@@ -1,0 +1,169 @@
+# =============================================================================
+#  NOAA Weather Radio SAME Decoder — AI-Thinker ESP32-Audio-Kit (ESP32-A1S / ES8388)
+#  Output model: finity69x2/nws_alerts style — a single COUNT sensor whose
+#  state is the number of currently active alerts matching my FIPS codes,
+#  with flat companion sensors describing the most recent matching alert.
+# =============================================================================
+
+substitutions:
+  device_name: "noaa-same-decoder"
+  # Home Assistant helper holding comma-separated 6-digit SAME/FIPS codes,
+  # e.g. "020091,020173". Create this as an input_text in HA.
+  fips_entity_id: "input_text.noaa_same_fips"
+
+esphome:
+  name: ${device_name}
+  friendly_name: "NOAA SAME Decoder"
+  on_boot:
+    priority: -100
+    then:
+      - lambda: 'ESP_LOGI("same", "Boot complete; SAME decoder starting.");'
+
+esp32:
+  board: esp-wrover-kit          # ESP32-A1S / WROVER-class module (has PSRAM)
+  framework:
+    type: esp-idf
+
+psram:
+  mode: quad
+  speed: 80MHz
+
+logger:
+  level: INFO
+
+api:
+  # Allows the count sensor + companions to be exported to Home Assistant.
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${device_name} Fallback"
+    password: !secret fallback_password
+
+captive_portal:
+
+# -----------------------------------------------------------------------------
+#  I2C bus — used to program the ES8388 codec
+# -----------------------------------------------------------------------------
+i2c:
+  sda: GPIO33
+  scl: GPIO32
+  frequency: 100kHz
+  id: bus_a
+
+# -----------------------------------------------------------------------------
+#  ES8388 audio codec (the analog LINE-IN feeds this chip's ADC)
+# -----------------------------------------------------------------------------
+audio_dac:
+  - platform: es8388
+    id: es8388_codec
+    i2c_id: bus_a
+    address: 0x10
+
+# Select which analog line the ADC listens to.
+#   LINE1 = left only | LINE2 = right only | DIFFERENCE = both L+R
+select:
+  - platform: es8388
+    es8388_id: es8388_codec
+    adc_input_mic:
+      name: "SAME ADC Input"
+      initial_option: DIFFERENCE
+    dac_output:
+      name: "SAME DAC Output"
+
+# -----------------------------------------------------------------------------
+#  I2S bus — the custom same_decoder owns the read loop (48 kHz mono).
+# -----------------------------------------------------------------------------
+i2s_audio:
+  - id: i2s_in
+    i2s_lrclk_pin: GPIO25
+    i2s_bclk_pin: GPIO27
+    i2s_mclk_pin: GPIO0
+
+# Amplifier is irrelevant to decoding; keep it OFF to reduce noise/power.
+switch:
+  - platform: gpio
+    pin: GPIO21
+    id: amp_ctrl
+    name: "Audio Amp"
+    restore_mode: ALWAYS_OFF
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO39
+      inverted: true
+    name: "Line-In Jack Present"
+
+  # nws_alerts-style convenience flag: on when count > 0.
+  # (Mirrors the common template binary_sensor {{ states('sensor.nws_alerts')|int > 0 }})
+  - platform: template
+    name: "SAME Alerts Active"
+    device_class: safety
+    lambda: 'return id(same_alert_count).state > 0;'
+
+# -----------------------------------------------------------------------------
+#  Pull the operator's FIPS list from Home Assistant into the device.
+# -----------------------------------------------------------------------------
+text_sensor:
+  - platform: homeassistant
+    id: my_fips_codes
+    entity_id: ${fips_entity_id}
+
+  # ---- Flat "latest matching alert" fields (nws_alerts-style attributes,
+  #      flattened because ESPHome can't publish an attribute array) ----
+  - platform: template
+    id: same_last_event           # e.g. "Tornado Warning"  (like Alerts.Event)
+    name: "SAME Last Event"
+  - platform: template
+    id: same_last_event_code      # e.g. "TOR"              (like Alerts.NWSCode)
+    name: "SAME Last Event Code"
+  - platform: template
+    id: same_last_severity        # Minor|Moderate|Severe|Extreme (like Alerts.Severity)
+    name: "SAME Last Severity"
+  - platform: template
+    id: same_last_areas           # comma-separated PSSCCC FIPS list
+    name: "SAME Last Affected FIPS"
+  - platform: template
+    id: same_last_raw             # full ZCZC-... header for diagnostics
+    name: "SAME Last Raw Header"
+
+# -----------------------------------------------------------------------------
+#  THE nws_alerts-STYLE CORE SENSOR: state = count of active matching alerts.
+# -----------------------------------------------------------------------------
+sensor:
+  - platform: template
+    id: same_alert_count
+    name: "SAME Alerts"            # -> sensor.<device>_same_alerts, state = count
+    accuracy_decimals: 0
+    unit_of_measurement: "alerts"
+    # Value is published by the custom component; this declares the entity.
+
+# -----------------------------------------------------------------------------
+#  The custom SAME decoder external component.
+# -----------------------------------------------------------------------------
+external_components:
+  - source:
+      type: local
+      path: my_components
+    components: [same_decoder]
+
+same_decoder:
+  id: same_dec
+  i2s_audio_id: i2s_in
+  i2s_din_pin: GPIO35
+  sample_rate: 48000
+  fips_source: my_fips_codes
+  # nws_alerts-style outputs:
+  alert_count_sensor: same_alert_count          # state = number of active matching alerts
+  last_event_sensor: same_last_event
+  last_event_code_sensor: same_last_event_code
+  last_severity_sensor: same_last_severity
+  last_areas_sensor: same_last_areas
+  last_raw_sensor: same_last_raw
+  # Alert expiry drives count decrement; when a matching alert's purge time
+  # elapses the component decrements the count (mirroring nws_alerts' expiry).
