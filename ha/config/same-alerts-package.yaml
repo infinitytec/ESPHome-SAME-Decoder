@@ -1,0 +1,173 @@
+# =============================================================================
+#  Drop-in Home Assistant package for the ESPHome SAME Decoder.
+#  Install: copy to <config>/packages/same_alerts_package.yaml
+#           ensure configuration.yaml has:
+#             homeassistant:
+#               packages: !include_dir_named packages
+#           then restart HA and fill in the helpers in the UI.
+# =============================================================================
+
+# ---- User-editable filtering config (UI helpers; no reflash needed) ---------
+input_text:
+  same_fips_list:
+    name: SAME FIPS Codes
+    max: 255
+    # Comma-separated 6-digit SAME/FIPS codes, e.g. "020091,020173".
+    # Blank = accept all areas.
+  same_event_include:
+    name: SAME Event Codes To Include
+    max: 255
+    # Optional. If non-empty, ONLY these event codes pass (e.g. "TOR,SVR,FFW").
+  same_event_exclude:
+    name: SAME Event Codes To Exclude
+    max: 255
+    # Optional. These event codes are dropped (e.g. "RWT,RMT,NPT").
+
+input_boolean:
+  same_ignore_tests:
+    name: SAME Ignore Test Alerts
+    # When on, drops RWT/RMT/NPT/DMO test codes regardless of other settings.
+
+# ---- The nws_alerts-style entity, rebuilt from device events ----------------
+template:
+  - trigger:
+      - platform: event
+        event_type: esphome.same_alert
+      - platform: time_pattern
+        minutes: "/1"                 # prune expired alerts every minute
+      - platform: homeassistant
+        event: start                  # re-render after restart
+    action:
+      # Load existing list (persisted across restarts by trigger-template state).
+      - variables:
+          existing: >
+            {{ state_attr('sensor.same_alerts', 'Alerts') | default([], true) }}
+          now_ts: "{{ now() }}"
+          # Parse helper config into normalized sets.
+          fips_cfg: >
+            {{ states('input_text.same_fips_list')
+               | replace(' ', '') | upper
+               | split(',') | reject('equalto','') | list }}
+          inc_cfg: >
+            {{ states('input_text.same_event_include')
+               | replace(' ', '') | upper
+               | split(',') | reject('equalto','') | list }}
+          exc_cfg: >
+            {{ states('input_text.same_event_exclude')
+               | replace(' ', '') | upper
+               | split(',') | reject('equalto','') | list }}
+          ignore_tests: "{{ is_state('input_boolean.same_ignore_tests','on') }}"
+          test_codes: "{{ ['RWT','RMT','NPT','DMO'] }}"
+          # Incoming event payload (empty on time/start triggers).
+          ev: "{{ trigger.event.data if trigger.platform == 'event' else none }}"
+    sensor:
+      - name: "SAME Alerts"
+        unique_id: same_alerts_reconstructed
+        # State = number of currently active alerts (nws_alerts convention).
+        state: >
+          {% set kept = namespace(list=[]) %}
+          {# 1) Start from existing, dropping anything expired. #}
+          {% for a in existing %}
+            {% if a.Expires is not defined
+                  or as_datetime(a.Expires) is none
+                  or as_datetime(a.Expires) > now_ts %}
+              {% set kept.list = kept.list + [a] %}
+            {% endif %}
+          {% endfor %}
+          {# 2) If this is an event trigger, decide whether to upsert it. #}
+          {% if ev %}
+            {% set code = (ev.event_code | default('')) | upper %}
+            {% set areas = (ev.areas | default('')) | replace(' ','')
+                            | upper | split(',') | reject('equalto','') | list %}
+            {% set fips_ok = (fips_cfg | length == 0)
+                             or (areas | select('in', fips_cfg) | list | length > 0) %}
+            {% set inc_ok = (inc_cfg | length == 0) or (code in inc_cfg) %}
+            {% set exc_ok = code not in exc_cfg %}
+            {% set test_ok = (not ignore_tests) or (code not in test_codes) %}
+            {% if fips_ok and inc_ok and exc_ok and test_ok %}
+              {# Build the alert dict in nws_alerts field shape. #}
+              {% set item = {
+                   'ID': ev.id | default(''),
+                   'Event': ev.event | default(code),
+                   'NWSCode': code,
+                   'Severity': ev.severity | default('Unknown'),
+                   'Status': ev.status | default('Actual'),
+                   'Originator': ev.originator | default(''),
+                   'Onset': ev.onset | default(''),
+                   'Expires': ev.expires | default(''),
+                   'Ends': ev.expires | default(''),
+                   'AreasAffected': ev.areas | default(''),
+                   'Sender': ev.sender | default(''),
+                   'Raw': ev.raw | default('')
+                 } %}
+              {# Upsert by stable ID: replace if present, else append. #}
+              {% set ns = namespace(list=[], found=false) %}
+              {% for a in kept.list %}
+                {% if a.ID == item.ID and item.ID != '' %}
+                  {% set ns.list = ns.list + [item] %}
+                  {% set ns.found = true %}
+                {% else %}
+                  {% set ns.list = ns.list + [a] %}
+                {% endif %}
+              {% endfor %}
+              {% if not ns.found %}
+                {% set ns.list = ns.list + [item] %}
+              {% endif %}
+              {% set kept.list = ns.list %}
+            {% endif %}
+          {% endif %}
+          {{ kept.list | length }}
+        attributes:
+          # Rebuild the list identically each render so state & attrs stay in sync.
+          Alerts: >
+            {% set kept = namespace(list=[]) %}
+            {% for a in existing %}
+              {% if a.Expires is not defined
+                    or as_datetime(a.Expires) is none
+                    or as_datetime(a.Expires) > now_ts %}
+                {% set kept.list = kept.list + [a] %}
+              {% endif %}
+            {% endfor %}
+            {% if ev %}
+              {% set code = (ev.event_code | default('')) | upper %}
+              {% set areas = (ev.areas | default('')) | replace(' ','')
+                              | upper | split(',') | reject('equalto','') | list %}
+              {% set fips_ok = (fips_cfg | length == 0)
+                               or (areas | select('in', fips_cfg) | list | length > 0) %}
+              {% set inc_ok = (inc_cfg | length == 0) or (code in inc_cfg) %}
+              {% set exc_ok = code not in exc_cfg %}
+              {% set test_ok = (not ignore_tests) or (code not in test_codes) %}
+              {% if fips_ok and inc_ok and exc_ok and test_ok %}
+                {% set item = {
+                     'ID': ev.id | default(''),
+                     'Event': ev.event | default(code),
+                     'NWSCode': code,
+                     'Severity': ev.severity | default('Unknown'),
+                     'Status': ev.status | default('Actual'),
+                     'Originator': ev.originator | default(''),
+                     'Onset': ev.onset | default(''),
+                     'Expires': ev.expires | default(''),
+                     'Ends': ev.expires | default(''),
+                     'AreasAffected': ev.areas | default(''),
+                     'Sender': ev.sender | default(''),
+                     'Raw': ev.raw | default('')
+                   } %}
+                {% set ns = namespace(list=[], found=false) %}
+                {% for a in kept.list %}
+                  {% if a.ID == item.ID and item.ID != '' %}
+                    {% set ns.list = ns.list + [item] %}
+                    {% set ns.found = true %}
+                  {% else %}
+                    {% set ns.list = ns.list + [a] %}
+                  {% endif %}
+                {% endfor %}
+                {% if not ns.found %}{% set ns.list = ns.list + [item] %}{% endif %}
+                {% set kept.list = ns.list %}
+              {% endif %}
+            {% endif %}
+            {{ kept.list }}
+          # Convenience flat fields mirroring nws_alerts usage.
+          last_event: "{{ ev.event | default('') if ev else '' }}"
+          last_severity: "{{ ev.severity | default('') if ev else '' }}"
+          friendly_name: "SAME Alerts"
+          icon: "mdi:alert"
