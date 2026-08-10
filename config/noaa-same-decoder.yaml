@@ -1,8 +1,17 @@
 # =============================================================================
 #  NOAA Weather Radio SAME Decoder — AI-Thinker ESP32-Audio-Kit (ESP32-A1S / ES8388)
+# -----------------------------------------------------------------------------
 #  Output model: finity69x2/nws_alerts style — a single COUNT sensor whose
 #  state is the number of currently active alerts matching my FIPS codes,
-#  with flat companion sensors describing the most recent matching alert.
+#  plus flat companion sensors describing the most recent matching alert.
+#
+#  The AFSK/SAME demodulation lives in the custom external component
+#  "same_decoder", pulled from GitHub over the git source below.
+#
+#  Board pin reference (ES8388 Audio Kit):
+#    I2C:  sda GPIO33, scl GPIO32
+#    I2S:  mclk GPIO0, bclk GPIO27, lrclk GPIO25, din GPIO35 (ADC data in)
+#    AMP control: GPIO21   |   Jack-detect: GPIO39
 # =============================================================================
 
 substitutions:
@@ -22,8 +31,9 @@ esphome:
 esp32:
   board: esp-wrover-kit          # ESP32-A1S / WROVER-class module (has PSRAM)
   framework:
-    type: esp-idf
+    type: esp-idf                # esp-idf recommended for the audio + custom I2S work
 
+# PSRAM helps the audio buffers; the A1S module includes it.
 psram:
   mode: quad
   speed: 80MHz
@@ -32,7 +42,8 @@ logger:
   level: INFO
 
 api:
-  # Allows the count sensor + companions to be exported to Home Assistant.
+  # Exports the count sensor + companions to Home Assistant over the native API.
+  # For production, add:  encryption: { key: !secret api_key }
 
 ota:
   - platform: esphome
@@ -45,6 +56,21 @@ wifi:
     password: !secret fallback_password
 
 captive_portal:
+
+# -----------------------------------------------------------------------------
+#  Custom SAME decoder external component, pulled from GitHub.
+#  NOTE: path points at "same_decoder" to match the CURRENT repo layout
+#  (Root/same_decoder/). If you later move it to Root/components/same_decoder/,
+#  remove the `path:` line (git sources default to components/).
+# -----------------------------------------------------------------------------
+external_components:
+  - source:
+      type: git
+      url: https://github.com/infinitytec/ESPHome-SAME-Decoder
+      ref: main
+      path: same_decoder
+    components: [same_decoder]
+    refresh: 1d
 
 # -----------------------------------------------------------------------------
 #  I2C bus — used to program the ES8388 codec
@@ -73,10 +99,10 @@ select:
       name: "SAME ADC Input"
       initial_option: DIFFERENCE
     dac_output:
-      name: "SAME DAC Output"
+      name: "SAME DAC Output"      # unused for decoding; harmless to expose
 
 # -----------------------------------------------------------------------------
-#  I2S bus — the custom same_decoder owns the read loop (48 kHz mono).
+#  I2S bus — the custom same_decoder component owns the read loop (48 kHz mono).
 # -----------------------------------------------------------------------------
 i2s_audio:
   - id: i2s_in
@@ -93,6 +119,7 @@ switch:
     restore_mode: ALWAYS_OFF
 
 binary_sensor:
+  # Line-in jack insertion detect on this board.
   - platform: gpio
     pin:
       number: GPIO39
@@ -117,13 +144,13 @@ text_sensor:
   # ---- Flat "latest matching alert" fields (nws_alerts-style attributes,
   #      flattened because ESPHome can't publish an attribute array) ----
   - platform: template
-    id: same_last_event           # e.g. "Tornado Warning"  (like Alerts.Event)
+    id: same_last_event           # e.g. "Tornado Warning"  (like Alerts[0].Event)
     name: "SAME Last Event"
   - platform: template
-    id: same_last_event_code      # e.g. "TOR"              (like Alerts.NWSCode)
+    id: same_last_event_code      # e.g. "TOR"              (like Alerts[0].NWSCode)
     name: "SAME Last Event Code"
   - platform: template
-    id: same_last_severity        # Minor|Moderate|Severe|Extreme (like Alerts.Severity)
+    id: same_last_severity        # Minor|Moderate|Severe|Extreme (like Alerts[0].Severity)
     name: "SAME Last Severity"
   - platform: template
     id: same_last_areas           # comma-separated PSSCCC FIPS list
@@ -144,19 +171,14 @@ sensor:
     # Value is published by the custom component; this declares the entity.
 
 # -----------------------------------------------------------------------------
-#  The custom SAME decoder external component.
+#  Decoder wiring — option names here MUST match CONFIG_SCHEMA in __init__.py
+#  and the setters in same_decoder.h (count-based vocabulary).
 # -----------------------------------------------------------------------------
-external_components:
-  - source:
-      type: local
-      path: my_components
-    components: [same_decoder]
-
 same_decoder:
   id: same_dec
   i2s_audio_id: i2s_in
-  i2s_din_pin: GPIO35
-  sample_rate: 48000
+  i2s_din_pin: GPIO35            # ES8388 ADC data line into the ESP32
+  sample_rate: 48000            # 48 kHz mono
   fips_source: my_fips_codes
   # nws_alerts-style outputs:
   alert_count_sensor: same_alert_count          # state = number of active matching alerts
@@ -165,5 +187,3 @@ same_decoder:
   last_severity_sensor: same_last_severity
   last_areas_sensor: same_last_areas
   last_raw_sensor: same_last_raw
-  # Alert expiry drives count decrement; when a matching alert's purge time
-  # elapses the component decrements the count (mirroring nws_alerts' expiry).
