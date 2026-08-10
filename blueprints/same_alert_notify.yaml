@@ -1,0 +1,65 @@
+# =============================================================================
+#  Automation Blueprint: notify on new SAME alerts (imported via URL in HA).
+#  Settings > Automations & Scenes > Blueprints > Import Blueprint.
+# =============================================================================
+blueprint:
+  name: SAME Alert Notification
+  description: >
+    Sends a notification when the SAME Alerts sensor gains a new active alert
+    at or above a chosen severity. Pairs with same_alerts_package.yaml.
+  domain: automation
+  input:
+    alerts_sensor:
+      name: SAME Alerts sensor
+      default: sensor.same_alerts
+      selector:
+        entity:
+          domain: sensor
+    notify_target:
+      name: Notify service
+      description: e.g. notify.mobile_app_yourphone
+      selector:
+        text:
+    min_severity:
+      name: Minimum severity
+      default: Severe
+      selector:
+        select:
+          options:
+            - Minor
+            - Moderate
+            - Severe
+            - Extreme
+
+variables:
+  rank: { Minor: 1, Moderate: 2, Severe: 3, Extreme: 4, Unknown: 0 }
+  min_sev: !input min_severity
+  alerts_sensor: !input alerts_sensor
+
+trigger:
+  - platform: state
+    entity_id: !input alerts_sensor
+
+condition:
+  # Only fire when the count went UP (a new/updated alert appeared).
+  - condition: template
+    value_template: >
+      {{ (trigger.to_state.state | int(0)) > (trigger.from_state.state | int(0)) }}
+
+action:
+  - variables:
+      newest: >
+        {{ (state_attr(alerts_sensor, 'Alerts') | default([], true)) | last
+           if (state_attr(alerts_sensor, 'Alerts') | default([], true)) | length > 0
+           else {} }}
+  - condition: template
+    value_template: >
+      {{ rank.get(newest.Severity | default('Unknown'), 0)
+         >= rank.get(min_sev, 3) }}
+  - service: !input notify_target
+    data:
+      title: "Weather Alert: {{ newest.Event | default('SAME Alert') }}"
+      message: >
+        {{ newest.Event | default('Alert') }} ({{ newest.Severity | default('Unknown') }})
+        for FIPS {{ newest.AreasAffected | default('your area') }}.
+        Expires {{ newest.Expires | default('unknown') }}.
