@@ -92,7 +92,7 @@ class SAMEDecoder : public Component {
   uint8_t     cur_byte_{0};
   int         cur_nbits_{0};
   std::string cur_burst_;
-  std::string bursts_;
+  std::string bursts_[3];
   int         burst_idx_{0};
   static constexpr int MAX_HEADER_BYTES = 268;
 };
