@@ -34,14 +34,15 @@ static bool decode_bit(const int16_t *win, int n) {
 }
 
 void SAMEDecoder::setup() {
-  ESP_LOGCONFIG(TAG, "SAME decoder ready (%.2f samples/bit, non-blocking state machine).",
-                SAMPLES_PER_BIT);
+  ESP_LOGCONFIG(TAG, "SAME decoder ready (%.2f samples/bit, gain=%.1f, non-blocking).",
+                SAMPLES_PER_BIT, this->gain_);
   this->reset_capture_();
 }
 
 void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "SAME Decoder:");
   ESP_LOGCONFIG(TAG, "  Sample rate: %" PRIu32 " Hz", this->sample_rate_);
+  ESP_LOGCONFIG(TAG, "  Software gain: %.1f", this->gain_);
   ESP_LOGCONFIG(TAG, "  Bit window: %d samples (%.2f/bit)", BIT_WINDOW, SAMPLES_PER_BIT);
   ESP_LOGCONFIG(TAG, "  Goertzel coeffs: mark=%.6f space=%.6f", COEFF_MARK, COEFF_SPACE);
   ESP_LOGCONFIG(TAG, "  Alert triggers: %u", (unsigned) this->alert_triggers_.size());
@@ -51,8 +52,12 @@ void SAMEDecoder::dump_config() {
 void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
   const size_t n = data.size() / 2;
   const int16_t *samples = reinterpret_cast<const int16_t *>(data.data());
-  for (size_t i = 0; i < n; i++)
-    this->feed_sample_(samples[i]);
+  for (size_t i = 0; i < n; i++) {
+    float v = (float) samples[i] * this->gain_;
+    if (v >  32767.0f) v =  32767.0f;
+    if (v < -32768.0f) v = -32768.0f;
+    this->feed_sample_((int16_t) v);
+  }
 }
 
 void SAMEDecoder::feed_sample_(int16_t s) {
