@@ -68,10 +68,9 @@ external_components:
       type: git
       url: https://github.com/infinitytec/ESPHome-SAME-Decoder
       ref: main
-      path: same_decoder
     components: [same_decoder]
-    refresh: 1d
-
+    refresh: 0s
+    
 # -----------------------------------------------------------------------------
 #  I2C bus — used to program the ES8388 codec (and, in Tier C, an I²C display).
 # -----------------------------------------------------------------------------
@@ -99,7 +98,6 @@ select:
     es8388_id: es8388_codec
     adc_input_mic:
       name: "SAME ADC Input"
-      initial_option: DIFFERENCE
     dac_output:
       name: "SAME DAC Output"      # unused for decoding; harmless to expose
 
