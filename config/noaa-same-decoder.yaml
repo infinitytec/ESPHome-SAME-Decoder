@@ -21,15 +21,31 @@ esphome:
       - lambda: 'ESP_LOGI("same", "Boot complete; SAME decoder starting.");'
       - select.set:
           id: same_adc_input
-          option: "DIFFERENCE"          # both line-in channels feed the ADC
-      # Start capture so the microphone streams into on_data continuously.
+          option: "DIFFERENCE"
+      # --- Raise ES8388 input PGA gain (ADCControl1 = reg 0x09) ---
+      # Both nibbles = per-channel MicAmp/PGA gain. 0x88 = +24 dB L & R.
+      # Try 0x88 (24 dB) first; if it clips, drop to 0x66 (18) or 0x44 (12).
+      - delay: 200ms
+      - lambda: |-
+          std::vector<uint8_t> buf;
+          buf.push_back(0x09);
+          buf.push_back(0x88);
+          id(bus_a).write(0x10, buf.data(), buf.size());
+          // Read it back to confirm it stuck:
+          uint8_t reg = 0x09;
+          uint8_t readback = 0;
+          id(bus_a).write(0x10, &reg, 1, false);   // set pointer, no stop
+          id(bus_a).read(0x10, &readback, 1);
+          ESP_LOGI("es8388", "ADCControl1 wrote 0x88, readback=0x%02X", readback);
       - microphone.capture: same_mic
 
 esp32:
   board: esp-wrover-kit
   framework:
     type: esp-idf
-
+    advanced:
+      minimum_chip_revision: "3.1"
+      sram1_as_iram: true
 psram:
   mode: quad
   speed: 80MHz
@@ -58,7 +74,7 @@ external_components:
       url: https://github.com/infinitytec/ESPHome-SAME-Decoder
       ref: main
     components: [same_decoder]
-    refresh: 1d
+    refresh: 0s
 
 i2c:
   sda: GPIO33
@@ -101,7 +117,21 @@ microphone:
     channel: right                     # single mono channel into the demod
     on_data:
       then:
-        - lambda: 'id(same_dec).feed_bytes(x);'   # x is std::vector<uint8_t>
+        - lambda: |-
+            id(same_dec).feed_bytes(x);
+            // Diagnostic: peak absolute sample value in this chunk.
+            const int16_t *s = reinterpret_cast<const int16_t *>(x.data());
+            size_t n = x.size() / 2;
+            int32_t peak = 0;
+            int64_t sumsq = 0;
+            for (size_t i = 0; i < n; i++) {
+              int32_t v = s[i];
+              if (v < 0) v = -v;
+              if (v > peak) peak = v;
+              sumsq += (int64_t) s[i] * s[i];
+            }
+            float rms = n ? sqrtf((float) sumsq / n) : 0.0f;
+            ESP_LOGD("mic_lvl", "peak=%ld rms=%.1f n=%d", (long) peak, rms, (int) n);
 
 # Amplifier control (kept OFF for decoding; toggled on only to play audio alarms).
 switch:
@@ -148,6 +178,7 @@ text_sensor:
 # -----------------------------------------------------------------------------
 same_decoder:
   id: same_dec
+  gain: 128.0
   sample_rate: 48000
   decode_count_sensor: same_decode_count
   last_raw_sensor: same_last_raw
