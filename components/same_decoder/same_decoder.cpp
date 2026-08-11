@@ -1,155 +1,158 @@
-// my_components/same_decoder/same_decoder.cpp
+// components/same_decoder/same_decoder.cpp
 #include "same_decoder.h"
+#include "same_event_codes.h"
 #include "esphome/core/log.h"
-#include <cmath>
-#include <cstring>
+
+#include <functional>   // std::hash
+#include <sstream>
+#include <iomanip>
 
 namespace esphome {
 namespace same_decoder {
 
 static const char *const TAG = "same_decoder";
 
-// SAME physical-layer constants (EIA/NWS SAME spec)
-static const float BAUD = 520.833f;
-static const float MARK_HZ = 2083.3f;   // logical 1
-static const float SPACE_HZ = 1562.5f;  // logical 0
-
 void SAMEDecoder::setup() {
-  ESP_LOGCONFIG(TAG, "Setting up SAME decoder @ %d Hz, DIN GPIO%d", this->sample_rate_, this->din_pin_);
-  if (!this->start_i2s_()) {
-    ESP_LOGE(TAG, "I2S init failed; decoder disabled.");
-    this->mark_failed();
-    return;
+  ESP_LOGCONFIG(TAG, "Setting up SAME decoder (din=GPIO%u, %u Hz)...",
+                this->din_pin_, this->sample_rate_);
+  this->i2s_ready_ = this->start_i2s_();
+  if (!this->i2s_ready_) {
+    ESP_LOGW(TAG, "I2S RX not configured yet (DSP scaffold). Decoder idle.");
   }
-  // Idle state for entities
-  if (this->alert_active_) this->alert_active_->publish_state(false);
+}
+
+void SAMEDecoder::dump_config() {
+  ESP_LOGCONFIG(TAG, "SAME Decoder:");
+  ESP_LOGCONFIG(TAG, "  DIN pin: GPIO%u", this->din_pin_);
+  ESP_LOGCONFIG(TAG, "  Sample rate: %u Hz", this->sample_rate_);
+  ESP_LOGCONFIG(TAG, "  Alert triggers: %u", (unsigned) this->alert_triggers_.size());
+  ESP_LOGCONFIG(TAG, "  NOTE: DSP core is scaffold — no live decodes yet.");
 }
 
 void SAMEDecoder::loop() {
-  // -----------------------------------------------------------------------
-  // High-level pipeline (runs continuously):
-  //   1. read a chunk of PCM from I2S
-  //   2. demodulate bits, hunt for preamble + "ZCZC"
-  //   3. assemble the 3 redundant bursts, majority-vote them
-  //   4. parse the header; if any area matches my FIPS -> publish + fire event
-  //
-  // NOTE: The read/demod inner loop is intentionally a skeleton. Locking AFSK
-  // on live audio is the hard, iterative part and needs tuning against real
-  // captured NWR samples (see project notes). Structure is complete; the
-  // per-bit tone discrimination and clock recovery need real-world hardening.
-  // -----------------------------------------------------------------------
-  static int16_t buf;
-  int n = this->read_samples_(buf, 512);
-  if (n <= 0) return;
-
-  if (!this->find_preamble_()) return;
-
-  std::string burst;
-  if (!this->assemble_burst_(burst)) return;
-
-  SAMEMessage msg;
-  if (!this->parse_header_(burst, msg)) {
-    ESP_LOGW(TAG, "Header parse failed: %s", burst.c_str());
+  // ---- DSP pipeline is stubbed; this is the intended shape. ----
+  if (!this->i2s_ready_)
     return;
-  }
 
-  bool mine = this->matches_my_fips_(msg);
-  this->publish_(msg, mine);
+  if (!this->find_preamble_())
+    return;
 
-  if (mine) {
-    for (auto *t : this->alert_triggers_) t->trigger();
-  }
+  std::string header;
+  if (!this->assemble_burst_(header))
+    return;
+
+  SameAlert alert;
+  if (!this->parse_header_(header, alert))
+    return;
+
+  this->publish_alert_(alert);
 }
 
-// ---- I2S bring-up -----------------------------------------------------------
+// ---------------- DSP STUBS (the real work remains) ----------------
+size_t SAMEDecoder::read_samples_(int16_t *buf, size_t max_samples) {
+  (void) buf; (void) max_samples;
+  return 0;  // TODO: read PCM from I2S RX channel.
+}
 bool SAMEDecoder::start_i2s_() {
-  // TODO: configure the shared i2s_audio parent for RX at sample_rate_, mono,
-  // 16-bit, using din_pin_. On esp-idf this installs an I2S RX channel that
-  // reads the ES8388's ADC output. Left as an integration point because the
-  // exact API depends on your installed ESPHome version's i2s_audio internals.
-  ESP_LOGCONFIG(TAG, "I2S RX configured (mono/16-bit/%dHz).", this->sample_rate_);
-  return true;
+  // TODO: configure the I2S RX channel on din_pin_ at sample_rate_.
+  return false;
 }
-
-int SAMEDecoder::read_samples_(int16_t *buf, int max) {
-  // TODO: i2s_channel_read(...) into buf; return sample count.
-  (void) buf; (void) max;
-  return 0;  // skeleton
+bool SAMEDecoder::find_preamble_() {
+  // TODO: Goertzel/AFSK preamble + ZCZC hunt.
+  return false;
 }
-
-// ---- DSP --------------------------------------------------------------------
-bool SAMEDecoder::demodulate_bit_(const int16_t *s, int n, bool &bit) {
-  // Goertzel energy at MARK vs SPACE over one bit period (sample_rate_/BAUD samples).
-  auto goertzel = [&](float freq) -> float {
-    float w = 2.0f * M_PI * freq / this->sample_rate_;
-    float c = 2.0f * cosf(w), q0, q1 = 0, q2 = 0;
-    for (int i = 0; i < n; i++) { q0 = c * q1 - q2 + s[i]; q2 = q1; q1 = q0; }
-    return q1 * q1 + q2 * q2 - q1 * q2 * c;
-  };
-  bit = goertzel(MARK_HZ) > goertzel(SPACE_HZ);
-  return true;
-}
-
-// ---- Framing (skeletons) ----------------------------------------------------
-bool SAMEDecoder::find_preamble_() { return false; }               // TODO
-bool SAMEDecoder::assemble_burst_(std::string &out) { (void)out; return false; }  // TODO
-bool SAMEDecoder::parse_header_(const std::string &b, SAMEMessage &m) {
-  // Expected: ZCZC-ORG-EEE-PSSCCC-PSSCCC...+TTTT-JJJHHMM-LLLLLLLL-
-  if (b.rfind("ZCZC-", 0) != 0) return false;
-  m.raw = b;
-  // TODO: tokenize on '-' and '+' into originator/event/areas/purge/issued/sender.
-  return true;
-}
-
-// ---- Matching + CAP mapping -------------------------------------------------
-bool SAMEDecoder::matches_my_fips_(const SAMEMessage &msg) {
-  if (this->fips_source_ == nullptr) return false;
-  std::string mine = this->fips_source_->state;   // "020091,020173"
-  for (const auto &area : msg.areas) {
-    // SAME area is PSSCCC; the leading P is a subdivision digit. Match on the
-    // trailing 5 (SSCCC) or the full 6 depending on how the operator enters them.
-    if (mine.find(area) != std::string::npos) return true;
-    if (area.size() == 6 && mine.find(area.substr(1)) != std::string::npos) return true;
-  }
+bool SAMEDecoder::assemble_burst_(std::string &header_out) {
+  (void) header_out;
+  // TODO: clock recovery + 3-burst majority vote -> full header string.
   return false;
 }
 
-std::string SAMEDecoder::severity_for_(const std::string &e) {
-  // Map SAME event codes to cap_alerts' canonical CAP tiers.
-  if (e == "TOR" || e == "TSW" || e == "EWW" || e == "EQW") return "extreme";
-  if (e == "SVR" || e == "FFW" || e == "HUW" || e == "TOA") return "severe";
-  if (e == "SVA" || e == "FFA" || e == "FLW" || e == "WSW") return "moderate";
-  if (e == "RWT" || e == "RMT" || e == "SPS")               return "minor";
-  return "unknown";
+// ---------------- Parsing / mapping (implemented) ----------------
+std::string SAMEDecoder::describe_(const std::string &code) {
+  auto it = SAME_EVENT_CODES.find(code);
+  if (it != SAME_EVENT_CODES.end())
+    return it->second.name;
+  return code;  // unknown code: fall back to the raw 3-letter code
 }
 
-std::string SAMEDecoder::describe_(const std::string &e) {
-  if (e == "TOR") return "Tornado Warning";
-  if (e == "SVR") return "Severe Thunderstorm Warning";
-  if (e == "FFW") return "Flash Flood Warning";
-  if (e == "RWT") return "Required Weekly Test";
-  if (e == "RMT") return "Required Monthly Test";
-  return e;  // fall back to the raw code
+std::string SAMEDecoder::severity_for_(const std::string &code) {
+  auto it = SAME_EVENT_CODES.find(code);
+  if (it != SAME_EVENT_CODES.end())
+    return it->second.severity;
+  return "Unknown";
 }
 
-void SAMEDecoder::publish_(const SAMEMessage &msg, bool mine) {
-  std::string areas;
-  for (size_t i = 0; i < msg.areas.size(); i++) {
-    if (i) areas += ",";
-    areas += msg.areas[i];
+std::string SAMEDecoder::make_id_(const SameAlert &a) {
+  // Stable across re-broadcasts of the SAME alert: event+areas+onset.
+  std::string key = a.event_code + "|" + a.areas_csv + "|" + a.onset_iso;
+  size_t h = std::hash<std::string>{}(key);
+  std::ostringstream os;
+  os << std::hex << h;
+  return os.str();
+}
+
+bool SAMEDecoder::parse_header_(const std::string &header, SameAlert &out) {
+  // Expected: ZCZC-ORG-EEE-PSSCCC-PSSCCC...+TTTT-JJJHHMM-LLLLLLLL-
+  // NOTE: This is the field-splitting skeleton. Timestamp math (JJJHHMM/purge
+  // -> ISO) is left as a TODO to keep this honest; wire it when validating
+  // against real captures.
+  out.raw_header = header;
+  if (header.rfind("ZCZC", 0) != 0)
+    return false;
+
+  std::vector<std::string> parts;
+  std::string cur;
+  for (char c : header) {
+    if (c == '-') { parts.push_back(cur); cur.clear(); }
+    else { cur += c; }
   }
-  if (this->t_originator_) this->t_originator_->publish_state(msg.originator);
-  if (this->t_event_code_) this->t_event_code_->publish_state(msg.event_code);
-  if (this->t_event_)      this->t_event_->publish_state(this->describe_(msg.event_code));
-  if (this->t_severity_)   this->t_severity_->publish_state(this->severity_for_(msg.event_code));
-  if (this->t_areas_)      this->t_areas_->publish_state(areas);
-  if (this->t_sender_)     this->t_sender_->publish_state(msg.sender);
-  if (this->t_raw_)        this->t_raw_->publish_state(msg.raw);
-  if (this->alert_active_) this->alert_active_->publish_state(mine);
-  // TODO: convert msg.purge (+TTTT) to minutes and publish s_expires_.
-  ESP_LOGI(TAG, "SAME %s (%s) mine=%d areas=%s",
-           msg.event_code.c_str(), this->severity_for_(msg.event_code).c_str(),
-           mine, areas.c_str());
+  if (!cur.empty()) parts.push_back(cur);
+  if (parts.size() < 4)
+    return false;
+
+  out.originator = parts[1];                 // REAL
+  out.event_code = parts[2];                 // REAL
+  out.event_name = this->describe_(out.event_code);        // DERIVED
+  out.severity   = this->severity_for_(out.event_code);    // DERIVED
+
+  // Areas: everything after event code until the token containing '+'.
+  std::string areas;
+  for (size_t i = 3; i < parts.size(); i++) {
+    if (parts[i].find('+') != std::string::npos) break;
+    if (!areas.empty()) areas += ",";
+    areas += parts[i];
+  }
+  out.areas_csv = areas;                     // REAL
+
+  // Status: RWT/RMT/DMO/NPT => Test, else Actual (simple heuristic).
+  out.status = (out.event_code == "RWT" || out.event_code == "RMT" ||
+                out.event_code == "DMO" || out.event_code == "NPT")
+                   ? "Test" : "Actual";      // DERIVED
+
+  // TODO: parse purge (+TTTT) and issue (JJJHHMM) into onset_iso/expires_iso.
+  out.onset_iso = "";                        // DERIVED (TODO)
+  out.expires_iso = "";                      // DERIVED (TODO)
+  out.sender = parts.empty() ? "" : parts.back();  // REAL (LLLLLLLL, last field)
+
+  out.id = this->make_id_(out);              // DERIVED stable hash
+  return true;
+}
+
+void SAMEDecoder::publish_alert_(const SameAlert &a) {
+  this->last_ = a;
+  this->decode_count_++;
+
+  if (this->decode_count_sensor_ != nullptr)
+    this->decode_count_sensor_->publish_state((float) this->decode_count_);
+  if (this->last_raw_sensor_ != nullptr)
+    this->last_raw_sensor_->publish_state(a.raw_header);
+
+  ESP_LOGI(TAG, "Decoded SAME: %s (%s) areas=%s",
+           a.event_name.c_str(), a.event_code.c_str(), a.areas_csv.c_str());
+
+  // Fire the on_alert automation(s); lambdas read the accessors off `this`.
+  for (auto *t : this->alert_triggers_)
+    t->trigger();
 }
 
 }  // namespace same_decoder
