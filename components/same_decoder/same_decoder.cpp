@@ -7,7 +7,7 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
-#include <cinttypes>   // PRIu32
+#include <cinttypes>
 
 namespace esphome {
 namespace same_decoder {
@@ -195,8 +195,8 @@ bool SAMEDecoder::parse_header_(const std::string &header, SameAlert &out) {
   if (parts.size() < 4)
     return false;
 
-  out.originator = parts[$1];
-  out.event_code = parts;
+  out.originator = parts[1];
+  out.event_code = parts[2];
   out.event_name = this->describe_(out.event_code);
   out.severity   = this->severity_for_(out.event_code);
 
