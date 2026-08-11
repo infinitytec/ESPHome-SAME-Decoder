@@ -1,0 +1,180 @@
+# =============================================================================
+#  NOAA Weather Radio SAME Decoder — AI-Thinker ESP32-Audio-Kit (ESP32-A1S / ES8388)
+#  Repo location: config/noaa-same-decoder.yaml
+# -----------------------------------------------------------------------------
+#  Tier A architecture (HA-only filtering):
+#    * Device decodes SAME and fires esphome.same_alert for EVERY decoded alert.
+#    * The custom component uses same_event_codes.h to fill in the human-readable
+#      event name + default severity tier for each 3-letter SAME code.
+#    * Home Assistant (ha/same_alerts_package.yaml) does FIPS + include/exclude
+#      filtering, builds the nws_alerts-style entity, and prunes on expiry.
+#    * Each event carries a stable `id` so HA upserts on re-broadcast/update.
+#
+#  Component files pulled from GitHub (Root/same_decoder/):
+#    __init__.py, same_decoder.h, same_decoder.cpp, same_event_codes.h
+#
+#  Board pin reference (ES8388 Audio Kit, schematic-verified):
+#    I2C:  sda GPIO33, scl GPIO32
+#    I2S:  mclk GPIO0, bclk GPIO27, lrclk GPIO25, din GPIO35 (ADC data in)
+#    AMP control (ShutDown/CTRL): GPIO21   |   Line-in jack detect: GPIO39
+# =============================================================================
+
+substitutions:
+  device_name: "noaa-same-decoder"
+
+esphome:
+  name: ${device_name}
+  friendly_name: "NOAA SAME Decoder"
+  on_boot:
+    priority: -100
+    then:
+      - lambda: 'ESP_LOGI("same", "Boot complete; SAME decoder starting.");'
+
+esp32:
+  board: esp-wrover-kit          # ESP32-A1S / WROVER-class module (has PSRAM)
+  framework:
+    type: esp-idf
+
+# PSRAM helps the audio buffers; the A1S module includes it.
+psram:
+  mode: quad
+  speed: 80MHz
+
+logger:
+  level: INFO
+
+api:
+  # Required for the device to fire esphome.same_alert on the HA event bus.
+  # For production add:  encryption: { key: !secret api_key }
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${device_name} Fallback"
+    password: !secret fallback_password
+
+captive_portal:
+
+# -----------------------------------------------------------------------------
+#  Custom SAME decoder external component from GitHub.
+#  path: same_decoder matches the current repo layout (Root/same_decoder/).
+# -----------------------------------------------------------------------------
+external_components:
+  - source:
+      type: git
+      url: https://github.com/infinitytec/ESPHome-SAME-Decoder
+      ref: main
+      path: same_decoder
+    components: [same_decoder]
+    refresh: 1d
+
+# -----------------------------------------------------------------------------
+#  I2C bus — used to program the ES8388 codec (and, in Tier C, an I²C display).
+# -----------------------------------------------------------------------------
+i2c:
+  sda: GPIO33
+  scl: GPIO32
+  frequency: 100kHz
+  id: bus_a
+
+# -----------------------------------------------------------------------------
+#  ES8388 audio codec (the analog LINE-IN feeds this chip's ADC).
+#  The onboard mics are on separate MIC1/MIC2 codec inputs and are simply
+#  not routed into the ADC when a LINE input is selected — no desoldering.
+# -----------------------------------------------------------------------------
+audio_dac:
+  - platform: es8388
+    id: es8388_codec
+    i2c_id: bus_a
+    address: 0x10
+
+# Select which analog line the ADC listens to.
+#   LINE1 = left only | LINE2 = right only | DIFFERENCE = both L+R
+select:
+  - platform: es8388
+    es8388_id: es8388_codec
+    adc_input_mic:
+      name: "SAME ADC Input"
+      initial_option: DIFFERENCE
+    dac_output:
+      name: "SAME DAC Output"      # unused for decoding; harmless to expose
+
+# -----------------------------------------------------------------------------
+#  I2S bus — the custom same_decoder component owns the read loop (48 kHz mono).
+# -----------------------------------------------------------------------------
+i2s_audio:
+  - id: i2s_in
+    i2s_lrclk_pin: GPIO25
+    i2s_bclk_pin: GPIO27
+    i2s_mclk_pin: GPIO0
+
+# Amplifier control (ShutDown/CTRL, IO21). Kept OFF for decoding to reduce
+# noise/power. In Tier C this is toggled on only while an audio alarm plays.
+switch:
+  - platform: gpio
+    pin: GPIO21
+    id: amp_ctrl
+    name: "Audio Amp"
+    restore_mode: ALWAYS_OFF
+
+binary_sensor:
+  # Line-in jack insertion detect on this board.
+  - platform: gpio
+    pin:
+      number: GPIO39
+      inverted: true
+    name: "Line-In Jack Present"
+
+# Diagnostic-only device entities. The AUTHORITATIVE nws_alerts-style sensor
+# is built in Home Assistant from the fired events (see ha/ package).
+sensor:
+  - platform: template
+    id: same_decode_count
+    name: "SAME Decodes (session)"
+    accuracy_decimals: 0
+    unit_of_measurement: "decodes"
+
+text_sensor:
+  - platform: template
+    id: same_last_raw
+    name: "SAME Last Raw Header"
+
+# -----------------------------------------------------------------------------
+#  Decoder wiring. It fires esphome.same_alert for EVERY decoded alert.
+#  The component uses same_event_codes.h to resolve:
+#    - event  (name)     via describe_(code)
+#    - severity (tier)   via severity_for_(code)
+#  Field annotations:
+#    REAL      = present in the SAME header
+#    DERIVED   = computed from a SAME field (code table, purge->timestamp, hash)
+#    (SAME has NO Headline/Description/Instruction/URL/Certainty — omitted.)
+# -----------------------------------------------------------------------------
+same_decoder:
+  id: same_dec
+  i2s_audio_id: i2s_in
+  i2s_din_pin: GPIO35            # ES8388 ADC data line into the ESP32
+  sample_rate: 48000            # 48 kHz mono
+  # Diagnostic sinks:
+  decode_count_sensor: same_decode_count
+  last_raw_sensor: same_last_raw
+  # Fire one HA event per decoded alert, carrying the full payload:
+  on_alert:
+    then:
+      - homeassistant.event:
+          event: esphome.same_alert
+          data:
+            id: !lambda 'return id(same_dec).last_alert_id();'           # DERIVED (stable hash)
+            event_code: !lambda 'return id(same_dec).last_event_code();' # REAL (EEE)
+            event: !lambda 'return id(same_dec).last_event_name();'      # DERIVED (code table -> name)
+            severity: !lambda 'return id(same_dec).last_severity();'     # DERIVED (code table -> tier)
+            originator: !lambda 'return id(same_dec).last_originator();' # REAL (ORG)
+            status: !lambda 'return id(same_dec).last_status();'         # DERIVED (Actual/Test)
+            areas: !lambda 'return id(same_dec).last_areas_csv();'       # REAL (PSSCCC list)
+            onset: !lambda 'return id(same_dec).last_onset_iso();'       # DERIVED (JJJHHMM -> ISO)
+            expires: !lambda 'return id(same_dec).last_expires_iso();'   # DERIVED (purge -> ISO)
+            sender: !lambda 'return id(same_dec).last_sender();'         # REAL (LLLLLLLL)
+            raw: !lambda 'return id(same_dec).last_raw_header();'        # REAL (full ZCZC-...)
