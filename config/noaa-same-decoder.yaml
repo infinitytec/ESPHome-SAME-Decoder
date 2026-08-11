@@ -1,26 +1,12 @@
 # =============================================================================
 #  NOAA Weather Radio SAME Decoder — AI-Thinker ESP32-Audio-Kit (ESP32-A1S / ES8388)
 #  Repo location: config/noaa-same-decoder.yaml
-# -----------------------------------------------------------------------------
-#  Tier A architecture (HA-only filtering):
-#    * Device decodes SAME and fires esphome.same_alert for EVERY decoded alert.
-#    * The custom component uses same_event_codes.h to fill in the human-readable
-#      event name + default severity tier for each 3-letter SAME code.
-#    * Home Assistant (ha/same_alerts_package.yaml) does FIPS + include/exclude
-#      filtering, builds the nws_alerts-style entity, and prunes on expiry.
-#    * Each event carries a stable `id` so HA upserts on re-broadcast/update.
 #
-#  Component files (repo layout, standard ESPHome convention):
-#    components/same_decoder/__init__.py
-#    components/same_decoder/same_decoder.h
-#    components/same_decoder/same_decoder.cpp
-#    components/same_decoder/same_event_codes.h
-#
-#  Board pin reference (ES8388 Audio Kit, schematic-verified):
-#    I2C:  sda GPIO33, scl GPIO32
-#    I2S:  mclk GPIO0, bclk GPIO27, lrclk GPIO25, din GPIO35 (ADC data in)
-#    AMP control (ShutDown/CTRL): GPIO21
-#    Jack detect: GPIO39 = LINE-OUT (J2) detect. LINE-IN (J1) has NO detect pin.
+#  Audio input path (schematic-verified):
+#    J1 (line-in) -> INL/INR -> ES8388 ADC -> I2S DIN GPIO35 -> microphone: -> decoder
+#  The microphone: component owns I2S input; its on_data trigger feeds bytes to
+#  the same_decoder via feed_bytes(). This decouples us from low-level I2S API
+#  churn (future-proof, idiomatic ESPHome).
 # =============================================================================
 
 substitutions:
@@ -33,28 +19,26 @@ esphome:
     priority: -100
     then:
       - lambda: 'ESP_LOGI("same", "Boot complete; SAME decoder starting.");'
-      # No initial_option on the es8388 select; force the ADC input here instead.
-      # DIFFERENCE = both L+R line-in channels feed the ADC.
       - select.set:
           id: same_adc_input
-          option: "DIFFERENCE"
+          option: "DIFFERENCE"          # both line-in channels feed the ADC
+      # Start capture so the microphone streams into on_data continuously.
+      - microphone.capture: same_mic
 
 esp32:
-  board: esp-wrover-kit          # ESP32-A1S / WROVER-class module (has PSRAM)
+  board: esp-wrover-kit
   framework:
     type: esp-idf
 
-# PSRAM helps the audio buffers; the A1S module includes it.
 psram:
   mode: quad
   speed: 80MHz
 
 logger:
-  level: INFO
+  level: DEBUG                          # DEBUG shows staged decode logs; raise to INFO later
 
 api:
-  # Required for the device to fire esphome.same_alert on the HA event bus.
-  # For production add:  encryption: { key: !secret api_key }
+  # For production add: encryption: { key: !secret api_key }
 
 ota:
   - platform: esphome
@@ -68,10 +52,6 @@ wifi:
 
 captive_portal:
 
-# -----------------------------------------------------------------------------
-#  Custom SAME decoder external component from GitHub.
-#  Uses the standard components/ layout, so NO `path:` is needed.
-# -----------------------------------------------------------------------------
 external_components:
   - source:
       type: git
@@ -80,50 +60,50 @@ external_components:
     components: [same_decoder]
     refresh: 1d
 
-# -----------------------------------------------------------------------------
-#  I2C bus — used to program the ES8388 codec (and, in Tier C, an I²C display).
-# -----------------------------------------------------------------------------
 i2c:
   sda: GPIO33
   scl: GPIO32
   frequency: 100kHz
   id: bus_a
 
-# -----------------------------------------------------------------------------
-#  ES8388 audio codec (the analog LINE-IN feeds this chip's ADC).
-#  The onboard mics are on separate MIC1/MIC2 codec inputs and are simply
-#  not routed into the ADC when a LINE input is selected — no desoldering.
-# -----------------------------------------------------------------------------
 audio_dac:
   - platform: es8388
     id: es8388_codec
     i2c_id: bus_a
     address: 0x10
 
-# Select which analog line the ADC listens to.
-#   adc_input_mic: LINE1 (default) | LINE2 | DIFFERENCE
-#   dac_output:    LINE1 (default) | LINE2 | BOTH
-# NOTE: this platform has NO `initial_option`; the boot automation above sets it.
 select:
   - platform: es8388
     es8388_id: es8388_codec
     adc_input_mic:
       id: same_adc_input
-      name: "SAME ADC Input"        # LINE1 | LINE2 | DIFFERENCE
+      name: "SAME ADC Input"            # LINE1 | LINE2 | DIFFERENCE
     dac_output:
-      name: "SAME DAC Output"       # LINE1 | LINE2 | BOTH (unused for decoding)
+      name: "SAME DAC Output"           # LINE1 | LINE2 | BOTH (unused for decoding)
 
-# -----------------------------------------------------------------------------
-#  I2S bus — the custom same_decoder component owns the read loop (48 kHz mono).
-# -----------------------------------------------------------------------------
+# I2S Audio bus (shared clock/pins). The microphone platform below uses it.
 i2s_audio:
   - id: i2s_in
     i2s_lrclk_pin: GPIO25
     i2s_bclk_pin: GPIO27
     i2s_mclk_pin: GPIO0
 
-# Amplifier control (ShutDown/CTRL, IO21). Kept OFF for decoding to reduce
-# noise/power. In Tier C this is toggled on only while an audio alarm plays.
+# Microphone owns the I2S RX path (external ES8388 ADC on GPIO35).
+# on_data forwards raw PCM bytes to the decoder's feed_bytes().
+microphone:
+  - platform: i2s_audio
+    id: same_mic
+    i2s_audio_id: i2s_in
+    adc_type: external
+    i2s_din_pin: GPIO35
+    sample_rate: 48000
+    bits_per_sample: 16bit             # forwarded samples are int16
+    channel: right                     # single mono channel into the demod
+    on_data:
+      then:
+        - lambda: 'id(same_dec).feed_bytes(x);'   # x is std::vector<uint8_t>
+
+# Amplifier control (kept OFF for decoding; toggled on only to play audio alarms).
 switch:
   - platform: gpio
     pin: GPIO21
@@ -132,25 +112,20 @@ switch:
     restore_mode: ALWAYS_OFF
 
 # -----------------------------------------------------------------------------
-#  Jack detection.
-#  IMPORTANT (schematic-verified): The line-IN jack (J1) exposes ONLY INL/INR/
-#  AGND — it has NO insertion-detect line. The detect signals (HP_Detect /
-#  SD_Detect) belong to the line-OUT/headphone jack (J2), routed via R30/R36
-#  pull-ups to the IO34/IO36/IO39 group. GPIO39 senses the OUTPUT jack, which
-#  is why inserting a cable into the line-out jack toggles this entity.
-#  A true "line-in present" sensor is therefore NOT possible on this board;
-#  this entity honestly reports the LINE-OUT jack. (A future "line-in audio
-#  detected" sensor based on ADC signal level is the better substitute.)
+#  Jack detection (schematic-verified): GPIO39 senses the LINE-OUT (J2) jack.
+#  The LINE-IN jack (J1) exposes only INL/INR/AGND — it has NO detect line, so a
+#  true "line-in present" sensor is not possible on this board. Entity named
+#  honestly for the jack it actually senses.
 # -----------------------------------------------------------------------------
 binary_sensor:
   - platform: gpio
     pin:
       number: GPIO39
       inverted: true
-    name: "Line-Out Jack Present"     # GPIO39 = J2 (output) detect, not line-in
+    name: "Line-Out Jack Present"
 
-# Diagnostic-only device entities. The AUTHORITATIVE nws_alerts-style sensor
-# is built in Home Assistant from the fired events (see ha/ package).
+# Diagnostic-only device entities. The authoritative nws_alerts-style sensor is
+# built in Home Assistant from the fired esphome.same_alert events.
 sensor:
   - platform: template
     id: same_decode_count
@@ -164,42 +139,31 @@ text_sensor:
     name: "SAME Last Raw Header"
 
 # -----------------------------------------------------------------------------
-#  Audio INPUT routing — schematic-verified as CORRECT:
-#    J1 (line-in) -> INL/INR -> LINEINL(22)/LINEINR(21) -> ES8388 ADC
-#    ES8388 ADC data (DIN) -> GPIO35 -> I2S -> ESP32
-#  >>> Feed your weather-radio audio into the LINE-IN (J1) jack. <<<
-#
-#  It fires esphome.same_alert for EVERY decoded alert. The component uses
-#  same_event_codes.h to resolve:
-#    - event  (name)     via describe_(code)
-#    - severity (tier)   via severity_for_(code)
-#  Field annotations:
-#    REAL      = present in the SAME header
-#    DERIVED   = computed from a SAME field (code table, purge->timestamp, hash)
-#    (SAME has NO Headline/Description/Instruction/URL/Certainty — omitted.)
+#  The SAME decoder. Receives PCM via feed_bytes() (from microphone on_data),
+#  runs a non-blocking dual-Goertzel AFSK state machine, and fires
+#  esphome.same_alert for EVERY decoded alert. Uses same_event_codes.h for the
+#  event name + default severity per 3-letter SAME code.
+#    REAL    = present in the SAME header
+#    DERIVED = computed (code table, purge->timestamp, hash)
 # -----------------------------------------------------------------------------
 same_decoder:
   id: same_dec
-  i2s_audio_id: i2s_in
-  i2s_din_pin: GPIO35            # ES8388 ADC data line into the ESP32 — VERIFIED
-  sample_rate: 48000            # 48 kHz mono
-  # Diagnostic sinks:
+  sample_rate: 48000
   decode_count_sensor: same_decode_count
   last_raw_sensor: same_last_raw
-  # Fire one HA event per decoded alert, carrying the full payload:
   on_alert:
     then:
       - homeassistant.event:
           event: esphome.same_alert
           data:
-            id: !lambda 'return id(same_dec).last_alert_id();'           # DERIVED (stable hash)
-            event_code: !lambda 'return id(same_dec).last_event_code();' # REAL (EEE)
-            event: !lambda 'return id(same_dec).last_event_name();'      # DERIVED (code table -> name)
-            severity: !lambda 'return id(same_dec).last_severity();'     # DERIVED (code table -> tier)
-            originator: !lambda 'return id(same_dec).last_originator();' # REAL (ORG)
-            status: !lambda 'return id(same_dec).last_status();'         # DERIVED (Actual/Test)
-            areas: !lambda 'return id(same_dec).last_areas_csv();'       # REAL (PSSCCC list)
-            onset: !lambda 'return id(same_dec).last_onset_iso();'       # DERIVED (JJJHHMM -> ISO)
-            expires: !lambda 'return id(same_dec).last_expires_iso();'   # DERIVED (purge -> ISO)
-            sender: !lambda 'return id(same_dec).last_sender();'         # REAL (LLLLLLLL)
-            raw: !lambda 'return id(same_dec).last_raw_header();'        # REAL (full ZCZC-...)
+            id: !lambda 'return id(same_dec).last_alert_id();'
+            event_code: !lambda 'return id(same_dec).last_event_code();'
+            event: !lambda 'return id(same_dec).last_event_name();'
+            severity: !lambda 'return id(same_dec).last_severity();'
+            originator: !lambda 'return id(same_dec).last_originator();'
+            status: !lambda 'return id(same_dec).last_status();'
+            areas: !lambda 'return id(same_dec).last_areas_csv();'
+            onset: !lambda 'return id(same_dec).last_onset_iso();'
+            expires: !lambda 'return id(same_dec).last_expires_iso();'
+            sender: !lambda 'return id(same_dec).last_sender();'
+            raw: !lambda 'return id(same_dec).last_raw_header();'
