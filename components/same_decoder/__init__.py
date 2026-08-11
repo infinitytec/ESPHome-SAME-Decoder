@@ -1,9 +1,10 @@
 # components/same_decoder/__init__.py
 # Config schema + codegen for the SAME decoder.
 # Audio is delivered from YAML via microphone: on_data -> feed_bytes(), so this
-# schema does NOT own the microphone/I2S — it only declares the decoder itself,
-# its diagnostic sinks, and the on_alert automation. This keeps us decoupled
-# from the (evolving) microphone C++ consumer API (future-proof).
+# schema does NOT own the microphone/I2S. Adds an optional software `gain`
+# applied inside feed_bytes() (the source-level gain_factor is not reachable
+# through the on_data bridge, so we apply our own — and allow >64 since the
+# incoming line-in level can be very low).
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
@@ -18,17 +19,18 @@ CODEOWNERS = ["@infinitytec"]
 CONF_DECODE_COUNT_SENSOR = "decode_count_sensor"
 CONF_LAST_RAW_SENSOR = "last_raw_sensor"
 CONF_ON_ALERT = "on_alert"
+CONF_GAIN = "gain"
 
 same_decoder_ns = cg.esphome_ns.namespace("same_decoder")
 SAMEDecoder = same_decoder_ns.class_("SAMEDecoder", cg.Component)
 
-# Automation trigger fired once per decoded alert.
 AlertTrigger = same_decoder_ns.class_("AlertTrigger", automation.Trigger.template())
 
 CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(SAMEDecoder),
         cv.Optional(CONF_SAMPLE_RATE, default=48000): cv.int_range(min=8000, max=96000),
+        cv.Optional(CONF_GAIN, default=1.0): cv.float_range(min=1.0, max=1000.0),
         cv.Optional(CONF_DECODE_COUNT_SENSOR): cv.use_id(sensor.Sensor),
         cv.Optional(CONF_LAST_RAW_SENSOR): cv.use_id(text_sensor.TextSensor),
         cv.Optional(CONF_ON_ALERT): automation.validate_automation(
@@ -45,6 +47,7 @@ async def to_code(config):
     await cg.register_component(var, config)
 
     cg.add(var.set_sample_rate(config[CONF_SAMPLE_RATE]))
+    cg.add(var.set_gain(config[CONF_GAIN]))
 
     if CONF_DECODE_COUNT_SENSOR in config:
         s = await cg.get_variable(config[CONF_DECODE_COUNT_SENSOR])
