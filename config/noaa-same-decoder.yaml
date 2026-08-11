@@ -10,13 +10,17 @@
 #      filtering, builds the nws_alerts-style entity, and prunes on expiry.
 #    * Each event carries a stable `id` so HA upserts on re-broadcast/update.
 #
-#  Component files pulled from GitHub (Root/same_decoder/):
-#    __init__.py, same_decoder.h, same_decoder.cpp, same_event_codes.h
+#  Component files (repo layout, standard ESPHome convention):
+#    components/same_decoder/__init__.py
+#    components/same_decoder/same_decoder.h
+#    components/same_decoder/same_decoder.cpp
+#    components/same_decoder/same_event_codes.h
 #
 #  Board pin reference (ES8388 Audio Kit, schematic-verified):
 #    I2C:  sda GPIO33, scl GPIO32
 #    I2S:  mclk GPIO0, bclk GPIO27, lrclk GPIO25, din GPIO35 (ADC data in)
-#    AMP control (ShutDown/CTRL): GPIO21   |   Line-in jack detect: GPIO39
+#    AMP control (ShutDown/CTRL): GPIO21
+#    Jack detect: GPIO39 = LINE-OUT (J2) detect. LINE-IN (J1) has NO detect pin.
 # =============================================================================
 
 substitutions:
@@ -29,6 +33,11 @@ esphome:
     priority: -100
     then:
       - lambda: 'ESP_LOGI("same", "Boot complete; SAME decoder starting.");'
+      # No initial_option on the es8388 select; force the ADC input here instead.
+      # DIFFERENCE = both L+R line-in channels feed the ADC.
+      - select.set:
+          id: same_adc_input
+          option: "DIFFERENCE"
 
 esp32:
   board: esp-wrover-kit          # ESP32-A1S / WROVER-class module (has PSRAM)
@@ -61,7 +70,7 @@ captive_portal:
 
 # -----------------------------------------------------------------------------
 #  Custom SAME decoder external component from GitHub.
-#  path: same_decoder matches the current repo layout (Root/same_decoder/).
+#  Uses the standard components/ layout, so NO `path:` is needed.
 # -----------------------------------------------------------------------------
 external_components:
   - source:
@@ -69,8 +78,8 @@ external_components:
       url: https://github.com/infinitytec/ESPHome-SAME-Decoder
       ref: main
     components: [same_decoder]
-    refresh: 0s
-    
+    refresh: 1d
+
 # -----------------------------------------------------------------------------
 #  I2C bus — used to program the ES8388 codec (and, in Tier C, an I²C display).
 # -----------------------------------------------------------------------------
@@ -92,14 +101,17 @@ audio_dac:
     address: 0x10
 
 # Select which analog line the ADC listens to.
-#   LINE1 = left only | LINE2 = right only | DIFFERENCE = both L+R
+#   adc_input_mic: LINE1 (default) | LINE2 | DIFFERENCE
+#   dac_output:    LINE1 (default) | LINE2 | BOTH
+# NOTE: this platform has NO `initial_option`; the boot automation above sets it.
 select:
   - platform: es8388
     es8388_id: es8388_codec
     adc_input_mic:
-      name: "SAME ADC Input"
+      id: same_adc_input
+      name: "SAME ADC Input"        # LINE1 | LINE2 | DIFFERENCE
     dac_output:
-      name: "SAME DAC Output"      # unused for decoding; harmless to expose
+      name: "SAME DAC Output"       # LINE1 | LINE2 | BOTH (unused for decoding)
 
 # -----------------------------------------------------------------------------
 #  I2S bus — the custom same_decoder component owns the read loop (48 kHz mono).
@@ -119,13 +131,23 @@ switch:
     name: "Audio Amp"
     restore_mode: ALWAYS_OFF
 
+# -----------------------------------------------------------------------------
+#  Jack detection.
+#  IMPORTANT (schematic-verified): The line-IN jack (J1) exposes ONLY INL/INR/
+#  AGND — it has NO insertion-detect line. The detect signals (HP_Detect /
+#  SD_Detect) belong to the line-OUT/headphone jack (J2), routed via R30/R36
+#  pull-ups to the IO34/IO36/IO39 group. GPIO39 senses the OUTPUT jack, which
+#  is why inserting a cable into the line-out jack toggles this entity.
+#  A true "line-in present" sensor is therefore NOT possible on this board;
+#  this entity honestly reports the LINE-OUT jack. (A future "line-in audio
+#  detected" sensor based on ADC signal level is the better substitute.)
+# -----------------------------------------------------------------------------
 binary_sensor:
-  # Line-in jack insertion detect on this board.
   - platform: gpio
     pin:
       number: GPIO39
       inverted: true
-    name: "Line-In Jack Present"
+    name: "Line-Out Jack Present"     # GPIO39 = J2 (output) detect, not line-in
 
 # Diagnostic-only device entities. The AUTHORITATIVE nws_alerts-style sensor
 # is built in Home Assistant from the fired events (see ha/ package).
@@ -142,8 +164,13 @@ text_sensor:
     name: "SAME Last Raw Header"
 
 # -----------------------------------------------------------------------------
-#  Decoder wiring. It fires esphome.same_alert for EVERY decoded alert.
-#  The component uses same_event_codes.h to resolve:
+#  Audio INPUT routing — schematic-verified as CORRECT:
+#    J1 (line-in) -> INL/INR -> LINEINL(22)/LINEINR(21) -> ES8388 ADC
+#    ES8388 ADC data (DIN) -> GPIO35 -> I2S -> ESP32
+#  >>> Feed your weather-radio audio into the LINE-IN (J1) jack. <<<
+#
+#  It fires esphome.same_alert for EVERY decoded alert. The component uses
+#  same_event_codes.h to resolve:
 #    - event  (name)     via describe_(code)
 #    - severity (tier)   via severity_for_(code)
 #  Field annotations:
@@ -154,7 +181,7 @@ text_sensor:
 same_decoder:
   id: same_dec
   i2s_audio_id: i2s_in
-  i2s_din_pin: GPIO35            # ES8388 ADC data line into the ESP32
+  i2s_din_pin: GPIO35            # ES8388 ADC data line into the ESP32 — VERIFIED
   sample_rate: 48000            # 48 kHz mono
   # Diagnostic sinks:
   decode_count_sensor: same_decode_count
