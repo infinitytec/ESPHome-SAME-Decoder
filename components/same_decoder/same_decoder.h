@@ -39,6 +39,7 @@ class SAMEDecoder : public Component {
   float get_setup_priority() const override { return setup_priority::LATE; }
 
   void set_sample_rate(uint32_t rate) { this->sample_rate_ = rate; }
+  void set_gain(float g) { this->gain_ = g; }
   void set_decode_count_sensor(sensor::Sensor *s) { this->decode_count_sensor_ = s; }
   void set_last_raw_sensor(text_sensor::TextSensor *s) { this->last_raw_sensor_ = s; }
   void register_alert_trigger(AlertTrigger *t) { this->alert_triggers_.push_back(t); }
@@ -70,6 +71,7 @@ class SAMEDecoder : public Component {
   void publish_alert_(const SameAlert &a);
 
   uint32_t sample_rate_{48000};
+  float gain_{1.0f};
   sensor::Sensor *decode_count_sensor_{nullptr};
   text_sensor::TextSensor *last_raw_sensor_{nullptr};
   std::vector<AlertTrigger *> alert_triggers_;
