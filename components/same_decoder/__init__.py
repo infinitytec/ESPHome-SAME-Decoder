@@ -1,76 +1,69 @@
-# my_components/same_decoder/__init__.py
+# components/same_decoder/__init__.py
+# ESPHome external component config schema + codegen for the SAME decoder.
+# Vocabulary MATCHES config/noaa-same-decoder.yaml (count/event model):
+#   i2s_audio_id, i2s_din_pin, sample_rate,
+#   decode_count_sensor, last_raw_sensor, on_alert (automation trigger).
+
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome import automation
-from esphome.components import i2s_audio, text_sensor, sensor, binary_sensor
-from esphome.const import CONF_ID, CONF_SAMPLE_RATE
+from esphome import automation, pins
+from esphome.components import i2s_audio, sensor, text_sensor
+from esphome.const import CONF_ID, CONF_SAMPLE_RATE, CONF_TRIGGER_ID
 
-CODEOWNERS = ["@you"]
-DEPENDENCIES = ["i2s_audio"]
-AUTO_LOAD = ["text_sensor", "sensor", "binary_sensor"]
+DEPENDENCIES = ["i2s_audio", "api"]
+AUTO_LOAD = ["sensor", "text_sensor"]
+CODEOWNERS = ["@infinitytec"]
 
-same_ns = cg.esphome_ns.namespace("same_decoder")
-SAMEDecoder = same_ns.class_("SAMEDecoder", cg.Component)
-OnAlertTrigger = same_ns.class_("OnAlertTrigger", automation.Trigger.template())
-
+CONF_I2S_AUDIO_ID = "i2s_audio_id"
 CONF_I2S_DIN_PIN = "i2s_din_pin"
-CONF_FIPS_SOURCE = "fips_source"
-CONF_ALERT_ACTIVE = "alert_active"
-CONF_EVENT_CODE_SENSOR = "event_code_sensor"
-CONF_EVENT_SENSOR = "event_sensor"
-CONF_SEVERITY_SENSOR = "severity_sensor"
-CONF_ORIGINATOR_SENSOR = "originator_sensor"
-CONF_FIPS_AFFECTED_SENSOR = "fips_affected_sensor"
-CONF_RAW_HEADER_SENSOR = "raw_header_sensor"
-CONF_SENDER_SENSOR = "sender_sensor"
-CONF_EXPIRES_SENSOR = "expires_sensor"
+CONF_DECODE_COUNT_SENSOR = "decode_count_sensor"
+CONF_LAST_RAW_SENSOR = "last_raw_sensor"
 CONF_ON_ALERT = "on_alert"
 
-CONFIG_SCHEMA = cv.Schema({
-    cv.GenerateID(): cv.declare_id(SAMEDecoder),
-    cv.GenerateID(i2s_audio.CONF_I2S_AUDIO_ID): cv.use_id(i2s_audio.I2SAudioComponent),
-    cv.Required(CONF_I2S_DIN_PIN): cv.int_,
-    cv.Optional(CONF_SAMPLE_RATE, default=48000): cv.int_range(min=8000, max=48000),
-    cv.Required(CONF_FIPS_SOURCE): cv.use_id(text_sensor.TextSensor),
-    cv.Required(CONF_ALERT_ACTIVE): cv.use_id(binary_sensor.BinarySensor),
-    cv.Required(CONF_EVENT_CODE_SENSOR): cv.use_id(text_sensor.TextSensor),
-    cv.Required(CONF_EVENT_SENSOR): cv.use_id(text_sensor.TextSensor),
-    cv.Required(CONF_SEVERITY_SENSOR): cv.use_id(text_sensor.TextSensor),
-    cv.Required(CONF_ORIGINATOR_SENSOR): cv.use_id(text_sensor.TextSensor),
-    cv.Required(CONF_FIPS_AFFECTED_SENSOR): cv.use_id(text_sensor.TextSensor),
-    cv.Required(CONF_RAW_HEADER_SENSOR): cv.use_id(text_sensor.TextSensor),
-    cv.Required(CONF_SENDER_SENSOR): cv.use_id(text_sensor.TextSensor),
-    cv.Required(CONF_EXPIRES_SENSOR): cv.use_id(sensor.Sensor),
-    cv.Optional(CONF_ON_ALERT): automation.validate_automation({
-        cv.GenerateID(automation.CONF_TRIGGER_ID): cv.declare_id(OnAlertTrigger),
-    }),
-}).extend(cv.COMPONENT_SCHEMA)
+same_decoder_ns = cg.esphome_ns.namespace("same_decoder")
+SAMEDecoder = same_decoder_ns.class_("SAMEDecoder", cg.Component)
+
+# Automation trigger fired once per decoded alert.
+AlertTrigger = same_decoder_ns.class_(
+    "AlertTrigger", automation.Trigger.template()
+)
+
+CONFIG_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(): cv.declare_id(SAMEDecoder),
+        cv.GenerateID(CONF_I2S_AUDIO_ID): cv.use_id(i2s_audio.I2SAudioComponent),
+        cv.Required(CONF_I2S_DIN_PIN): pins.internal_gpio_input_pin_number,
+        cv.Optional(CONF_SAMPLE_RATE, default=48000): cv.int_range(min=8000, max=96000),
+        # Diagnostic sinks (optional):
+        cv.Optional(CONF_DECODE_COUNT_SENSOR): cv.use_id(sensor.Sensor),
+        cv.Optional(CONF_LAST_RAW_SENSOR): cv.use_id(text_sensor.TextSensor),
+        # Fired for every decoded alert:
+        cv.Optional(CONF_ON_ALERT): automation.validate_automation(
+            {
+                cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(AlertTrigger),
+            }
+        ),
+    }
+).extend(cv.COMPONENT_SCHEMA)
 
 
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
 
-    parent = await cg.get_variable(config[i2s_audio.CONF_I2S_AUDIO_ID])
+    parent = await cg.get_variable(config[CONF_I2S_AUDIO_ID])
     cg.add(var.set_i2s_parent(parent))
     cg.add(var.set_din_pin(config[CONF_I2S_DIN_PIN]))
     cg.add(var.set_sample_rate(config[CONF_SAMPLE_RATE]))
 
-    for key, setter in [
-        (CONF_FIPS_SOURCE, var.set_fips_source),
-        (CONF_ALERT_ACTIVE, var.set_alert_active),
-        (CONF_EVENT_CODE_SENSOR, var.set_event_code_sensor),
-        (CONF_EVENT_SENSOR, var.set_event_sensor),
-        (CONF_SEVERITY_SENSOR, var.set_severity_sensor),
-        (CONF_ORIGINATOR_SENSOR, var.set_originator_sensor),
-        (CONF_FIPS_AFFECTED_SENSOR, var.set_fips_affected_sensor),
-        (CONF_RAW_HEADER_SENSOR, var.set_raw_header_sensor),
-        (CONF_SENDER_SENSOR, var.set_sender_sensor),
-        (CONF_EXPIRES_SENSOR, var.set_expires_sensor),
-    ]:
-        cg.add(setter(await cg.get_variable(config[key])))
+    if CONF_DECODE_COUNT_SENSOR in config:
+        s = await cg.get_variable(config[CONF_DECODE_COUNT_SENSOR])
+        cg.add(var.set_decode_count_sensor(s))
+    if CONF_LAST_RAW_SENSOR in config:
+        ts = await cg.get_variable(config[CONF_LAST_RAW_SENSOR])
+        cg.add(var.set_last_raw_sensor(ts))
 
     for conf in config.get(CONF_ON_ALERT, []):
-        trigger = cg.new_Pvariable(conf[automation.CONF_TRIGGER_ID])
+        trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)
         await automation.build_automation(trigger, [], conf)
-        cg.add(var.add_on_alert_trigger(trigger))
+        cg.add(var.register_alert_trigger(trigger))
