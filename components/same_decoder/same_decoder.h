@@ -60,7 +60,7 @@ class SAMEDecoder : public Component {
 
  protected:
   void feed_sample_(int16_t s);
-  void process_bit_(bool bit);
+  void emit_bit_(bool bit);
   void reset_capture_();
   void vote_and_emit_();
 
@@ -79,18 +79,25 @@ class SAMEDecoder : public Component {
   SameAlert last_{};
   uint32_t decode_count_{0};
 
-  static constexpr int   BIT_WINDOW      = 92;
+  // ---- Timing / sampling ----
   static constexpr float SAMPLES_PER_BIT = 92.16f;
-  int16_t win_[BIT_WINDOW];
-  int     win_fill_{0};
-  float   bit_phase_{0.0f};
+  static constexpr float PHASE_INC       = 1.0f / 92.16f;   // 0.01085069
+  static constexpr int   GWIN            = 64;              // Goertzel window (< bit)
+  int16_t ring_[128];                                       // circular sample history
+  int     ring_pos_{0};
+  float   phase_{0.0f};                                     // bit-clock phase accumulator
 
-  enum Phase { HUNT_PREAMBLE, CAPTURE };
-  Phase phase_{HUNT_PREAMBLE};
-  bool  last_bit_{false};
-  int   preamble_run_{0};
-  static constexpr int PREAMBLE_MIN_ALT = 16;
+  // ---- Sync / framing ----
+  enum Phase { HUNT_SYNC, CAPTURE };
+  Phase   phase_state_{HUNT_SYNC};
+  uint32_t sync_shift_{0};                                  // rolling 32-bit bit history
 
+  // LSB-first 'ZCZC' = 0x5A 0x43 0x5A 0x43 transmitted LSB-first.
+  // As a 32-bit value with FIRST-received bit in LSB position of the window,
+  // we compare against the assembled pattern (see .cpp for construction).
+  static constexpr uint32_t SYNC_ZCZC = 0x4358435A;         // see .cpp note
+
+  // ---- Byte / burst assembly ----
   uint8_t     cur_byte_{0};
   int         cur_nbits_{0};
   std::string cur_burst_;
