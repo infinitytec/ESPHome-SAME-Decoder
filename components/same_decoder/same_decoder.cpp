@@ -8,34 +8,30 @@
 #include <iomanip>
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
 
 namespace esphome {
 namespace same_decoder {
 
 static const char *const TAG = "same_decoder";
 
-static constexpr float COEFF_MARK  = 1.926090f;
-static constexpr float COEFF_SPACE = 1.958313f;
+static constexpr float COEFF_MARK  = 1.926090f;   // 2*cos(2*pi*2083.33/48000)
+static constexpr float COEFF_SPACE = 1.958313f;   // 2*cos(2*pi*1562.5/48000)
 
-static float goertzel_energy(const int16_t *x, int n, float coeff) {
+// Goertzel energy over `n` samples pulled from the ring buffer ending at `endpos`.
+static float goertzel_ring(const int16_t *ring, int ringlen, int startpos, int n, float coeff) {
   float s1 = 0.f, s2 = 0.f;
   for (int i = 0; i < n; i++) {
-    float s0 = (float) x[i] + coeff * s1 - s2;
+    int idx = (startpos + i) % ringlen;
+    float s0 = (float) ring[idx] + coeff * s1 - s2;
     s2 = s1;
     s1 = s0;
   }
   return s1 * s1 + s2 * s2 - coeff * s1 * s2;
 }
 
-static bool decode_bit(const int16_t *win, int n) {
-  float em = goertzel_energy(win, n, COEFF_MARK);
-  float es = goertzel_energy(win, n, COEFF_SPACE);
-  return em > es;
-}
-
 void SAMEDecoder::setup() {
-  ESP_LOGCONFIG(TAG, "SAME decoder ready (%.2f samples/bit, gain=%.1f, non-blocking).",
-                SAMPLES_PER_BIT, this->gain_);
+  ESP_LOGCONFIG(TAG, "SAME decoder ready (timing-recovery, gain=%.1f).", this->gain_);
   this->reset_capture_();
 }
 
@@ -43,10 +39,9 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "SAME Decoder:");
   ESP_LOGCONFIG(TAG, "  Sample rate: %" PRIu32 " Hz", this->sample_rate_);
   ESP_LOGCONFIG(TAG, "  Software gain: %.1f", this->gain_);
-  ESP_LOGCONFIG(TAG, "  Bit window: %d samples (%.2f/bit)", BIT_WINDOW, SAMPLES_PER_BIT);
+  ESP_LOGCONFIG(TAG, "  Samples/bit: %.2f, Goertzel window: %d", SAMPLES_PER_BIT, GWIN);
   ESP_LOGCONFIG(TAG, "  Goertzel coeffs: mark=%.6f space=%.6f", COEFF_MARK, COEFF_SPACE);
   ESP_LOGCONFIG(TAG, "  Alert triggers: %u", (unsigned) this->alert_triggers_.size());
-  ESP_LOGCONFIG(TAG, "  Audio via microphone:on_data -> feed_bytes().");
 }
 
 void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
@@ -60,25 +55,33 @@ void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
   }
 }
 
+// Push each sample into the ring; advance the bit-clock phase; when it crosses
+// 1.0, sample the bit at its CENTER using a 64-sample Goertzel window.
 void SAMEDecoder::feed_sample_(int16_t s) {
-  this->win_[this->win_fill_++] = s;
-  if (this->win_fill_ < BIT_WINDOW)
+  this->ring_[this->ring_pos_] = s;
+  this->ring_pos_ = (this->ring_pos_ + 1) % 128;
+
+  this->phase_ += PHASE_INC;
+  if (this->phase_ < 1.0f)
     return;
+  this->phase_ -= 1.0f;
 
-  bool bit = decode_bit(this->win_, BIT_WINDOW);
-  this->win_fill_ = 0;
+  // Bit center is ~half a bit behind the current write position. The 64-sample
+  // window should be centered on the bit: start it GWIN samples back from the
+  // most-recent sample, offset so its midpoint sits at the bit center.
+  // Most-recent sample index is (ring_pos_ - 1). Window covers the last GWIN
+  // samples, which straddle the bit center given our phase alignment.
+  int start = (this->ring_pos_ - GWIN + 128) % 128;
+  float em = goertzel_ring(this->ring_, 128, start, GWIN, COEFF_MARK);
+  float es = goertzel_ring(this->ring_, 128, start, GWIN, COEFF_SPACE);
+  bool bit = em > es;
 
-  this->bit_phase_ += (SAMPLES_PER_BIT - BIT_WINDOW);
-  if (this->bit_phase_ >= 1.0f) {
-    this->bit_phase_ -= 1.0f;
-  }
-
-  this->process_bit_(bit);
+  this->emit_bit_(bit);
 }
 
 void SAMEDecoder::reset_capture_() {
-  this->phase_ = HUNT_PREAMBLE;
-  this->preamble_run_ = 0;
+  this->phase_state_ = HUNT_SYNC;
+  this->sync_shift_ = 0;
   this->cur_byte_ = 0;
   this->cur_nbits_ = 0;
   this->cur_burst_.clear();
@@ -86,25 +89,28 @@ void SAMEDecoder::reset_capture_() {
   for (int i = 0; i < 3; i++) this->bursts_[i].clear();
 }
 
-void SAMEDecoder::process_bit_(bool bit) {
-  if (this->phase_ == HUNT_PREAMBLE) {
-    if (bit != this->last_bit_) {
-      this->preamble_run_++;
-    } else {
-      this->preamble_run_ = 0;
-    }
-    this->last_bit_ = bit;
+void SAMEDecoder::emit_bit_(bool bit) {
+  if (this->phase_state_ == HUNT_SYNC) {
+    // Shift new bit into MSB side; first-received bit ends up toward LSB as we
+    // shift right. Build a rolling 32-bit window and compare against ZCZC.
+    this->sync_shift_ = (this->sync_shift_ >> 1) | ((uint32_t) (bit ? 1u : 0u) << 31);
 
-    if (this->preamble_run_ >= PREAMBLE_MIN_ALT) {
-      ESP_LOGD(TAG, "Preamble lock: %d alternating bits.", this->preamble_run_);
-      this->phase_ = CAPTURE;
+    // 'ZCZC' LSB-first bitstream: Z=0x5A->01011010, C=0x43->11000010 (LSB-first
+    // per-byte), concatenated = 01011010 11000010 01011010 11000010.
+    // Assembled into a 32-bit word as received (first bit -> LSB after 32 shifts):
+    // We match SYNC_ZCZC computed to equal that received pattern.
+    if (this->sync_shift_ == SYNC_ZCZC) {
+      ESP_LOGD(TAG, "ZCZC sync found. Byte-aligned capture starting.");
+      this->phase_state_ = CAPTURE;
+      // Seed the burst with the known "ZCZC" we just matched.
+      this->cur_burst_ = "ZCZC";
       this->cur_byte_ = 0;
       this->cur_nbits_ = 0;
-      this->cur_burst_.clear();
     }
     return;
   }
 
+  // CAPTURE — assemble LSB-first bytes.
   this->cur_byte_ >>= 1;
   if (bit) this->cur_byte_ |= 0x80;
   this->cur_nbits_++;
@@ -118,7 +124,16 @@ void SAMEDecoder::process_bit_(bool bit) {
     bool eom = (this->cur_burst_.size() >= 4 &&
                 this->cur_burst_.compare(this->cur_burst_.size() - 4, 4, "NNNN") == 0);
     if (eom || this->cur_burst_.size() >= (size_t) MAX_HEADER_BYTES) {
-      ESP_LOGD(TAG, "Burst %d raw: '%s'", this->burst_idx_, this->cur_burst_.c_str());
+      // Hex+ASCII diagnostic of the assembled burst.
+      std::string hex;
+      char tmp[4];
+      for (size_t i = 0; i < this->cur_burst_.size() && i < 32; i++) {
+        snprintf(tmp, sizeof(tmp), "%02X ", (uint8_t) this->cur_burst_[i]);
+        hex += tmp;
+      }
+      ESP_LOGD(TAG, "Burst %d ascii: '%s'", this->burst_idx_, this->cur_burst_.c_str());
+      ESP_LOGD(TAG, "Burst %d hex : %s", this->burst_idx_, hex.c_str());
+
       this->bursts_[this->burst_idx_] = this->cur_burst_;
       this->burst_idx_++;
       this->cur_burst_.clear();
@@ -127,6 +142,9 @@ void SAMEDecoder::process_bit_(bool bit) {
         this->vote_and_emit_();
         this->reset_capture_();
       } else {
+        // Next repeat: hunt for its ZCZC again (robust to gaps between bursts).
+        this->phase_state_ = HUNT_SYNC;
+        this->sync_shift_ = 0;
         this->cur_byte_ = 0;
         this->cur_nbits_ = 0;
       }
