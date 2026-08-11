@@ -30,8 +30,8 @@ struct SameAlert {
 };
 
 // Automation trigger fired once per decoded alert.
-// FULLY DEFINED here, BEFORE SAMEDecoder uses it (fixes incomplete-type error).
-// No parameters — on_alert lambdas read the accessors off the component.
+// Defined BEFORE SAMEDecoder uses it. No parameters — on_alert lambdas read
+// the accessors off the component via id(same_dec) in YAML.
 class AlertTrigger : public Trigger<> {
  public:
   AlertTrigger() = default;
@@ -66,11 +66,11 @@ class SAMEDecoder : public Component {
   std::string last_raw_header() const { return this->last_.raw_header; }
 
  protected:
-  // ---- DSP pipeline (STUBS — the real work) ----
-  size_t read_samples_(int16_t *buf, size_t max_samples);   // TODO: I2S read
-  bool start_i2s_();                                        // TODO: configure RX
-  bool find_preamble_();                                    // TODO: preamble hunt
-  bool assemble_burst_(std::string &header_out);            // TODO: 3-burst vote
+  // ---- DSP pipeline ----
+  size_t read_samples_(int16_t *buf, size_t max_samples);   // hardware-binding (port)
+  bool start_i2s_();                                        // arm demod
+  bool find_preamble_();                                    // preamble hunt (0xAB alternation)
+  bool assemble_burst_(std::string &header_out);            // 3-burst 2-of-3 vote
 
   // ---- Parsing / mapping (implemented) ----
   bool parse_header_(const std::string &header, SameAlert &out);
@@ -91,6 +91,12 @@ class SAMEDecoder : public Component {
   SameAlert last_{};
   uint32_t decode_count_{0};
   bool i2s_ready_{false};
+
+  // ---- DSP state ----
+  bool last_preamble_bit_{false};
+  int  preamble_run_{0};
+  static constexpr int PREAMBLE_MIN_ALT = 24;    // consecutive alt bits to lock
+  static constexpr int MAX_HEADER_BYTES = 268;   // SAME max header length cap
 };
 
 }  // namespace same_decoder
