@@ -89,7 +89,7 @@ class SAMEDecoder : public Component {
   Phase phase_{HUNT_PREAMBLE};
   bool  last_bit_{false};
   int   preamble_run_{0};
-  static constexpr int PREAMBLE_MIN_ALT = 24;
+  static constexpr int PREAMBLE_MIN_ALT = 16;
 
   uint8_t     cur_byte_{0};
   int         cur_nbits_{0};
