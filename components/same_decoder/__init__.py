@@ -64,6 +64,6 @@ async def to_code(config):
         cg.add(var.set_last_raw_sensor(ts))
 
     for conf in config.get(CONF_ON_ALERT, []):
-        trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID], var)
+        trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID])
         await automation.build_automation(trigger, [], conf)
         cg.add(var.register_alert_trigger(trigger))
