@@ -3,22 +3,20 @@
 #include "same_event_codes.h"
 #include "esphome/core/log.h"
 
-#include <functional>   // std::hash
+#include <functional>
 #include <sstream>
 #include <iomanip>
-#include <algorithm>    // std::max
+#include <algorithm>
+#include <cinttypes>   // PRIu32
 
 namespace esphome {
 namespace same_decoder {
 
 static const char *const TAG = "same_decoder";
 
-// ================= DSP constants (SAME AFSK @ 48 kHz) =================
-// Mark(1)=2083.33Hz, Space(0)=1562.5Hz, 520.833 bps -> 92.16 samples/bit.
-static constexpr float COEFF_MARK  = 1.926090f;   // 2*cos(2*pi*2083.33/48000)
-static constexpr float COEFF_SPACE = 1.958313f;   // 2*cos(2*pi*1562.5/48000)
+static constexpr float COEFF_MARK  = 1.926090f;
+static constexpr float COEFF_SPACE = 1.958313f;
 
-// Goertzel energy for one coefficient over n samples.
 static float goertzel_energy(const int16_t *x, int n, float coeff) {
   float s1 = 0.f, s2 = 0.f;
   for (int i = 0; i < n; i++) {
@@ -32,10 +30,8 @@ static float goertzel_energy(const int16_t *x, int n, float coeff) {
 static bool decode_bit(const int16_t *win, int n) {
   float em = goertzel_energy(win, n, COEFF_MARK);
   float es = goertzel_energy(win, n, COEFF_SPACE);
-  return em > es;   // true = 1 (mark)
+  return em > es;
 }
-
-// =============================== Lifecycle ===============================
 
 void SAMEDecoder::setup() {
   ESP_LOGCONFIG(TAG, "SAME decoder ready (%.2f samples/bit, non-blocking state machine).",
@@ -45,25 +41,20 @@ void SAMEDecoder::setup() {
 
 void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "SAME Decoder:");
-  ESP_LOGCONFIG(TAG, "  Sample rate: %u Hz", this->sample_rate_);
+  ESP_LOGCONFIG(TAG, "  Sample rate: %" PRIu32 " Hz", this->sample_rate_);
   ESP_LOGCONFIG(TAG, "  Bit window: %d samples (%.2f/bit)", BIT_WINDOW, SAMPLES_PER_BIT);
   ESP_LOGCONFIG(TAG, "  Goertzel coeffs: mark=%.6f space=%.6f", COEFF_MARK, COEFF_SPACE);
   ESP_LOGCONFIG(TAG, "  Alert triggers: %u", (unsigned) this->alert_triggers_.size());
   ESP_LOGCONFIG(TAG, "  Audio via microphone:on_data -> feed_bytes().");
 }
 
-// =========================== Audio ingress ===========================
-
 void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
-  // Interpret raw bytes as little-endian int16 PCM.
   const size_t n = data.size() / 2;
   const int16_t *samples = reinterpret_cast<const int16_t *>(data.data());
   for (size_t i = 0; i < n; i++)
     this->feed_sample_(samples[i]);
 }
 
-// Accumulate samples into a 92-sample window; on fill, emit one bit and advance
-// the fractional bit clock so 92.16 doesn't drift. Never blocks.
 void SAMEDecoder::feed_sample_(int16_t s) {
   this->win_[this->win_fill_++] = s;
   if (this->win_fill_ < BIT_WINDOW)
@@ -72,20 +63,13 @@ void SAMEDecoder::feed_sample_(int16_t s) {
   bool bit = decode_bit(this->win_, BIT_WINDOW);
   this->win_fill_ = 0;
 
-  // Track fractional sample drift: accumulate the 0.16 remainder; when it
-  // exceeds 1 sample, we would skip/repeat. Simplified: shift phase and, when
-  // it rolls over a whole sample, keep one extra sample next window.
   this->bit_phase_ += (SAMPLES_PER_BIT - BIT_WINDOW);
   if (this->bit_phase_ >= 1.0f) {
     this->bit_phase_ -= 1.0f;
-    // Carry one sample into the next window to preserve timing.
-    // (Left simple for clean test files; PLL upgrade is a TODO for off-air.)
   }
 
   this->process_bit_(bit);
 }
-
-// =========================== Demod state machine ===========================
 
 void SAMEDecoder::reset_capture_() {
   this->phase_ = HUNT_PREAMBLE;
@@ -99,7 +83,6 @@ void SAMEDecoder::reset_capture_() {
 
 void SAMEDecoder::process_bit_(bool bit) {
   if (this->phase_ == HUNT_PREAMBLE) {
-    // Count alternating bits as a proxy for the 0xAB preamble tone pattern.
     if (bit != this->last_bit_) {
       this->preamble_run_++;
     } else {
@@ -117,7 +100,6 @@ void SAMEDecoder::process_bit_(bool bit) {
     return;
   }
 
-  // CAPTURE phase — assemble LSB-first bytes.
   this->cur_byte_ >>= 1;
   if (bit) this->cur_byte_ |= 0x80;
   this->cur_nbits_++;
@@ -128,7 +110,6 @@ void SAMEDecoder::process_bit_(bool bit) {
     this->cur_byte_ = 0;
     this->cur_nbits_ = 0;
 
-    // End of this burst on NNNN terminator or length cap.
     bool eom = (this->cur_burst_.size() >= 4 &&
                 this->cur_burst_.compare(this->cur_burst_.size() - 4, 4, "NNNN") == 0);
     if (eom || this->cur_burst_.size() >= (size_t) MAX_HEADER_BYTES) {
@@ -139,9 +120,8 @@ void SAMEDecoder::process_bit_(bool bit) {
 
       if (this->burst_idx_ >= 3) {
         this->vote_and_emit_();
-        this->reset_capture_();   // back to hunting for the next message
+        this->reset_capture_();
       } else {
-        // Expect the next repeat of the header; keep capturing.
         this->cur_byte_ = 0;
         this->cur_nbits_ = 0;
       }
@@ -150,7 +130,6 @@ void SAMEDecoder::process_bit_(bool bit) {
 }
 
 void SAMEDecoder::vote_and_emit_() {
-  // Byte-by-byte 2-of-3 majority vote across captured bursts.
   size_t maxlen = 0;
   for (int i = 0; i < 3; i++) maxlen = std::max(maxlen, this->bursts_[i].size());
   std::string voted;
@@ -179,8 +158,6 @@ void SAMEDecoder::vote_and_emit_() {
     this->publish_alert_(alert);
 }
 
-// =========================== Parsing / mapping ===========================
-
 std::string SAMEDecoder::describe_(const std::string &code) {
   auto it = SAME_EVENT_CODES.find(code);
   if (it != SAME_EVENT_CODES.end())
@@ -204,7 +181,6 @@ std::string SAMEDecoder::make_id_(const SameAlert &a) {
 }
 
 bool SAMEDecoder::parse_header_(const std::string &header, SameAlert &out) {
-  // Expected: ZCZC-ORG-EEE-PSSCCC-...+TTTT-JJJHHMM-LLLLLLLL-
   out.raw_header = header;
   if (header.rfind("ZCZC", 0) != 0)
     return false;
@@ -219,10 +195,10 @@ bool SAMEDecoder::parse_header_(const std::string &header, SameAlert &out) {
   if (parts.size() < 4)
     return false;
 
-  out.originator = parts【1-abc】;                               // REAL
-  out.event_code = parts【2-abc】;                               // REAL
-  out.event_name = this->describe_(out.event_code);        // DERIVED
-  out.severity   = this->severity_for_(out.event_code);    // DERIVED
+  out.originator = parts[$1];
+  out.event_code = parts;
+  out.event_name = this->describe_(out.event_code);
+  out.severity   = this->severity_for_(out.event_code);
 
   std::string areas;
   for (size_t i = 3; i < parts.size(); i++) {
@@ -230,18 +206,17 @@ bool SAMEDecoder::parse_header_(const std::string &header, SameAlert &out) {
     if (!areas.empty()) areas += ",";
     areas += parts[i];
   }
-  out.areas_csv = areas;                                   // REAL
+  out.areas_csv = areas;
 
   out.status = (out.event_code == "RWT" || out.event_code == "RMT" ||
                 out.event_code == "DMO" || out.event_code == "NPT")
-                   ? "Test" : "Actual";                    // DERIVED
+                   ? "Test" : "Actual";
 
-  // TODO: parse purge (+TTTT) and issue (JJJHHMM) into onset/expires ISO.
-  out.onset_iso = "";                                      // DERIVED (TODO)
-  out.expires_iso = "";                                    // DERIVED (TODO)
-  out.sender = parts.empty() ? "" : parts.back();          // REAL
+  out.onset_iso = "";
+  out.expires_iso = "";
+  out.sender = parts.empty() ? "" : parts.back();
 
-  out.id = this->make_id_(out);                            // DERIVED
+  out.id = this->make_id_(out);
   return true;
 }
 
