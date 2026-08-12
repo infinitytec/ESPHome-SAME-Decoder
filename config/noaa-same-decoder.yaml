@@ -1,5 +1,5 @@
 # =============================================================================
-#  NOAA Weather Radio SAME Decoder — AI-Thinker ESP32-Audio-Kit (ESP32-A1S / ES8388)
+#  NOAA Weather Radio SAME Decoder - AI-Thinker ESP32-Audio-Kit (ESP32-A1S / ES8388)
 #  Repo location: config/noaa-same-decoder.yaml
 #
 #  Audio input path (schematic-verified):
@@ -67,6 +67,7 @@ ota:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  power_save_mode: none                 # keep radio fully awake so WiFi work never starves the I2S/audio task (roaming stays enabled)
   ap:
     ssid: "${device_name} Fallback"
     password: !secret fallback_password
@@ -124,19 +125,6 @@ microphone:
       then:
         - lambda: |-
             id(same_dec).feed_bytes(x);
-            // Diagnostic: peak absolute sample value in this chunk.
-            const int16_t *s = reinterpret_cast<const int16_t *>(x.data());
-            size_t n = x.size() / 2;
-            int32_t peak = 0;
-            int64_t sumsq = 0;
-            for (size_t i = 0; i < n; i++) {
-              int32_t v = s[i];
-              if (v < 0) v = -v;
-              if (v > peak) peak = v;
-              sumsq += (int64_t) s[i] * s[i];
-            }
-            float rms = n ? sqrtf((float) sumsq / n) : 0.0f;
-            ESP_LOGD("mic_lvl", "peak=%ld rms=%.1f n=%d", (long) peak, rms, (int) n);
 
 # Amplifier control (kept OFF for decoding; toggled on only to play audio alarms).
 switch:
@@ -146,9 +134,16 @@ switch:
     name: "Audio Amp"
     restore_mode: ALWAYS_OFF
 
+# Remote reboot from Home Assistant.
+button:
+  - platform: restart
+    name: "Restart"
+    id: same_restart
+    icon: "mdi:restart"
+
 # -----------------------------------------------------------------------------
 #  Jack detection (schematic-verified): GPIO39 senses the LINE-OUT (J2) jack.
-#  The LINE-IN jack (J1) exposes only INL/INR/AGND — it has NO detect line, so a
+#  The LINE-IN jack (J1) exposes only INL/INR/AGND - it has NO detect line, so a
 #  true "line-in present" sensor is not possible on this board. Entity named
 #  honestly for the jack it actually senses.
 # -----------------------------------------------------------------------------
