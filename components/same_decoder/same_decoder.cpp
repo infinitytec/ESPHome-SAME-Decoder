@@ -62,14 +62,14 @@ void SAMEDecoder::setup() {
   this->reset_capture_();
 }
 
-// Runs on the MAIN loop thread. Drain a staged alert (produced by mic_task) and
-// perform all Native API interaction here where it is thread-safe.
+// Runs on the MAIN loop thread. Drain ALL queued alerts (produced by mic_task)
+// and perform all Native API interaction here where it is thread-safe.
 void SAMEDecoder::loop() {
-  if (this->alert_pending_.load(std::memory_order_acquire)) {
-    // Copy while pending is true; the producer will not overwrite the mailbox
-    // because it only writes when alert_pending_ is false.
-    SameAlert a = this->pending_alert_;
-    this->alert_pending_.store(false, std::memory_order_release);
+  uint32_t head = this->q_head_.load(std::memory_order_relaxed);
+  while (head != this->q_tail_.load(std::memory_order_acquire)) {
+    SameAlert a = this->alert_queue_[head];
+    head = (head + 1) % ALERT_Q_LEN;
+    this->q_head_.store(head, std::memory_order_release);
     this->dispatch_alert_(a);
   }
 }
@@ -81,6 +81,7 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "  Samples/bit: %.2f, Goertzel window: %d, ring: %d", SAMPLES_PER_BIT, GWIN, RINGLEN);
   ESP_LOGCONFIG(TAG, "  Goertzel coeffs: mark=%.6f space=%.6f", COEFF_MARK, COEFF_SPACE);
   ESP_LOGCONFIG(TAG, "  Timing loop: Kp=%.3f Ki=%.4f delta=%d conf_min=%.2f", TR_KP, TR_KI, TR_DELTA, TR_CONF_MIN);
+  ESP_LOGCONFIG(TAG, "  Alert queue depth: %d", ALERT_Q_LEN);
   ESP_LOGCONFIG(TAG, "  Alert triggers: %u", (unsigned) this->alert_triggers_.size());
 }
 
@@ -385,9 +386,9 @@ bool SAMEDecoder::parse_header_(const std::string &header, SameAlert &out) {
   return true;
 }
 
-// Called from mic_task. Do NOT touch the Native API here. Stage the alert and
-// let loop() (main thread) do all publish_state()/trigger() work. Drop-if-
-// pending keeps this single-producer/single-consumer and lock-free.
+// Called from mic_task (producer). Do NOT touch the Native API here. Push the
+// alert onto the lock-free ring buffer; loop() (main thread) drains and does all
+// publish_state()/trigger() work. Only drops if the queue is genuinely full.
 void SAMEDecoder::publish_alert_(const SameAlert &a) {
   SameAlert clean = a;
   // Guarantee valid 7-bit ASCII for the raw header before it ever reaches the
@@ -397,16 +398,15 @@ void SAMEDecoder::publish_alert_(const SameAlert &a) {
   ESP_LOGI(TAG, "Decoded SAME: %s (%s) areas=%s",
            clean.event_name.c_str(), clean.event_code.c_str(), clean.areas_csv.c_str());
 
-  bool expected = false;
-  if (this->alert_pending_.compare_exchange_strong(expected, true,
-        std::memory_order_acq_rel, std::memory_order_relaxed)) {
-    // Was not pending: safe to write the mailbox now. loop() will pick it up.
-    this->pending_alert_ = clean;
-  } else {
-    // A previous alert is still awaiting dispatch on the main loop - drop this
-    // one rather than risk racing the consumer. (Rare; alerts are seconds apart.)
-    ESP_LOGW(TAG, "Alert dispatch still pending; dropping duplicate/rapid alert.");
+  uint32_t tail = this->q_tail_.load(std::memory_order_relaxed);
+  uint32_t next = (tail + 1) % ALERT_Q_LEN;
+  if (next == this->q_head_.load(std::memory_order_acquire)) {
+    // Queue full: main loop has not drained in time. Drop rather than overwrite.
+    ESP_LOGW(TAG, "Alert queue full; dropping alert (loop starved?).");
+    return;
   }
+  this->alert_queue_[tail] = clean;
+  this->q_tail_.store(next, std::memory_order_release);
 }
 
 // Runs on the MAIN loop thread (from loop()). All Native API interaction lives
