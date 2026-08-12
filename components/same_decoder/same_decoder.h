@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <atomic>
 
 namespace esphome {
 namespace same_decoder {
@@ -35,6 +36,7 @@ class AlertTrigger : public Trigger<> {
 class SAMEDecoder : public Component {
  public:
   void setup() override;
+  void loop() override;
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::LATE; }
 
@@ -70,6 +72,7 @@ class SAMEDecoder : public Component {
   std::string severity_for_(const std::string &code);
   std::string make_id_(const SameAlert &a);
   void publish_alert_(const SameAlert &a);
+  void dispatch_alert_(const SameAlert &a);
 
   uint32_t sample_rate_{48000};
   float gain_{1.0f};
@@ -79,6 +82,15 @@ class SAMEDecoder : public Component {
 
   SameAlert last_{};
   uint32_t decode_count_{0};
+
+  // ---- Cross-thread hand-off (mic_task -> main loop) ----
+  // The DSP runs on the microphone task. publish_state()/Trigger::trigger()
+  // send Native API traffic and MUST run on the main loop thread, so we stage
+  // the decoded alert here and dispatch it from loop(). Single-producer
+  // (mic_task) / single-consumer (loop). Producer only writes the mailbox when
+  // alert_pending_ is false; loop() copies then clears the flag.
+  SameAlert pending_alert_{};
+  std::atomic<bool> alert_pending_{false};
 
   // ---- Timing / sampling ----
   static constexpr float SAMPLES_PER_BIT = 92.16f;
