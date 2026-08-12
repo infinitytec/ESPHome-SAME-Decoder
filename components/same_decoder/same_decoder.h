@@ -63,6 +63,7 @@ class SAMEDecoder : public Component {
   void emit_bit_(bool bit);
   void reset_capture_();
   void vote_and_emit_();
+  void finish_burst_();
 
   bool parse_header_(const std::string &header, SameAlert &out);
   std::string describe_(const std::string &code);
@@ -83,15 +84,12 @@ class SAMEDecoder : public Component {
   static constexpr float SAMPLES_PER_BIT = 92.16f;
   static constexpr float PHASE_INC       = 1.0f / 92.16f;   // 0.01085069 nominal
   static constexpr int   GWIN            = 64;              // Goertzel window (< bit)
-  static constexpr int   RINGLEN         = 256;            // ring size (was 128; grown for early/late windows)
+  static constexpr int   RINGLEN         = 256;            // ring size (grown for early/late windows)
   int16_t ring_[RINGLEN];                                   // circular sample history
   int     ring_pos_{0};
   float   phase_{0.0f};                                     // bit-clock phase accumulator
 
   // ---- Timing recovery (early/late gate) ----
-  // See .cpp: samples the mark/space discriminant a few samples early and late
-  // around bit-center and nudges the phase (Kp) and the bit-rate (Ki) toward
-  // the true bit center. Gated on bit confidence so it ignores the noisy tail.
   static constexpr int   CENTER_LAG      = GWIN / 2;        // window end sits this far back of "now"
   static constexpr int   TR_DELTA        = 12;             // early/late offset in samples
   static constexpr float TR_KP           = 0.06f;          // proportional phase gain
@@ -99,13 +97,13 @@ class SAMEDecoder : public Component {
   static constexpr float TR_CONF_MIN     = 0.25f;          // min confidence to adapt
   static constexpr float TR_DPHI_CLAMP   = 0.125f;         // max per-bit phase nudge (bit fraction)
   static constexpr float TR_WOFF_CLAMP   = 0.002f * PHASE_INC;  // max rate correction (+-0.2%)
-  float   w_off_{0.0f};                                     // integral bit-rate correction
-  uint32_t samples_seen_{0};                                // to skip timing updates until ring is primed
+  float   w_off_{0.0f};
+  uint32_t samples_seen_{0};
 
   // ---- Sync / framing ----
   enum Phase { HUNT_SYNC, CAPTURE };
   Phase   phase_state_{HUNT_SYNC};
-  uint32_t sync_shift_{0};                                  // rolling 32-bit bit history
+  uint32_t sync_shift_{0};
 
   // LSB-first 'ZCZC' = 0x5A 0x43 0x5A 0x43 transmitted LSB-first.
   // As a 32-bit value with FIRST-received bit in LSB position of the window,
@@ -127,6 +125,17 @@ class SAMEDecoder : public Component {
   std::string bursts_[3];
   int         burst_idx_{0};
   static constexpr int MAX_HEADER_BYTES = 268;
+
+  // ---- Header termination (structure-driven) ----
+  // A ZCZC header ends at the trailing '-' after the fixed tail
+  // "+TTTT-JJJHHMM-LLLLLLLL". It does NOT contain "NNNN" (that is a separate
+  // End-Of-Message transmission). We anchor on '+', then count the fixed tail
+  // and stop at the closing '-'. TAIL_MIN is the minimum chars after '+' before
+  // the closing dash can legitimately appear: TTTT(4) - JJJHHMM(7) - up to
+  // LLLLLLLL(8), i.e. 4 + 1 + 7 + 1 + 1 = 14 minimum before a valid stop dash.
+  bool  plus_seen_{false};                                  // have we seen '+' yet
+  int   tail_count_{0};                                     // chars counted since '+'
+  static constexpr int TAIL_MIN = 14;                       // min tail chars before closing '-'
 };
 
 }  // namespace same_decoder
