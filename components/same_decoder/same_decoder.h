@@ -83,7 +83,7 @@ class SAMEDecoder : public Component {
   static constexpr float SAMPLES_PER_BIT = 92.16f;
   static constexpr float PHASE_INC       = 1.0f / 92.16f;   // 0.01085069
   static constexpr int   GWIN            = 64;              // Goertzel window (< bit)
-  int16_t ring_[128];                                       // circular sample history
+  int16_t ring_;                                       // circular sample history
   int     ring_pos_{0};
   float   phase_{0.0f};                                     // bit-clock phase accumulator
 
@@ -94,14 +94,22 @@ class SAMEDecoder : public Component {
 
   // LSB-first 'ZCZC' = 0x5A 0x43 0x5A 0x43 transmitted LSB-first.
   // As a 32-bit value with FIRST-received bit in LSB position of the window,
-  // we compare against the assembled pattern (see .cpp for construction).
-  static constexpr uint32_t SYNC_ZCZC = 0x4358435A;         // see .cpp note
+  // the assembled pattern is 0x435A435A. The hunt shifter inserts the newest
+  // bit at bit 31 and shifts older bits toward LSB, so after 32 bits the first
+  // received 'Z' occupies the low byte and the last received 'C' the high byte.
+  // Built from characters so the value can't silently drift again:
+  //   high byte -> last received 'C', low byte -> first received 'Z'.
+  static constexpr uint32_t SYNC_ZCZC =
+      (static_cast<uint32_t>('C') << 24) |
+      (static_cast<uint32_t>('Z') << 16) |
+      (static_cast<uint32_t>('C') << 8) |
+      (static_cast<uint32_t>('Z'));                          // == 0x435A435A
 
   // ---- Byte / burst assembly ----
   uint8_t     cur_byte_{0};
   int         cur_nbits_{0};
   std::string cur_burst_;
-  std::string bursts_[3];
+  std::string bursts_【3-abc】;
   int         burst_idx_{0};
   static constexpr int MAX_HEADER_BYTES = 268;
 };
