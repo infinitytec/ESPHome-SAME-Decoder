@@ -34,6 +34,15 @@ static std::string sanitize_ascii(const std::string &in) {
   return out;
 }
 
+// Valid characters within a SAME ZCZC header: digits, uppercase letters, and
+// the structural separators '-', '+', '/'. Anything else means we have run off
+// the end of the header into the attention tone / audio and should stop.
+static bool is_valid_same_char(char c) {
+  return (c >= '0' && c <= '9') ||
+         (c >= 'A' && c <= 'Z') ||
+         c == '-' || c == '+' || c == '/';
+}
+
 // Goertzel energy over `n` samples pulled from the ring buffer. The window
 // ENDS at ring index `endpos` (inclusive) and extends backwards `n` samples.
 static float goertzel_ring_end(const int16_t *ring, int ringlen, int endpos, int n, float coeff) {
@@ -144,7 +153,40 @@ void SAMEDecoder::reset_capture_() {
   this->cur_nbits_ = 0;
   this->cur_burst_.clear();
   this->burst_idx_ = 0;
+  this->plus_seen_ = false;
+  this->tail_count_ = 0;
   for (int i = 0; i < 3; i++) this->bursts_[i].clear();
+}
+
+// Store the completed burst, log it, and either vote (after 3) or hunt for the
+// next repeat's ZCZC.
+void SAMEDecoder::finish_burst_() {
+  // Hex+ASCII diagnostic of the assembled burst.
+  std::string hex;
+  char tmp[4];
+  for (size_t i = 0; i < this->cur_burst_.size() && i < 32; i++) {
+    snprintf(tmp, sizeof(tmp), "%02X ", (uint8_t) this->cur_burst_[i]);
+    hex += tmp;
+  }
+  ESP_LOGD(TAG, "Burst %d ascii: '%s'", this->burst_idx_, sanitize_ascii(this->cur_burst_).c_str());
+  ESP_LOGD(TAG, "Burst %d hex : %s", this->burst_idx_, hex.c_str());
+
+  this->bursts_[this->burst_idx_] = this->cur_burst_;
+  this->burst_idx_++;
+  this->cur_burst_.clear();
+  this->plus_seen_ = false;
+  this->tail_count_ = 0;
+
+  if (this->burst_idx_ >= 3) {
+    this->vote_and_emit_();
+    this->reset_capture_();
+  } else {
+    // Next repeat: hunt for its ZCZC again (robust to gaps between bursts).
+    this->phase_state_ = HUNT_SYNC;
+    this->sync_shift_ = 0;
+    this->cur_byte_ = 0;
+    this->cur_nbits_ = 0;
+  }
 }
 
 void SAMEDecoder::emit_bit_(bool bit) {
@@ -164,6 +206,8 @@ void SAMEDecoder::emit_bit_(bool bit) {
       this->cur_burst_ = "ZCZC";
       this->cur_byte_ = 0;
       this->cur_nbits_ = 0;
+      this->plus_seen_ = false;
+      this->tail_count_ = 0;
     }
     return;
   }
@@ -173,49 +217,57 @@ void SAMEDecoder::emit_bit_(bool bit) {
   if (bit) this->cur_byte_ |= 0x80;
   this->cur_nbits_++;
 
-  if (this->cur_nbits_ == 8) {
-    char c = (char) this->cur_byte_;
-    this->cur_burst_ += c;
-    this->cur_byte_ = 0;
-    this->cur_nbits_ = 0;
+  if (this->cur_nbits_ != 8)
+    return;
 
-    bool eom = (this->cur_burst_.size() >= 4 &&
-                this->cur_burst_.compare(this->cur_burst_.size() - 4, 4, "NNNN") == 0);
-    if (eom || this->cur_burst_.size() >= (size_t) MAX_HEADER_BYTES) {
-      // On a clean end-of-message, trim anything captured past the "NNNN" so
-      // trailing noise bytes never reach the parser or the text sensor. (On a
-      // length-limited stop there is no NNNN to trim to; keep what we have.)
-      if (eom) {
-        size_t nn = this->cur_burst_.rfind("NNNN");
-        if (nn != std::string::npos)
-          this->cur_burst_.erase(nn + 4);
-      }
+  char c = (char) this->cur_byte_;
+  this->cur_byte_ = 0;
+  this->cur_nbits_ = 0;
 
-      // Hex+ASCII diagnostic of the assembled burst.
-      std::string hex;
-      char tmp[4];
-      for (size_t i = 0; i < this->cur_burst_.size() && i < 32; i++) {
-        snprintf(tmp, sizeof(tmp), "%02X ", (uint8_t) this->cur_burst_[i]);
-        hex += tmp;
-      }
-      ESP_LOGD(TAG, "Burst %d ascii: '%s'", this->burst_idx_, sanitize_ascii(this->cur_burst_).c_str());
-      ESP_LOGD(TAG, "Burst %d hex : %s", this->burst_idx_, hex.c_str());
-
-      this->bursts_[this->burst_idx_] = this->cur_burst_;
-      this->burst_idx_++;
-      this->cur_burst_.clear();
-
-      if (this->burst_idx_ >= 3) {
-        this->vote_and_emit_();
-        this->reset_capture_();
-      } else {
-        // Next repeat: hunt for its ZCZC again (robust to gaps between bursts).
-        this->phase_state_ = HUNT_SYNC;
-        this->sync_shift_ = 0;
-        this->cur_byte_ = 0;
-        this->cur_nbits_ = 0;
-      }
+  // Guard: if the character is not a legal SAME header char, we have run off the
+  // end of the header into the attention tone / audio. End the burst now with
+  // whatever valid header we have (do NOT append the invalid char).
+  if (!is_valid_same_char(c)) {
+    if (this->cur_burst_.size() >= 4) {
+      this->finish_burst_();
+    } else {
+      // Too short to be real - abandon and re-hunt.
+      this->phase_state_ = HUNT_SYNC;
+      this->sync_shift_ = 0;
+      this->cur_byte_ = 0;
+      this->cur_nbits_ = 0;
+      this->plus_seen_ = false;
+      this->tail_count_ = 0;
     }
+    return;
+  }
+
+  this->cur_burst_ += c;
+
+  // ---- Structure-driven end-of-header detection ----
+  // The header format is:
+  //   ZCZC-ORG-EEE-PSSCCC[-PSSCCC...]+TTTT-JJJHHMM-LLLLLLLL-
+  // The '+' unambiguously ends the variable-length area list. After it comes a
+  // fixed tail; the header ends at the trailing '-' after LLLLLLLL. We anchor on
+  // '+' then stop at the first '-' that appears once we are past the fixed
+  // minimum tail length.
+  if (!this->plus_seen_) {
+    if (c == '+') {
+      this->plus_seen_ = true;
+      this->tail_count_ = 0;
+    }
+  } else {
+    this->tail_count_++;
+    if (c == '-' && this->tail_count_ >= TAIL_MIN) {
+      // This dash closes the header. Terminate here (dash already appended).
+      this->finish_burst_();
+      return;
+    }
+  }
+
+  // Safety net: never run away past a plausible header length.
+  if (this->cur_burst_.size() >= (size_t) MAX_HEADER_BYTES) {
+    this->finish_burst_();
   }
 }
 
