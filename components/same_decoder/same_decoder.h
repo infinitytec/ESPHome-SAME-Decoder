@@ -81,11 +81,26 @@ class SAMEDecoder : public Component {
 
   // ---- Timing / sampling ----
   static constexpr float SAMPLES_PER_BIT = 92.16f;
-  static constexpr float PHASE_INC       = 1.0f / 92.16f;   // 0.01085069
+  static constexpr float PHASE_INC       = 1.0f / 92.16f;   // 0.01085069 nominal
   static constexpr int   GWIN            = 64;              // Goertzel window (< bit)
-  int16_t ring_[128];                                       // circular sample history
+  static constexpr int   RINGLEN         = 256;            // ring size (was 128; grown for early/late windows)
+  int16_t ring_[RINGLEN];                                   // circular sample history
   int     ring_pos_{0};
   float   phase_{0.0f};                                     // bit-clock phase accumulator
+
+  // ---- Timing recovery (early/late gate) ----
+  // See .cpp: samples the mark/space discriminant a few samples early and late
+  // around bit-center and nudges the phase (Kp) and the bit-rate (Ki) toward
+  // the true bit center. Gated on bit confidence so it ignores the noisy tail.
+  static constexpr int   CENTER_LAG      = GWIN / 2;        // window end sits this far back of "now"
+  static constexpr int   TR_DELTA        = 12;             // early/late offset in samples
+  static constexpr float TR_KP           = 0.06f;          // proportional phase gain
+  static constexpr float TR_KI           = 0.0015f;        // integral rate gain
+  static constexpr float TR_CONF_MIN     = 0.25f;          // min confidence to adapt
+  static constexpr float TR_DPHI_CLAMP   = 0.125f;         // max per-bit phase nudge (bit fraction)
+  static constexpr float TR_WOFF_CLAMP   = 0.002f * PHASE_INC;  // max rate correction (+-0.2%)
+  float   w_off_{0.0f};                                     // integral bit-rate correction
+  uint32_t samples_seen_{0};                                // to skip timing updates until ring is primed
 
   // ---- Sync / framing ----
   enum Phase { HUNT_SYNC, CAPTURE };
