@@ -85,12 +85,14 @@ class SAMEDecoder : public Component {
 
   // ---- Cross-thread hand-off (mic_task -> main loop) ----
   // The DSP runs on the microphone task. publish_state()/Trigger::trigger()
-  // send Native API traffic and MUST run on the main loop thread, so we stage
-  // the decoded alert here and dispatch it from loop(). Single-producer
-  // (mic_task) / single-consumer (loop). Producer only writes the mailbox when
-  // alert_pending_ is false; loop() copies then clears the flag.
-  SameAlert pending_alert_{};
-  std::atomic<bool> alert_pending_{false};
+  // send Native API traffic and MUST run on the main loop thread, so we queue
+  // decoded alerts here and dispatch them from loop(). Lock-free single-
+  // producer (mic_task) / single-consumer (loop) ring buffer so closely-spaced
+  // alerts are not dropped (only dropped if the queue is genuinely full).
+  static constexpr int ALERT_Q_LEN = 4;
+  SameAlert alert_queue_[ALERT_Q_LEN];
+  std::atomic<uint32_t> q_head_{0};   // consumer index (written by loop)
+  std::atomic<uint32_t> q_tail_{0};   // producer index (written by mic_task)
 
   // ---- Timing / sampling ----
   static constexpr float SAMPLES_PER_BIT = 92.16f;
