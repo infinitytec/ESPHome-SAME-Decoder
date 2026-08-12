@@ -34,9 +34,11 @@ static std::string sanitize_ascii(const std::string &in) {
   return out;
 }
 
-// Goertzel energy over `n` samples pulled from the ring buffer ending at `endpos`.
-static float goertzel_ring(const int16_t *ring, int ringlen, int startpos, int n, float coeff) {
+// Goertzel energy over `n` samples pulled from the ring buffer. The window
+// ENDS at ring index `endpos` (inclusive) and extends backwards `n` samples.
+static float goertzel_ring_end(const int16_t *ring, int ringlen, int endpos, int n, float coeff) {
   float s1 = 0.f, s2 = 0.f;
+  int startpos = ((endpos - (n - 1)) % ringlen + ringlen) % ringlen;
   for (int i = 0; i < n; i++) {
     int idx = (startpos + i) % ringlen;
     float s0 = (float) ring[idx] + coeff * s1 - s2;
@@ -55,8 +57,9 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "SAME Decoder:");
   ESP_LOGCONFIG(TAG, "  Sample rate: %" PRIu32 " Hz", this->sample_rate_);
   ESP_LOGCONFIG(TAG, "  Software gain: %.1f", this->gain_);
-  ESP_LOGCONFIG(TAG, "  Samples/bit: %.2f, Goertzel window: %d", SAMPLES_PER_BIT, GWIN);
+  ESP_LOGCONFIG(TAG, "  Samples/bit: %.2f, Goertzel window: %d, ring: %d", SAMPLES_PER_BIT, GWIN, RINGLEN);
   ESP_LOGCONFIG(TAG, "  Goertzel coeffs: mark=%.6f space=%.6f", COEFF_MARK, COEFF_SPACE);
+  ESP_LOGCONFIG(TAG, "  Timing loop: Kp=%.3f Ki=%.4f delta=%d conf_min=%.2f", TR_KP, TR_KI, TR_DELTA, TR_CONF_MIN);
   ESP_LOGCONFIG(TAG, "  Alert triggers: %u", (unsigned) this->alert_triggers_.size());
 }
 
@@ -71,26 +74,65 @@ void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
   }
 }
 
-// Push each sample into the ring; advance the bit-clock phase; when it crosses
-// 1.0, sample the bit at its CENTER using a 64-sample Goertzel window.
+// Push each sample into the ring; advance the bit-clock phase (with rate
+// correction). When phase crosses 1.0, make a bit decision using a Goertzel
+// window CENTERED on the bit, and run an early/late timing update that nudges
+// phase and bit-rate toward the true bit center.
 void SAMEDecoder::feed_sample_(int16_t s) {
   this->ring_[this->ring_pos_] = s;
-  this->ring_pos_ = (this->ring_pos_ + 1) % 128;
+  this->ring_pos_ = (this->ring_pos_ + 1) % RINGLEN;
+  if (this->samples_seen_ < 0x7fffffff) this->samples_seen_++;
 
-  this->phase_ += PHASE_INC;
+  this->phase_ += (PHASE_INC + this->w_off_);
   if (this->phase_ < 1.0f)
     return;
   this->phase_ -= 1.0f;
 
-  // Bit center is ~half a bit behind the current write position. The 64-sample
-  // window should be centered on the bit: start it GWIN samples back from the
-  // most-recent sample, offset so its midpoint sits at the bit center.
-  // Most-recent sample index is (ring_pos_ - 1). Window covers the last GWIN
-  // samples, which straddle the bit center given our phase alignment.
-  int start = (this->ring_pos_ - GWIN + 128) % 128;
-  float em = goertzel_ring(this->ring_, 128, start, GWIN, COEFF_MARK);
-  float es = goertzel_ring(this->ring_, 128, start, GWIN, COEFF_SPACE);
-  bool bit = em > es;
+  // Index of the most-recently written sample.
+  int s_now = (this->ring_pos_ - 1 + RINGLEN) % RINGLEN;
+
+  // Window END indices for center / early / late. Centering the window on the
+  // bit (CENTER_LAG back from "now") removes the half-window bias the old code
+  // had from ending the window at the newest sample.
+  int t_center = (s_now - CENTER_LAG + RINGLEN) % RINGLEN;
+  int t_early  = (t_center - TR_DELTA + RINGLEN) % RINGLEN;
+  int t_late   = (t_center + TR_DELTA) % RINGLEN;
+
+  // Center energies + bit decision.
+  float em_c = goertzel_ring_end(this->ring_, RINGLEN, t_center, GWIN, COEFF_MARK);
+  float es_c = goertzel_ring_end(this->ring_, RINGLEN, t_center, GWIN, COEFF_SPACE);
+  bool bit = em_c > es_c;
+
+  // Only adapt timing once the ring is primed with enough history for the
+  // furthest-back (late+window) read, so early bits don't chase stale data.
+  bool primed = this->samples_seen_ >= (uint32_t) (CENTER_LAG + TR_DELTA + GWIN + 2);
+  if (primed) {
+    float em_e = goertzel_ring_end(this->ring_, RINGLEN, t_early, GWIN, COEFF_MARK);
+    float es_e = goertzel_ring_end(this->ring_, RINGLEN, t_early, GWIN, COEFF_SPACE);
+    float em_l = goertzel_ring_end(this->ring_, RINGLEN, t_late,  GWIN, COEFF_MARK);
+    float es_l = goertzel_ring_end(this->ring_, RINGLEN, t_late,  GWIN, COEFF_SPACE);
+
+    float d_early = std::fabs(em_e - es_e);
+    float d_late  = std::fabs(em_l - es_l);
+    float d_center = std::fabs(em_c - es_c);
+    float e_center = em_c + es_c;
+
+    const float eps = 1e-9f;
+    float e_raw = (d_late - d_early) / (d_late + d_early + eps);
+    float conf  = d_center / (e_center + eps);
+    float e = (conf >= TR_CONF_MIN) ? e_raw : 0.0f;
+
+    // Proportional phase correction (clamped).
+    float dphi = TR_KP * e;
+    if (dphi >  TR_DPHI_CLAMP) dphi =  TR_DPHI_CLAMP;
+    if (dphi < -TR_DPHI_CLAMP) dphi = -TR_DPHI_CLAMP;
+    this->phase_ += dphi;
+
+    // Integral bit-rate correction (clamped) - removes steady drift.
+    this->w_off_ += TR_KI * e;
+    if (this->w_off_ >  TR_WOFF_CLAMP) this->w_off_ =  TR_WOFF_CLAMP;
+    if (this->w_off_ < -TR_WOFF_CLAMP) this->w_off_ = -TR_WOFF_CLAMP;
+  }
 
   this->emit_bit_(bit);
 }
