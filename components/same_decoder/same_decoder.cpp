@@ -62,6 +62,18 @@ void SAMEDecoder::setup() {
   this->reset_capture_();
 }
 
+// Runs on the MAIN loop thread. Drain a staged alert (produced by mic_task) and
+// perform all Native API interaction here where it is thread-safe.
+void SAMEDecoder::loop() {
+  if (this->alert_pending_.load(std::memory_order_acquire)) {
+    // Copy while pending is true; the producer will not overwrite the mailbox
+    // because it only writes when alert_pending_ is false.
+    SameAlert a = this->pending_alert_;
+    this->alert_pending_.store(false, std::memory_order_release);
+    this->dispatch_alert_(a);
+  }
+}
+
 void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "SAME Decoder:");
   ESP_LOGCONFIG(TAG, "  Sample rate: %" PRIu32 " Hz", this->sample_rate_);
@@ -342,9 +354,20 @@ bool SAMEDecoder::parse_header_(const std::string &header, SameAlert &out) {
   out.event_name = this->describe_(out.event_code);
   out.severity   = this->severity_for_(out.event_code);
 
+  // Collect area codes. The area list ends at the '+', which appears INSIDE the
+  // part that also carries the valid-time (e.g. "031025+0045"). So when a part
+  // contains '+', take the substring before it as the final area, then stop.
   std::string areas;
   for (size_t i = 3; i < parts.size(); i++) {
-    if (parts[i].find('+') != std::string::npos) break;
+    size_t plus = parts[i].find('+');
+    if (plus != std::string::npos) {
+      std::string last_area = parts[i].substr(0, plus);
+      if (!last_area.empty()) {
+        if (!areas.empty()) areas += ",";
+        areas += last_area;
+      }
+      break;
+    }
     if (!areas.empty()) areas += ",";
     areas += parts[i];
   }
@@ -362,21 +385,40 @@ bool SAMEDecoder::parse_header_(const std::string &header, SameAlert &out) {
   return true;
 }
 
+// Called from mic_task. Do NOT touch the Native API here. Stage the alert and
+// let loop() (main thread) do all publish_state()/trigger() work. Drop-if-
+// pending keeps this single-producer/single-consumer and lock-free.
 void SAMEDecoder::publish_alert_(const SameAlert &a) {
+  SameAlert clean = a;
+  // Guarantee valid 7-bit ASCII for the raw header before it ever reaches the
+  // API as a protobuf string.
+  clean.raw_header = sanitize_ascii(a.raw_header);
+
+  ESP_LOGI(TAG, "Decoded SAME: %s (%s) areas=%s",
+           clean.event_name.c_str(), clean.event_code.c_str(), clean.areas_csv.c_str());
+
+  bool expected = false;
+  if (this->alert_pending_.compare_exchange_strong(expected, true,
+        std::memory_order_acq_rel, std::memory_order_relaxed)) {
+    // Was not pending: safe to write the mailbox now. loop() will pick it up.
+    this->pending_alert_ = clean;
+  } else {
+    // A previous alert is still awaiting dispatch on the main loop - drop this
+    // one rather than risk racing the consumer. (Rare; alerts are seconds apart.)
+    ESP_LOGW(TAG, "Alert dispatch still pending; dropping duplicate/rapid alert.");
+  }
+}
+
+// Runs on the MAIN loop thread (from loop()). All Native API interaction lives
+// here so it never races the API sender.
+void SAMEDecoder::dispatch_alert_(const SameAlert &a) {
   this->last_ = a;
-  // Ensure the raw header we retain and publish is always valid 7-bit ASCII so
-  // the ESPHome API (protobuf UTF-8 string) can never be poisoned by capture
-  // noise. SAME headers are ASCII by spec, so this is lossless for valid data.
-  this->last_.raw_header = sanitize_ascii(a.raw_header);
   this->decode_count_++;
 
   if (this->decode_count_sensor_ != nullptr)
     this->decode_count_sensor_->publish_state((float) this->decode_count_);
   if (this->last_raw_sensor_ != nullptr)
     this->last_raw_sensor_->publish_state(this->last_.raw_header);
-
-  ESP_LOGI(TAG, "Decoded SAME: %s (%s) areas=%s",
-           a.event_name.c_str(), a.event_code.c_str(), a.areas_csv.c_str());
 
   for (auto *t : this->alert_triggers_)
     t->trigger();
