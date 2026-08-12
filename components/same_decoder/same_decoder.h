@@ -83,7 +83,7 @@ class SAMEDecoder : public Component {
   static constexpr float SAMPLES_PER_BIT = 92.16f;
   static constexpr float PHASE_INC       = 1.0f / 92.16f;   // 0.01085069
   static constexpr int   GWIN            = 64;              // Goertzel window (< bit)
-  int16_t ring_;                                       // circular sample history
+  int16_t ring_[128];                                       // circular sample history
   int     ring_pos_{0};
   float   phase_{0.0f};                                     // bit-clock phase accumulator
 
