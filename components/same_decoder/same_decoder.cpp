@@ -18,6 +18,22 @@ static const char *const TAG = "same_decoder";
 static constexpr float COEFF_MARK  = 1.926090f;   // 2*cos(2*pi*2083.33/48000)
 static constexpr float COEFF_SPACE = 1.958313f;   // 2*cos(2*pi*1562.5/48000)
 
+// Replace any byte that is not printable 7-bit ASCII (0x20..0x7E) with '?'.
+// SAME headers are pure ASCII by spec; anything else is capture noise. This
+// guarantees the string we hand to the ESPHome API (a protobuf UTF-8 string)
+// is always valid UTF-8 and cannot crash the connection.
+static std::string sanitize_ascii(const std::string &in) {
+  std::string out;
+  out.reserve(in.size());
+  for (unsigned char c : in) {
+    if (c >= 0x20 && c <= 0x7E)
+      out += (char) c;
+    else
+      out += '?';
+  }
+  return out;
+}
+
 // Goertzel energy over `n` samples pulled from the ring buffer ending at `endpos`.
 static float goertzel_ring(const int16_t *ring, int ringlen, int startpos, int n, float coeff) {
   float s1 = 0.f, s2 = 0.f;
@@ -110,7 +126,7 @@ void SAMEDecoder::emit_bit_(bool bit) {
     return;
   }
 
-  // CAPTURE — assemble LSB-first bytes.
+  // CAPTURE -- assemble LSB-first bytes.
   this->cur_byte_ >>= 1;
   if (bit) this->cur_byte_ |= 0x80;
   this->cur_nbits_++;
@@ -124,6 +140,15 @@ void SAMEDecoder::emit_bit_(bool bit) {
     bool eom = (this->cur_burst_.size() >= 4 &&
                 this->cur_burst_.compare(this->cur_burst_.size() - 4, 4, "NNNN") == 0);
     if (eom || this->cur_burst_.size() >= (size_t) MAX_HEADER_BYTES) {
+      // On a clean end-of-message, trim anything captured past the "NNNN" so
+      // trailing noise bytes never reach the parser or the text sensor. (On a
+      // length-limited stop there is no NNNN to trim to; keep what we have.)
+      if (eom) {
+        size_t nn = this->cur_burst_.rfind("NNNN");
+        if (nn != std::string::npos)
+          this->cur_burst_.erase(nn + 4);
+      }
+
       // Hex+ASCII diagnostic of the assembled burst.
       std::string hex;
       char tmp[4];
@@ -131,7 +156,7 @@ void SAMEDecoder::emit_bit_(bool bit) {
         snprintf(tmp, sizeof(tmp), "%02X ", (uint8_t) this->cur_burst_[i]);
         hex += tmp;
       }
-      ESP_LOGD(TAG, "Burst %d ascii: '%s'", this->burst_idx_, this->cur_burst_.c_str());
+      ESP_LOGD(TAG, "Burst %d ascii: '%s'", this->burst_idx_, sanitize_ascii(this->cur_burst_).c_str());
       ESP_LOGD(TAG, "Burst %d hex : %s", this->burst_idx_, hex.c_str());
 
       this->bursts_[this->burst_idx_] = this->cur_burst_;
@@ -169,7 +194,7 @@ void SAMEDecoder::vote_and_emit_() {
     if (best) voted += best;
   }
 
-  ESP_LOGD(TAG, "Voted header: '%s'", voted.c_str());
+  ESP_LOGD(TAG, "Voted header: '%s'", sanitize_ascii(voted).c_str());
   size_t z = voted.find("ZCZC");
   if (z == std::string::npos) {
     ESP_LOGW(TAG, "Voted header missing ZCZC; discarding.");
@@ -245,12 +270,16 @@ bool SAMEDecoder::parse_header_(const std::string &header, SameAlert &out) {
 
 void SAMEDecoder::publish_alert_(const SameAlert &a) {
   this->last_ = a;
+  // Ensure the raw header we retain and publish is always valid 7-bit ASCII so
+  // the ESPHome API (protobuf UTF-8 string) can never be poisoned by capture
+  // noise. SAME headers are ASCII by spec, so this is lossless for valid data.
+  this->last_.raw_header = sanitize_ascii(a.raw_header);
   this->decode_count_++;
 
   if (this->decode_count_sensor_ != nullptr)
     this->decode_count_sensor_->publish_state((float) this->decode_count_);
   if (this->last_raw_sensor_ != nullptr)
-    this->last_raw_sensor_->publish_state(a.raw_header);
+    this->last_raw_sensor_->publish_state(this->last_.raw_header);
 
   ESP_LOGI(TAG, "Decoded SAME: %s (%s) areas=%s",
            a.event_name.c_str(), a.event_code.c_str(), a.areas_csv.c_str());
