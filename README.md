@@ -10,4 +10,4 @@ To install: use [this file]() in ESPHome Device Builder as your device's config.
 
 
 ### Generative AI Disclaimer:
-I am using Generative AI tools to develop this. I am using GitHub to help me track changes to prevent introducing new bugs and to speed up review between versions.
+I am using Generative AI tools to develop this. I am using GitHub to help me track changes to prevent introducing new bugs and to speed up review between versions. Contributions using Generative AI are welcome.
