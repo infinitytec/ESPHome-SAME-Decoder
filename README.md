@@ -22,7 +22,7 @@ I am using Generative AI tools to develop this. I am using GitHub to help me tra
 
 
 ### To-Do:
-[] Make the decoding more robust
-[] Decoding seems to really like to listen in groups of threes (understandable) but if it misses one and another alert comes it seems to not be happy. So it should time out (less than 30 seconds?) and send what it's got.
-[] SNR for NOAA signals would be cool and useful.
-[] Refactor decoder to work better with off-frequency tuning (not sure how necessary this is).
+- [ ] Make the decoding more robust
+- [ ] Decoding seems to really like to listen in groups of threes (understandable) but if it misses one and another alert comes it seems to not be happy. So it should time out (less than 30 seconds?) and send what it's got.
+- [ ] SNR for NOAA signals would be cool and useful.
+- [ ] Refactor decoder to work better with off-frequency tuning (not sure how necessary this is).
