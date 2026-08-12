@@ -5,6 +5,10 @@ Process live National Weather Service radio data for real-time, Internet-indepen
 VERY MUCH A WORK-IN-PROGRESS!
 
 
+## Hardware
+THIS IS INCOMPLETE AS I AM STILL WORKING ON THE HARDWARE SIDE OF THIS.
+* ESP32 Audio Dev Kit such as [this](https://www.aliexpress.us/item/3256804762753719.html)
+
 ## Installation
 To install: use [this file]() in ESPHome Device Builder as your device's config.
 
