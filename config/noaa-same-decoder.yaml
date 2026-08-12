@@ -59,6 +59,8 @@ logger:
   level: DEBUG                          # DEBUG shows staged decode logs; raise to INFO later
 
 api:
+  encryption:
+    key: !secret noaa_same_decoder__encryption_key
   # For production add: encryption: { key: !secret api_key }
 
 ota:
@@ -141,6 +143,13 @@ button:
 #  - SAME Burst Timeout: if 1-2 header bursts are collected but the 3rd never
 #    arrives within this many seconds, emit what we have and reset (diagnostic,
 #    disabled by default).
+#
+#  NOTE: template numbers use `optimistic: true` (+ restore_value/initial_value)
+#  and therefore CANNOT also define a `lambda:` value-reader (ESPHome forbids
+#  combining them). The slider is the single source of truth: its stored value
+#  is restored on boot and re-applied to the decoder via set_action. Because the
+#  decoder's gain/timeout are only ever changed through these sliders, the
+#  reported value always matches the decoder state.
 number:
   - platform: template
     name: "SAME Software Gain"
@@ -150,12 +159,11 @@ number:
     max_value: 512
     step: 1
     mode: slider
-    restore_value: true
     optimistic: true
+    restore_value: true
     initial_value: 128
     set_action:
       - lambda: 'id(same_dec).set_gain(x);'
-    lambda: 'return id(same_dec).get_gain();'
 
   - platform: template
     name: "SAME Burst Timeout"
@@ -166,14 +174,13 @@ number:
     max_value: 30
     step: 1
     mode: slider
-    restore_value: true
     optimistic: true
+    restore_value: true
     initial_value: 5
     entity_category: config
     disabled_by_default: true
     set_action:
       - lambda: 'id(same_dec).set_timeout_ms((uint32_t) (x * 1000.0f));'
-    lambda: 'return id(same_dec).get_timeout_ms() / 1000.0f;'
 
 # Diagnostic + decoder entities.
 #  - same_decode_count / same_last_raw: the authoritative decode outputs.
