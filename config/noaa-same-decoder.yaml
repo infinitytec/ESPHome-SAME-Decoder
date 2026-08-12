@@ -178,6 +178,29 @@ sensor:
       entity_category: diagnostic
       disabled_by_default: true
 
+      - platform: template
+    id: same_quality
+    name: "SAME Decode Quality"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    disabled_by_default: true
+
+  - platform: template
+    id: same_snr
+    name: "SAME SNR"
+    unit_of_measurement: "dB"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    disabled_by_default: true
+
+  - platform: template
+    id: same_freq_offset
+    name: "SAME Freq Offset"
+    unit_of_measurement: "Hz"
+    accuracy_decimals: 1
+    entity_category: diagnostic
+    disabled_by_default: true
+
 text_sensor:
   - platform: template
     id: same_last_raw
@@ -195,8 +218,12 @@ same_decoder:
   id: same_dec
   gain: 128.0
   sample_rate: 48000
+  burst_timeout: 12s
   decode_count_sensor: same_decode_count
   last_raw_sensor: same_last_raw
+  quality_sensor: same_quality
+  snr_sensor: same_snr
+  freq_offset_sensor: same_freq_offset
   on_alert:
     then:
       - homeassistant.event:
