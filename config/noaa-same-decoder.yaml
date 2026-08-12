@@ -9,9 +9,9 @@
 #  churn (future-proof, idiomatic ESPHome).
 #
 #  Audio input selection:
-#    LINE1 (default) = line-in only (INL/INR), the intended decode source.
-#    LINE2 / DIFFERENCE remain selectable from Home Assistant via the
-#    "SAME ADC Input" select for troubleshooting (e.g. compare against a mic).
+#    LINE1 (default) = line-in (INL/INR), the intended decode source.
+#    LINE2 = on-board mic. Selectable from Home Assistant via the "SAME ADC Input"
+#    select for troubleshooting (entity disabled by default).
 # =============================================================================
 
 substitutions:
@@ -26,7 +26,7 @@ esphome:
       - lambda: 'ESP_LOGI("same", "Boot complete; SAME decoder starting.");'
       - select.set:
           id: same_adc_input
-          option: "LINE1"              # line-in only (was DIFFERENCE, which mixed mics + line-in)
+          option: "LINE1"              # line-in (was DIFFERENCE, which mixed mics + line-in)
       # --- Raise ES8388 input PGA gain (ADCControl1 = reg 0x09) ---
       # Both nibbles = per-channel MicAmp/PGA gain. 0x88 = +24 dB L & R.
       # Try 0x88 (24 dB) first; if it clips, drop to 0x66 (18) or 0x44 (12).
@@ -74,6 +74,10 @@ wifi:
 
 captive_portal:
 
+# Debug component drives the diagnostic sensors below (CPU freq, free heap).
+debug:
+  update_interval: 30s
+
 external_components:
   - source:
       type: git
@@ -99,9 +103,8 @@ select:
     es8388_id: es8388_codec
     adc_input_mic:
       id: same_adc_input
-      name: "SAME ADC Input"            # LINE1 | LINE2 | DIFFERENCE
-    dac_output:
-      name: "SAME DAC Output"           # LINE1 | LINE2 | BOTH (unused for decoding)
+      name: "SAME ADC Input (LINE1=Line-In, LINE2=Mic)"   # LINE1 | LINE2 | DIFFERENCE (hardcoded by es8388 component)
+      disabled_by_default: true
 
 # I2S Audio bus (shared clock/pins). The microphone platform below uses it.
 i2s_audio:
@@ -126,14 +129,6 @@ microphone:
         - lambda: |-
             id(same_dec).feed_bytes(x);
 
-# Amplifier control (kept OFF for decoding; toggled on only to play audio alarms).
-switch:
-  - platform: gpio
-    pin: GPIO21
-    id: amp_ctrl
-    name: "Audio Amp"
-    restore_mode: ALWAYS_OFF
-
 # Remote reboot from Home Assistant.
 button:
   - platform: restart
@@ -141,27 +136,47 @@ button:
     id: same_restart
     icon: "mdi:restart"
 
-# -----------------------------------------------------------------------------
-#  Jack detection (schematic-verified): GPIO39 senses the LINE-OUT (J2) jack.
-#  The LINE-IN jack (J1) exposes only INL/INR/AGND - it has NO detect line, so a
-#  true "line-in present" sensor is not possible on this board. Entity named
-#  honestly for the jack it actually senses.
-# -----------------------------------------------------------------------------
-binary_sensor:
-  - platform: gpio
-    pin:
-      number: GPIO39
-      inverted: true
-    name: "Line-Out Jack Present"
-
-# Diagnostic-only device entities. The authoritative nws_alerts-style sensor is
-# built in Home Assistant from the fired esphome.same_alert events.
+# Diagnostic + decoder entities.
+#  - same_decode_count / same_last_raw: the authoritative decode outputs.
+#  - The remaining diagnostics (gain, CPU, memory, RSSI) are disabled by default;
+#    enable them in the Home Assistant UI when troubleshooting.
 sensor:
   - platform: template
     id: same_decode_count
     name: "SAME Decodes (session)"
     accuracy_decimals: 0
     unit_of_measurement: "decodes"
+
+  # Configured software gain (read-only; compile-time value from same_decoder).
+  - platform: template
+    name: "SAME Gain"
+    id: same_gain
+    accuracy_decimals: 1
+    lambda: 'return 128.0;'
+    update_interval: 60s
+    entity_category: diagnostic
+    disabled_by_default: true
+
+  # WiFi signal strength (RSSI).
+  - platform: wifi_signal
+    name: "RSSI"
+    id: rssi_dbm
+    update_interval: 60s
+    unit_of_measurement: "dBm"
+    device_class: signal_strength
+    entity_category: diagnostic
+    disabled_by_default: true
+
+  # CPU frequency + free heap from the debug component.
+  - platform: debug
+    free:
+      name: "Memory Free"
+      entity_category: diagnostic
+      disabled_by_default: true
+    cpu_frequency:
+      name: "CPU Frequency"
+      entity_category: diagnostic
+      disabled_by_default: true
 
 text_sensor:
   - platform: template
