@@ -81,6 +81,7 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "  Samples/bit: %.2f, Goertzel window: %d, ring: %d", SAMPLES_PER_BIT, GWIN, RINGLEN);
   ESP_LOGCONFIG(TAG, "  Goertzel coeffs: mark=%.6f space=%.6f", COEFF_MARK, COEFF_SPACE);
   ESP_LOGCONFIG(TAG, "  Timing loop: Kp=%.3f Ki=%.4f delta=%d conf_min=%.2f", TR_KP, TR_KI, TR_DELTA, TR_CONF_MIN);
+  ESP_LOGCONFIG(TAG, "  Header end: dash>=%d, fallback>=%d chars after '+'", TAIL_MIN, TAIL_COMPLETE);
   ESP_LOGCONFIG(TAG, "  Alert queue depth: %d", ALERT_Q_LEN);
   ESP_LOGCONFIG(TAG, "  Alert triggers: %u", (unsigned) this->alert_triggers_.size());
 }
@@ -261,9 +262,11 @@ void SAMEDecoder::emit_bit_(bool bit) {
   // The header format is:
   //   ZCZC-ORG-EEE-PSSCCC[-PSSCCC...]+TTTT-JJJHHMM-LLLLLLLL-
   // The '+' unambiguously ends the variable-length area list. After it comes a
-  // fixed tail; the header ends at the trailing '-' after LLLLLLLL. We anchor on
-  // '+' then stop at the first '-' that appears once we are past the fixed
-  // minimum tail length.
+  // fixed tail; the header ends at the trailing '-' after LLLLLLLL.
+  //  PRIMARY : anchor on '+', stop at the first '-' once past TAIL_MIN.
+  //  FALLBACK: if that closing '-' is missed/garbled, stop once the full fixed
+  //            tail (TAIL_COMPLETE chars) has been consumed - the header is
+  //            structurally complete, so we do not lose an otherwise-good decode.
   if (!this->plus_seen_) {
     if (c == '+') {
       this->plus_seen_ = true;
@@ -272,7 +275,12 @@ void SAMEDecoder::emit_bit_(bool bit) {
   } else {
     this->tail_count_++;
     if (c == '-' && this->tail_count_ >= TAIL_MIN) {
-      // This dash closes the header. Terminate here (dash already appended).
+      // Primary: this dash closes the header (dash already appended).
+      this->finish_burst_();
+      return;
+    } else if (this->tail_count_ >= TAIL_COMPLETE) {
+      // Fallback: closing dash missed, but the fixed tail is complete.
+      ESP_LOGD(TAG, "Header end fallback: fixed tail complete without closing dash.");
       this->finish_burst_();
       return;
     }
