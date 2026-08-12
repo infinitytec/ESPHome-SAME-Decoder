@@ -136,9 +136,48 @@ button:
     id: same_restart
     icon: "mdi:restart"
 
+# Runtime-adjustable controls (sliders).
+#  - SAME Software Gain: multiplies incoming PCM before the demod. Persists.
+#  - SAME Burst Timeout: if 1-2 header bursts are collected but the 3rd never
+#    arrives within this many seconds, emit what we have and reset (diagnostic,
+#    disabled by default).
+number:
+  - platform: template
+    name: "SAME Software Gain"
+    id: same_gain_number
+    icon: "mdi:volume-high"
+    min_value: 1
+    max_value: 512
+    step: 1
+    mode: slider
+    restore_value: true
+    optimistic: true
+    initial_value: 128
+    set_action:
+      - lambda: 'id(same_dec).set_gain(x);'
+    lambda: 'return id(same_dec).get_gain();'
+
+  - platform: template
+    name: "SAME Burst Timeout"
+    id: same_timeout_number
+    icon: "mdi:timer-sand"
+    unit_of_measurement: "s"
+    min_value: 1
+    max_value: 30
+    step: 1
+    mode: slider
+    restore_value: true
+    optimistic: true
+    initial_value: 5
+    entity_category: config
+    disabled_by_default: true
+    set_action:
+      - lambda: 'id(same_dec).set_timeout_ms((uint32_t) (x * 1000.0f));'
+    lambda: 'return id(same_dec).get_timeout_ms() / 1000.0f;'
+
 # Diagnostic + decoder entities.
 #  - same_decode_count / same_last_raw: the authoritative decode outputs.
-#  - The remaining diagnostics (gain, CPU, memory, RSSI) are disabled by default;
+#  - The remaining diagnostics (CPU, memory, RSSI) are disabled by default;
 #    enable them in the Home Assistant UI when troubleshooting.
 sensor:
   - platform: template
@@ -146,16 +185,6 @@ sensor:
     name: "SAME Decodes (session)"
     accuracy_decimals: 0
     unit_of_measurement: "decodes"
-
-  # Configured software gain (read-only; compile-time value from same_decoder).
-  - platform: template
-    name: "SAME Gain"
-    id: same_gain
-    accuracy_decimals: 1
-    lambda: 'return 128.0;'
-    update_interval: 60s
-    entity_category: diagnostic
-    disabled_by_default: true
 
   # WiFi signal strength (RSSI).
   - platform: wifi_signal
@@ -178,29 +207,6 @@ sensor:
       entity_category: diagnostic
       disabled_by_default: true
 
-  - platform: template
-    id: same_quality
-    name: "SAME Decode Quality"
-    accuracy_decimals: 1
-    entity_category: diagnostic
-    disabled_by_default: true
-
-  - platform: template
-    id: same_snr
-    name: "SAME SNR"
-    unit_of_measurement: "dB"
-    accuracy_decimals: 1
-    entity_category: diagnostic
-    disabled_by_default: true
-
-  - platform: template
-    id: same_freq_offset
-    name: "SAME Freq Offset"
-    unit_of_measurement: "Hz"
-    accuracy_decimals: 1
-    entity_category: diagnostic
-    disabled_by_default: true
-
 text_sensor:
   - platform: template
     id: same_last_raw
@@ -218,12 +224,8 @@ same_decoder:
   id: same_dec
   gain: 128.0
   sample_rate: 48000
-  burst_timeout: 12s
   decode_count_sensor: same_decode_count
   last_raw_sensor: same_last_raw
-  quality_sensor: same_quality
-  snr_sensor: same_snr
-  freq_offset_sensor: same_freq_offset
   on_alert:
     then:
       - homeassistant.event:
