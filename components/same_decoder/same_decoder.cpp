@@ -2,6 +2,7 @@
 #include "same_decoder.h"
 #include "same_event_codes.h"
 #include "esphome/core/log.h"
+#include "esphome/core/hal.h"
 
 #include <functional>
 #include <sstream>
@@ -15,13 +16,7 @@ namespace same_decoder {
 
 static const char *const TAG = "same_decoder";
 
-static constexpr float COEFF_MARK  = 1.926090f;   // 2*cos(2*pi*2083.33/48000)
-static constexpr float COEFF_SPACE = 1.958313f;   // 2*cos(2*pi*1562.5/48000)
-
-// Replace any byte that is not printable 7-bit ASCII (0x20..0x7E) with '?'.
-// SAME headers are pure ASCII by spec; anything else is capture noise. This
-// guarantees the string we hand to the ESPHome API (a protobuf UTF-8 string)
-// is always valid UTF-8 and cannot crash the connection.
+// Sanitize to printable 7-bit ASCII so the ESPHome API never receives invalid UTF-8.
 static std::string sanitize_ascii(const std::string &in) {
   std::string out;
   out.reserve(in.size());
@@ -34,43 +29,28 @@ static std::string sanitize_ascii(const std::string &in) {
   return out;
 }
 
-// Valid characters within a SAME ZCZC header: digits, uppercase letters, and
-// the structural separators '-', '+', '/'. Anything else means we have run off
-// the end of the header into the attention tone / audio and should stop.
-static bool is_valid_same_char(char c) {
-  return (c >= '0' && c <= '9') ||
-         (c >= 'A' && c <= 'Z') ||
-         c == '-' || c == '+' || c == '/';
-}
-
-// Goertzel energy over `n` samples pulled from the ring buffer. The window
-// ENDS at ring index `endpos` (inclusive) and extends backwards `n` samples.
-static float goertzel_ring_end(const int16_t *ring, int ringlen, int endpos, int n, float coeff) {
-  float s1 = 0.f, s2 = 0.f;
-  int startpos = ((endpos - (n - 1)) % ringlen + ringlen) % ringlen;
-  for (int i = 0; i < n; i++) {
-    int idx = (startpos + i) % ringlen;
-    float s0 = (float) ring[idx] + coeff * s1 - s2;
-    s2 = s1;
-    s1 = s0;
-  }
-  return s1 * s1 + s2 * s2 - coeff * s1 * s2;
-}
-
 void SAMEDecoder::setup() {
-  ESP_LOGCONFIG(TAG, "SAME decoder ready (timing-recovery, gain=%.1f).", this->gain_);
+  this->samples_per_bit_ = (float) this->sample_rate_ / 520.83f;
+  this->phase_inc_ = 1.0f / this->samples_per_bit_;
+  this->update_goertzel_coeffs_();
+  ESP_LOGCONFIG(TAG, "SAME decoder ready (multi-bin AFC, soft decisions, burst timeout).");
   this->reset_capture_();
 }
 
-// Runs on the MAIN loop thread. Drain ALL queued alerts (produced by mic_task)
-// and perform all Native API interaction here where it is thread-safe.
 void SAMEDecoder::loop() {
-  uint32_t head = this->q_head_.load(std::memory_order_relaxed);
-  while (head != this->q_tail_.load(std::memory_order_acquire)) {
-    SameAlert a = this->alert_queue_[head];
-    head = (head + 1) % ALERT_Q_LEN;
-    this->q_head_.store(head, std::memory_order_release);
-    this->dispatch_alert_(a);
+  // If we have at least one burst and the group has gone quiet longer than the
+  // timeout, emit whatever we have and return to hunt. Prevents a missed third
+  // repeat from blocking the next alert.
+  if (this->burst_idx_ > 0 && this->group_start_ms_ != 0) {
+    const uint32_t now = millis();
+    const uint32_t idle = now - this->last_activity_ms_;
+    const uint32_t age = now - this->group_start_ms_;
+    if (idle >= this->burst_timeout_ms_ || age >= (this->burst_timeout_ms_ + 5000)) {
+      ESP_LOGD(TAG, "Burst group timeout (%u bursts, idle=%u ms); emitting partial.",
+               (unsigned) this->burst_idx_, (unsigned) idle);
+      this->vote_and_emit_();
+      this->reset_capture_();
+    }
   }
 }
 
@@ -78,12 +58,41 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "SAME Decoder:");
   ESP_LOGCONFIG(TAG, "  Sample rate: %" PRIu32 " Hz", this->sample_rate_);
   ESP_LOGCONFIG(TAG, "  Software gain: %.1f", this->gain_);
-  ESP_LOGCONFIG(TAG, "  Samples/bit: %.2f, Goertzel window: %d, ring: %d", SAMPLES_PER_BIT, GWIN, RINGLEN);
-  ESP_LOGCONFIG(TAG, "  Goertzel coeffs: mark=%.6f space=%.6f", COEFF_MARK, COEFF_SPACE);
-  ESP_LOGCONFIG(TAG, "  Timing loop: Kp=%.3f Ki=%.4f delta=%d conf_min=%.2f", TR_KP, TR_KI, TR_DELTA, TR_CONF_MIN);
-  ESP_LOGCONFIG(TAG, "  Header end: dash>=%d, fallback>=%d chars after '+'", TAIL_MIN, TAIL_COMPLETE);
-  ESP_LOGCONFIG(TAG, "  Alert queue depth: %d", ALERT_Q_LEN);
+  ESP_LOGCONFIG(TAG, "  Samples/bit: %.2f, Goertzel window: %d", this->samples_per_bit_, GWIN);
+  ESP_LOGCONFIG(TAG, "  Frequency bins: %d  step: %.0f Hz", NUM_BINS, BIN_STEP_HZ);
+  ESP_LOGCONFIG(TAG, "  Max sync Hamming distance: %d", MAX_SYNC_HAMMING);
+  ESP_LOGCONFIG(TAG, "  Burst group timeout: %" PRIu32 " ms", this->burst_timeout_ms_);
   ESP_LOGCONFIG(TAG, "  Alert triggers: %u", (unsigned) this->alert_triggers_.size());
+}
+
+void SAMEDecoder::update_goertzel_coeffs_() {
+  for (int b = 0; b < NUM_BINS; b++) {
+    float offset = (b - (NUM_BINS / 2)) * BIN_STEP_HZ + this->freq_offset_hz_;
+    float fm = NOM_MARK_HZ + offset;
+    float fs = NOM_SPACE_HZ + offset;
+    this->coeff_mark_[b] =
+        2.0f * std::cos(2.0f * (float) M_PI * fm / (float) this->sample_rate_);
+    this->coeff_space_[b] =
+        2.0f * std::cos(2.0f * (float) M_PI * fs / (float) this->sample_rate_);
+  }
+}
+
+float SAMEDecoder::goertzel_ring_(int start, int n, float coeff) const {
+  float s1 = 0.f, s2 = 0.f;
+  for (int i = 0; i < n; i++) {
+    int idx = (start + i) % RING_LEN;
+    float s0 = (float) this->ring_[idx] + coeff * s1 - s2;
+    s2 = s1;
+    s1 = s0;
+  }
+  return s1 * s1 + s2 * s2 - coeff * s1 * s2;
+}
+
+int SAMEDecoder::hamming32_(uint32_t a, uint32_t b) const {
+  uint32_t x = a ^ b;
+  x = x - ((x >> 1) & 0x55555555u);
+  x = (x & 0x33333333u) + ((x >> 2) & 0x33333333u);
+  return (int) ((((x + (x >> 4)) & 0x0F0F0F0Fu) * 0x01010101u) >> 24);
 }
 
 void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
@@ -91,73 +100,86 @@ void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
   const int16_t *samples = reinterpret_cast<const int16_t *>(data.data());
   for (size_t i = 0; i < n; i++) {
     float v = (float) samples[i] * this->gain_;
-    if (v >  32767.0f) v =  32767.0f;
-    if (v < -32768.0f) v = -32768.0f;
+    if (v > 32767.0f)
+      v = 32767.0f;
+    if (v < -32768.0f)
+      v = -32768.0f;
     this->feed_sample_((int16_t) v);
   }
 }
 
-// Push each sample into the ring; advance the bit-clock phase (with rate
-// correction). When phase crosses 1.0, make a bit decision using a Goertzel
-// window CENTERED on the bit, and run an early/late timing update that nudges
-// phase and bit-rate toward the true bit center.
 void SAMEDecoder::feed_sample_(int16_t s) {
   this->ring_[this->ring_pos_] = s;
-  this->ring_pos_ = (this->ring_pos_ + 1) % RINGLEN;
-  if (this->samples_seen_ < 0x7fffffff) this->samples_seen_++;
+  this->ring_pos_ = (this->ring_pos_ + 1) % RING_LEN;
 
-  this->phase_ += (PHASE_INC + this->w_off_);
+  this->phase_ += this->phase_inc_;
   if (this->phase_ < 1.0f)
     return;
   this->phase_ -= 1.0f;
 
-  // Index of the most-recently written sample.
-  int s_now = (this->ring_pos_ - 1 + RINGLEN) % RINGLEN;
+  int center_start = (this->ring_pos_ - GWIN + RING_LEN) % RING_LEN;
 
-  // Window END indices for center / early / late. Centering the window on the
-  // bit (CENTER_LAG back from "now") removes the half-window bias the old code
-  // had from ending the window at the newest sample.
-  int t_center = (s_now - CENTER_LAG + RINGLEN) % RINGLEN;
-  int t_early  = (t_center - TR_DELTA + RINGLEN) % RINGLEN;
-  int t_late   = (t_center + TR_DELTA) % RINGLEN;
+  // Evaluate all frequency bins; keep highest mark/space contrast.
+  float best_contrast = -1.0f;
+  float best_em = 0.f, best_es = 0.f;
+  int best_b = this->best_bin_;
 
-  // Center energies + bit decision.
-  float em_c = goertzel_ring_end(this->ring_, RINGLEN, t_center, GWIN, COEFF_MARK);
-  float es_c = goertzel_ring_end(this->ring_, RINGLEN, t_center, GWIN, COEFF_SPACE);
-  bool bit = em_c > es_c;
+  for (int b = 0; b < NUM_BINS; b++) {
+    float em = this->goertzel_ring_(center_start, GWIN, this->coeff_mark_[b]);
+    float es = this->goertzel_ring_(center_start, GWIN, this->coeff_space_[b]);
+    float contrast = std::fabs(em - es);
+    if (contrast > best_contrast) {
+      best_contrast = contrast;
+      best_em = em;
+      best_es = es;
+      best_b = b;
+    }
+  }
+  this->best_bin_ = best_b;
 
-  // Only adapt timing once the ring is primed with enough history for the
-  // furthest-back (late+window) read, so early bits don't chase stale data.
-  bool primed = this->samples_seen_ >= (uint32_t) (CENTER_LAG + TR_DELTA + GWIN + 2);
-  if (primed) {
-    float em_e = goertzel_ring_end(this->ring_, RINGLEN, t_early, GWIN, COEFF_MARK);
-    float es_e = goertzel_ring_end(this->ring_, RINGLEN, t_early, GWIN, COEFF_SPACE);
-    float em_l = goertzel_ring_end(this->ring_, RINGLEN, t_late,  GWIN, COEFF_MARK);
-    float es_l = goertzel_ring_end(this->ring_, RINGLEN, t_late,  GWIN, COEFF_SPACE);
+  float soft = (best_em - best_es) / (this->agc_level_ + 1.0f);
 
-    float d_early = std::fabs(em_e - es_e);
-    float d_late  = std::fabs(em_l - es_l);
-    float d_center = std::fabs(em_c - es_c);
-    float e_center = em_c + es_c;
+  // Light AGC on decision magnitude.
+  float mag = std::fabs(best_em) + std::fabs(best_es);
+  this->agc_level_ = (1.0f - AGC_ALPHA) * this->agc_level_ + AGC_ALPHA * mag;
 
-    const float eps = 1e-9f;
-    float e_raw = (d_late - d_early) / (d_late + d_early + eps);
-    float conf  = d_center / (e_center + eps);
-    float e = (conf >= TR_CONF_MIN) ? e_raw : 0.0f;
-
-    // Proportional phase correction (clamped).
-    float dphi = TR_KP * e;
-    if (dphi >  TR_DPHI_CLAMP) dphi =  TR_DPHI_CLAMP;
-    if (dphi < -TR_DPHI_CLAMP) dphi = -TR_DPHI_CLAMP;
-    this->phase_ += dphi;
-
-    // Integral bit-rate correction (clamped) - removes steady drift.
-    this->w_off_ += TR_KI * e;
-    if (this->w_off_ >  TR_WOFF_CLAMP) this->w_off_ =  TR_WOFF_CLAMP;
-    if (this->w_off_ < -TR_WOFF_CLAMP) this->w_off_ = -TR_WOFF_CLAMP;
+  // Running signal vs residual energy for an SNR-style metric.
+  float sig = std::max(best_em, best_es);
+  float res = std::min(best_em, best_es);
+  this->energy_signal_ = (1.0f - SNR_ALPHA) * this->energy_signal_ + SNR_ALPHA * sig;
+  this->energy_noise_ = (1.0f - SNR_ALPHA) * this->energy_noise_ + SNR_ALPHA * res;
+  if (this->energy_noise_ > 1.0f) {
+    this->last_snr_db_ = 10.0f * std::log10(this->energy_signal_ / this->energy_noise_);
   }
 
-  this->emit_bit_(bit);
+  // Early / late samples for timing recovery.
+  int early_off = (int) (EARLY_FRAC * this->samples_per_bit_);
+  int late_off = (int) (LATE_FRAC * this->samples_per_bit_);
+  int early_start = (center_start - early_off + RING_LEN) % RING_LEN;
+  int late_start = (center_start + late_off) % RING_LEN;
+
+  float e_early = this->goertzel_ring_(early_start, GWIN, this->coeff_mark_[best_b]) -
+                  this->goertzel_ring_(early_start, GWIN, this->coeff_space_[best_b]);
+  float e_late = this->goertzel_ring_(late_start, GWIN, this->coeff_mark_[best_b]) -
+                 this->goertzel_ring_(late_start, GWIN, this->coeff_space_[best_b]);
+
+  float timing_err = (std::fabs(e_late) - std::fabs(e_early));
+  this->phase_ += 0.04f * (timing_err / (std::fabs(soft) + 1.0f));
+
+  // Simple AFC: walk residual offset toward the winning bin.
+  if (best_b != (NUM_BINS / 2)) {
+    float desired = (best_b - (NUM_BINS / 2)) * BIN_STEP_HZ;
+    this->freq_offset_hz_ =
+        (1.0f - this->afc_alpha_) * this->freq_offset_hz_ + this->afc_alpha_ * desired;
+    static int afc_counter = 0;
+    if (++afc_counter >= 32) {
+      afc_counter = 0;
+      this->update_goertzel_coeffs_();
+    }
+  }
+
+  bool hard = soft > 0.0f;
+  this->emit_bit_(hard, soft);
 }
 
 void SAMEDecoder::reset_capture_() {
@@ -167,149 +189,169 @@ void SAMEDecoder::reset_capture_() {
   this->cur_nbits_ = 0;
   this->cur_burst_.clear();
   this->burst_idx_ = 0;
-  this->plus_seen_ = false;
-  this->tail_count_ = 0;
-  for (int i = 0; i < 3; i++) this->bursts_[i].clear();
+  for (int i = 0; i < 3; i++) {
+    this->bursts_[i].clear();
+    this->burst_quality_[i] = 0.0f;
+  }
+  this->soft_accum_ = 0.0f;
+  this->soft_count_ = 0;
+  this->group_start_ms_ = 0;
+  this->last_activity_ms_ = 0;
 }
 
-// Store the completed burst, log it, and either vote (after 3) or hunt for the
-// next repeat's ZCZC.
-void SAMEDecoder::finish_burst_() {
-  // Hex+ASCII diagnostic of the assembled burst.
-  std::string hex;
-  char tmp[4];
-  for (size_t i = 0; i < this->cur_burst_.size() && i < 32; i++) {
-    snprintf(tmp, sizeof(tmp), "%02X ", (uint8_t) this->cur_burst_[i]);
-    hex += tmp;
+void SAMEDecoder::emit_bit_(bool hard_bit, float soft) {
+  this->last_activity_ms_ = millis();
+
+  if (this->phase_state_ == CAPTURE) {
+    this->soft_accum_ += std::fabs(soft);
+    this->soft_count_++;
   }
-  ESP_LOGD(TAG, "Burst %d ascii: '%s'", this->burst_idx_, sanitize_ascii(this->cur_burst_).c_str());
-  ESP_LOGD(TAG, "Burst %d hex : %s", this->burst_idx_, hex.c_str());
 
-  this->bursts_[this->burst_idx_] = this->cur_burst_;
-  this->burst_idx_++;
-  this->cur_burst_.clear();
-  this->plus_seen_ = false;
-  this->tail_count_ = 0;
-
-  if (this->burst_idx_ >= 3) {
-    this->vote_and_emit_();
-    this->reset_capture_();
-  } else {
-    // Next repeat: hunt for its ZCZC again (robust to gaps between bursts).
-    this->phase_state_ = HUNT_SYNC;
-    this->sync_shift_ = 0;
-    this->cur_byte_ = 0;
-    this->cur_nbits_ = 0;
-  }
-}
-
-void SAMEDecoder::emit_bit_(bool bit) {
   if (this->phase_state_ == HUNT_SYNC) {
-    // Shift new bit into MSB side; first-received bit ends up toward LSB as we
-    // shift right. Build a rolling 32-bit window and compare against ZCZC.
-    this->sync_shift_ = (this->sync_shift_ >> 1) | ((uint32_t) (bit ? 1u : 0u) << 31);
+    this->sync_shift_ = (this->sync_shift_ >> 1) | ((uint32_t) (hard_bit ? 1u : 0u) << 31);
 
-    // 'ZCZC' LSB-first bitstream: Z=0x5A->01011010, C=0x43->11000010 (LSB-first
-    // per-byte), concatenated = 01011010 11000010 01011010 11000010.
-    // Assembled into a 32-bit word as received (first bit -> LSB after 32 shifts):
-    // We match SYNC_ZCZC computed to equal that received pattern.
-    if (this->sync_shift_ == SYNC_ZCZC) {
-      ESP_LOGD(TAG, "ZCZC sync found. Byte-aligned capture starting.");
+    int dist = this->hamming32_(this->sync_shift_, SYNC_ZCZC);
+    if (dist <= MAX_SYNC_HAMMING) {
+      ESP_LOGD(TAG, "ZCZC sync found (Hamming=%d). Byte-aligned capture starting.", dist);
       this->phase_state_ = CAPTURE;
-      // Seed the burst with the known "ZCZC" we just matched.
       this->cur_burst_ = "ZCZC";
       this->cur_byte_ = 0;
       this->cur_nbits_ = 0;
-      this->plus_seen_ = false;
-      this->tail_count_ = 0;
+      this->soft_accum_ = 0.0f;
+      this->soft_count_ = 0;
+      if (this->burst_idx_ == 0)
+        this->group_start_ms_ = millis();
     }
     return;
   }
 
-  // CAPTURE -- assemble LSB-first bytes.
+  // CAPTURE — assemble LSB-first bytes.
   this->cur_byte_ >>= 1;
-  if (bit) this->cur_byte_ |= 0x80;
+  if (hard_bit)
+    this->cur_byte_ |= 0x80;
   this->cur_nbits_++;
 
-  if (this->cur_nbits_ != 8)
-    return;
+  if (this->cur_nbits_ == 8) {
+    char c = (char) this->cur_byte_;
+    this->cur_burst_ += c;
+    this->cur_byte_ = 0;
+    this->cur_nbits_ = 0;
 
-  char c = (char) this->cur_byte_;
-  this->cur_byte_ = 0;
-  this->cur_nbits_ = 0;
-
-  // Guard: if the character is not a legal SAME header char, we have run off the
-  // end of the header into the attention tone / audio. End the burst now with
-  // whatever valid header we have (do NOT append the invalid char).
-  if (!is_valid_same_char(c)) {
-    if (this->cur_burst_.size() >= 4) {
-      this->finish_burst_();
-    } else {
-      // Too short to be real - abandon and re-hunt.
-      this->phase_state_ = HUNT_SYNC;
-      this->sync_shift_ = 0;
-      this->cur_byte_ = 0;
-      this->cur_nbits_ = 0;
-      this->plus_seen_ = false;
-      this->tail_count_ = 0;
+    bool eom = (this->cur_burst_.size() >= 4 &&
+                this->cur_burst_.compare(this->cur_burst_.size() - 4, 4, "NNNN") == 0);
+    // Tolerate a single-character error in the EOM marker.
+    if (!eom && this->cur_burst_.size() >= 4) {
+      const char *tail = this->cur_burst_.c_str() + this->cur_burst_.size() - 4;
+      int errs = 0;
+      for (int i = 0; i < 4; i++)
+        if (tail[i] != 'N')
+          errs++;
+      if (errs <= 1)
+        eom = true;
     }
-    return;
-  }
 
-  this->cur_burst_ += c;
+    if (eom || this->cur_burst_.size() >= (size_t) MAX_HEADER_BYTES) {
+      if (eom) {
+        size_t nn = this->cur_burst_.rfind("NNNN");
+        if (nn != std::string::npos) {
+          this->cur_burst_.erase(nn + 4);
+        } else {
+          // Near-match: trim to last plausible end.
+          for (size_t i = this->cur_burst_.size(); i-- > 3;) {
+            if (this->cur_burst_[i] == 'N') {
+              this->cur_burst_.erase(i + 1);
+              break;
+            }
+          }
+        }
+      }
 
-  // ---- Structure-driven end-of-header detection ----
-  // The header format is:
-  //   ZCZC-ORG-EEE-PSSCCC[-PSSCCC...]+TTTT-JJJHHMM-LLLLLLLL-
-  // The '+' unambiguously ends the variable-length area list. After it comes a
-  // fixed tail; the header ends at the trailing '-' after LLLLLLLL.
-  //  PRIMARY : anchor on '+', stop at the first '-' once past TAIL_MIN.
-  //  FALLBACK: if that closing '-' is missed/garbled, stop once the full fixed
-  //            tail (TAIL_COMPLETE chars) has been consumed - the header is
-  //            structurally complete, so we do not lose an otherwise-good decode.
-  if (!this->plus_seen_) {
-    if (c == '+') {
-      this->plus_seen_ = true;
-      this->tail_count_ = 0;
+      std::string hex;
+      char tmp[4];
+      for (size_t i = 0; i < this->cur_burst_.size() && i < 32; i++) {
+        snprintf(tmp, sizeof(tmp), "%02X ", (uint8_t) this->cur_burst_[i]);
+        hex += tmp;
+      }
+      float q = (this->soft_count_ > 0) ? (this->soft_accum_ / this->soft_count_) : 0.0f;
+      ESP_LOGD(TAG, "Burst %d ascii: '%s'  quality=%.1f", this->burst_idx_,
+               sanitize_ascii(this->cur_burst_).c_str(), q);
+      ESP_LOGD(TAG, "Burst %d hex : %s", this->burst_idx_, hex.c_str());
+
+      this->bursts_[this->burst_idx_] = this->cur_burst_;
+      this->burst_quality_[this->burst_idx_] = q;
+      this->burst_idx_++;
+      this->cur_burst_.clear();
+      this->soft_accum_ = 0.0f;
+      this->soft_count_ = 0;
+
+      if (this->burst_idx_ >= 3) {
+        this->vote_and_emit_();
+        this->reset_capture_();
+      } else {
+        // Re-hunt for the next repeat (robust to gaps between bursts).
+        this->phase_state_ = HUNT_SYNC;
+        this->sync_shift_ = 0;
+        this->cur_byte_ = 0;
+        this->cur_nbits_ = 0;
+      }
     }
-  } else {
-    this->tail_count_++;
-    if (c == '-' && this->tail_count_ >= TAIL_MIN) {
-      // Primary: this dash closes the header (dash already appended).
-      this->finish_burst_();
-      return;
-    } else if (this->tail_count_ >= TAIL_COMPLETE) {
-      // Fallback: closing dash missed, but the fixed tail is complete.
-      ESP_LOGD(TAG, "Header end fallback: fixed tail complete without closing dash.");
-      this->finish_burst_();
-      return;
-    }
-  }
-
-  // Safety net: never run away past a plausible header length.
-  if (this->cur_burst_.size() >= (size_t) MAX_HEADER_BYTES) {
-    this->finish_burst_();
   }
 }
 
 void SAMEDecoder::vote_and_emit_() {
+  if (this->burst_idx_ < 1)
+    return;
+
   size_t maxlen = 0;
-  for (int i = 0; i < 3; i++) maxlen = std::max(maxlen, this->bursts_[i].size());
+  for (int i = 0; i < this->burst_idx_; i++)
+    maxlen = std::max(maxlen, this->bursts_[i].size());
+
   std::string voted;
   voted.reserve(maxlen);
+
   for (size_t i = 0; i < maxlen; i++) {
-    char best = 0; int bestcount = 0;
-    for (int a = 0; a < 3; a++) {
-      if (i >= this->bursts_[a].size()) continue;
-      char ca = this->bursts_[a][i]; int cnt = 0;
-      for (int c = 0; c < 3; c++)
-        if (i < this->bursts_[c].size() && this->bursts_[c][i] == ca) cnt++;
-      if (cnt > bestcount) { bestcount = cnt; best = ca; }
+    // Quality-weighted majority over the bursts we actually have.
+    char best = 0;
+    float best_score = -1.0f;
+    for (int a = 0; a < this->burst_idx_; a++) {
+      if (i >= this->bursts_[a].size())
+        continue;
+      char ca = this->bursts_[a][i];
+      float score = 0.0f;
+      for (int c = 0; c < this->burst_idx_; c++) {
+        if (i < this->bursts_[c].size() && this->bursts_[c][i] == ca)
+          score += this->burst_quality_[c] + 0.1f;
+      }
+      if (score > best_score) {
+        best_score = score;
+        best = ca;
+      }
     }
-    if (best) voted += best;
+    if (best)
+      voted += best;
   }
 
-  ESP_LOGD(TAG, "Voted header: '%s'", sanitize_ascii(voted).c_str());
+  float total_q = 0.0f;
+  int used = 0;
+  for (int i = 0; i < this->burst_idx_; i++) {
+    if (!this->bursts_[i].empty()) {
+      total_q += this->burst_quality_[i];
+      used++;
+    }
+  }
+  this->last_quality_ = (used > 0) ? (total_q / used) : 0.0f;
+
+  ESP_LOGD(TAG, "Voted header (%d bursts): '%s'  quality=%.1f  snr=%.1f dB  offset=%.1f Hz",
+           this->burst_idx_, sanitize_ascii(voted).c_str(), this->last_quality_,
+           this->last_snr_db_, this->freq_offset_hz_);
+
+  if (this->quality_sensor_ != nullptr)
+    this->quality_sensor_->publish_state(this->last_quality_);
+  if (this->snr_sensor_ != nullptr)
+    this->snr_sensor_->publish_state(this->last_snr_db_);
+  if (this->freq_offset_sensor_ != nullptr)
+    this->freq_offset_sensor_->publish_state(this->freq_offset_hz_);
+
   size_t z = voted.find("ZCZC");
   if (z == std::string::npos) {
     ESP_LOGW(TAG, "Voted header missing ZCZC; discarding.");
@@ -351,82 +393,58 @@ bool SAMEDecoder::parse_header_(const std::string &header, SameAlert &out) {
   std::vector<std::string> parts;
   std::string cur;
   for (char c : header) {
-    if (c == '-') { parts.push_back(cur); cur.clear(); }
-    else { cur += c; }
+    if (c == '-') {
+      parts.push_back(cur);
+      cur.clear();
+    } else {
+      cur += c;
+    }
   }
-  if (!cur.empty()) parts.push_back(cur);
+  if (!cur.empty())
+    parts.push_back(cur);
   if (parts.size() < 4)
     return false;
 
   out.originator = parts[1];
   out.event_code = parts[2];
   out.event_name = this->describe_(out.event_code);
-  out.severity   = this->severity_for_(out.event_code);
+  out.severity = this->severity_for_(out.event_code);
 
-  // Collect area codes. The area list ends at the '+', which appears INSIDE the
-  // part that also carries the valid-time (e.g. "031025+0045"). So when a part
-  // contains '+', take the substring before it as the final area, then stop.
   std::string areas;
   for (size_t i = 3; i < parts.size(); i++) {
-    size_t plus = parts[i].find('+');
-    if (plus != std::string::npos) {
-      std::string last_area = parts[i].substr(0, plus);
-      if (!last_area.empty()) {
-        if (!areas.empty()) areas += ",";
-        areas += last_area;
-      }
+    if (parts[i].find('+') != std::string::npos)
       break;
-    }
-    if (!areas.empty()) areas += ",";
+    if (!areas.empty())
+      areas += ",";
     areas += parts[i];
   }
   out.areas_csv = areas;
 
   out.status = (out.event_code == "RWT" || out.event_code == "RMT" ||
                 out.event_code == "DMO" || out.event_code == "NPT")
-                   ? "Test" : "Actual";
+                   ? "Test"
+                   : "Actual";
 
   out.onset_iso = "";
   out.expires_iso = "";
   out.sender = parts.empty() ? "" : parts.back();
-
   out.id = this->make_id_(out);
   return true;
 }
 
-// Called from mic_task (producer). Do NOT touch the Native API here. Push the
-// alert onto the lock-free ring buffer; loop() (main thread) drains and does all
-// publish_state()/trigger() work. Only drops if the queue is genuinely full.
 void SAMEDecoder::publish_alert_(const SameAlert &a) {
-  SameAlert clean = a;
-  // Guarantee valid 7-bit ASCII for the raw header before it ever reaches the
-  // API as a protobuf string.
-  clean.raw_header = sanitize_ascii(a.raw_header);
-
-  ESP_LOGI(TAG, "Decoded SAME: %s (%s) areas=%s",
-           clean.event_name.c_str(), clean.event_code.c_str(), clean.areas_csv.c_str());
-
-  uint32_t tail = this->q_tail_.load(std::memory_order_relaxed);
-  uint32_t next = (tail + 1) % ALERT_Q_LEN;
-  if (next == this->q_head_.load(std::memory_order_acquire)) {
-    // Queue full: main loop has not drained in time. Drop rather than overwrite.
-    ESP_LOGW(TAG, "Alert queue full; dropping alert (loop starved?).");
-    return;
-  }
-  this->alert_queue_[tail] = clean;
-  this->q_tail_.store(next, std::memory_order_release);
-}
-
-// Runs on the MAIN loop thread (from loop()). All Native API interaction lives
-// here so it never races the API sender.
-void SAMEDecoder::dispatch_alert_(const SameAlert &a) {
   this->last_ = a;
+  this->last_.raw_header = sanitize_ascii(a.raw_header);
   this->decode_count_++;
 
   if (this->decode_count_sensor_ != nullptr)
     this->decode_count_sensor_->publish_state((float) this->decode_count_);
   if (this->last_raw_sensor_ != nullptr)
     this->last_raw_sensor_->publish_state(this->last_.raw_header);
+
+  ESP_LOGI(TAG, "Decoded SAME: %s (%s) areas=%s  quality=%.1f  snr=%.1f dB  offset=%.1f Hz",
+           a.event_name.c_str(), a.event_code.c_str(), a.areas_csv.c_str(),
+           this->last_quality_, this->last_snr_db_, this->freq_offset_hz_);
 
   for (auto *t : this->alert_triggers_)
     t->trigger();
