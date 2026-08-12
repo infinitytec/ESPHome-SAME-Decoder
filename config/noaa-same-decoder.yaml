@@ -7,6 +7,11 @@
 #  The microphone: component owns I2S input; its on_data trigger feeds bytes to
 #  the same_decoder via feed_bytes(). This decouples us from low-level I2S API
 #  churn (future-proof, idiomatic ESPHome).
+#
+#  Audio input selection:
+#    LINE1 (default) = line-in only (INL/INR), the intended decode source.
+#    LINE2 / DIFFERENCE remain selectable from Home Assistant via the
+#    "SAME ADC Input" select for troubleshooting (e.g. compare against a mic).
 # =============================================================================
 
 substitutions:
@@ -21,7 +26,7 @@ esphome:
       - lambda: 'ESP_LOGI("same", "Boot complete; SAME decoder starting.");'
       - select.set:
           id: same_adc_input
-          option: "DIFFERENCE"
+          option: "LINE1"              # line-in only (was DIFFERENCE, which mixed mics + line-in)
       # --- Raise ES8388 input PGA gain (ADCControl1 = reg 0x09) ---
       # Both nibbles = per-channel MicAmp/PGA gain. 0x88 = +24 dB L & R.
       # Try 0x88 (24 dB) first; if it clips, drop to 0x66 (18) or 0x44 (12).
