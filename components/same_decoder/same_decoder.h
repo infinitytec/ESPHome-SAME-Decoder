@@ -143,13 +143,18 @@ class SAMEDecoder : public Component {
   // ---- Header termination (structure-driven) ----
   // A ZCZC header ends at the trailing '-' after the fixed tail
   // "+TTTT-JJJHHMM-LLLLLLLL". It does NOT contain "NNNN" (that is a separate
-  // End-Of-Message transmission). We anchor on '+', then count the fixed tail
-  // and stop at the closing '-'. TAIL_MIN is the minimum chars after '+' before
-  // the closing dash can legitimately appear: TTTT(4) - JJJHHMM(7) - up to
-  // LLLLLLLL(8), i.e. 4 + 1 + 7 + 1 + 1 = 14 minimum before a valid stop dash.
+  // End-Of-Message transmission). We anchor on '+', then count the fixed tail.
+  //  PRIMARY  : stop at the closing '-' once past TAIL_MIN.
+  //  FALLBACK : if that dash is missed/garbled, stop once the full fixed tail
+  //             length (TAIL_COMPLETE chars) has been consumed - the header is
+  //             structurally complete by then, so an otherwise-good decode is
+  //             not lost.
+  // TAIL_MIN     = 4(TTTT) +1(-) +7(JJJHHMM) +1(-) +1 = 14 (earliest valid dash)
+  // TAIL_COMPLETE= 4(TTTT) +1(-) +7(JJJHHMM) +1(-) +8(LLLLLLLL) = 21 (tail done)
   bool  plus_seen_{false};                                  // have we seen '+' yet
   int   tail_count_{0};                                     // chars counted since '+'
   static constexpr int TAIL_MIN = 14;                       // min tail chars before closing '-'
+  static constexpr int TAIL_COMPLETE = 21;                  // full fixed tail length after '+'
 };
 
 }  // namespace same_decoder
