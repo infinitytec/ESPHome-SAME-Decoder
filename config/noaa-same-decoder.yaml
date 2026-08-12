@@ -178,7 +178,7 @@ sensor:
       entity_category: diagnostic
       disabled_by_default: true
 
-      - platform: template
+  - platform: template
     id: same_quality
     name: "SAME Decode Quality"
     accuracy_decimals: 1
