@@ -104,7 +104,8 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "  Same-message match: ORG/EEE fuzzy, area+timing EXACT");
   ESP_LOGCONFIG(TAG, "  Dedup: session-based; immediate-dup guard %" PRIu32 " ms", IMMEDIATE_DUP_MS);
   ESP_LOGCONFIG(TAG, "  Re-arm sync cleanly after each burst (catch tight repeats).");
-  ESP_LOGCONFIG(TAG, "  Single-burst emit: strictly valid only, after >= %" PRIu32 " ms", SINGLE_BURST_MIN_MS);
+  ESP_LOGCONFIG(TAG, "  Weak-evidence gate: structural only (UNKNOWN codes fire).");
+  ESP_LOGCONFIG(TAG, "  Single-burst emit: structurally valid only, after >= %" PRIu32 " ms", SINGLE_BURST_MIN_MS);
   ESP_LOGCONFIG(TAG, "  Burst timeout (>=2 bursts): %" PRIu32 " ms", this->timeout_ms_.load(std::memory_order_relaxed));
   ESP_LOGCONFIG(TAG, "  Alert triggers: %u, sync triggers: %u",
                 (unsigned) this->alert_triggers_.size(), (unsigned) this->sync_triggers_.size());
@@ -398,13 +399,17 @@ void SAMEDecoder::emit_bit_(bool bit) {
   }
 }
 
+// Weak-evidence gate: structural checks only. The "must be a known event code"
+// requirement has been REMOVED so an UNKNOWN-but-structurally-valid header
+// (e.g. a rare/new code, or a national code not yet in the table) still fires -
+// it decodes with the raw code as its name and "Unknown" severity. Structural
+// checks are retained so garbled noise cannot fire as a bogus alert.
 bool SAMEDecoder::header_is_strictly_valid_(const std::string &header) {
   if (header.rfind("ZCZC", 0) != 0) return false;
   if (header.find('+') == std::string::npos) return false;
   SameAlert probe;
   if (!this->parse_header_(header, probe)) return false;
   if (probe.event_code.size() != 3) return false;
-  if (!this->is_known_code_(probe.event_code)) return false;
   if (probe.originator.size() != 3) return false;
   return true;
 }
@@ -440,16 +445,20 @@ void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
   bool weak = (from_timeout && collected < 2) || fallback_synced;
   if (weak) {
     if (!this->header_is_strictly_valid_(header)) {
-      ESP_LOGW(TAG, "Weak-evidence emit rejected (failed strict validity): '%s'",
+      ESP_LOGW(TAG, "Weak-evidence emit rejected (failed structural validity): '%s'",
                sanitize_ascii(header).c_str());
       return;
     }
-    ESP_LOGI(TAG, "Weak-evidence emit accepted (strictly valid).");
+    ESP_LOGI(TAG, "Weak-evidence emit accepted (structurally valid).");
   }
 
   SameAlert alert;
   if (!this->parse_header_(header, alert))
     return;
+
+  if (!this->is_known_code_(alert.event_code)) {
+    ESP_LOGW(TAG, "Unknown event code '%s' - firing as Unknown severity.", alert.event_code.c_str());
+  }
 
   uint32_t now = millis();
 
@@ -487,7 +496,7 @@ std::string SAMEDecoder::describe_(const std::string &code) {
   auto it = SAME_EVENT_CODES.find(code);
   if (it != SAME_EVENT_CODES.end())
     return it->second.name;
-  return code;
+  return code;   // unknown code -> raw code as the name
 }
 
 std::string SAMEDecoder::severity_for_(const std::string &code) {
