@@ -10,6 +10,7 @@
 #include <vector>
 #include <cstdint>
 #include <atomic>
+#include <cmath>
 
 namespace esphome {
 namespace same_decoder {
@@ -46,11 +47,18 @@ class SAMEDecoder : public Component {
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::LATE; }
 
-  void set_sample_rate(uint32_t rate) { this->sample_rate_ = rate; }
+  void set_sample_rate(uint32_t rate);
   void set_gain(float g) { this->gain_ = g; }
   float get_gain() const { return this->gain_; }
+  void set_freq_offset_hz(float hz) { this->freq_offset_hz_ = hz; }
+  void set_agc_enable(bool e) { this->agc_enable_ = e; }
+  void set_agc_target(float t) { this->agc_target_ = t; }
+  void set_agc_min_gain(float g) { this->agc_min_gain_ = g; }
+  void set_agc_max_gain(float g) { this->agc_max_gain_ = g; }
   void set_timeout_ms(uint32_t v) { this->timeout_ms_.store(v, std::memory_order_relaxed); }
   uint32_t get_timeout_ms() const { return this->timeout_ms_.load(std::memory_order_relaxed); }
+  void set_single_burst_min_ms(uint32_t v) { this->single_burst_min_ms_ = v; }
+  void set_post_emit_dead_ms(uint32_t v) { this->post_emit_dead_ms_ = v; }
   void set_decode_count_sensor(sensor::Sensor *s) { this->decode_count_sensor_ = s; }
   void set_last_raw_sensor(text_sensor::TextSensor *s) { this->last_raw_sensor_ = s; }
   void register_alert_trigger(AlertTrigger *t) { this->alert_triggers_.push_back(t); }
@@ -83,9 +91,14 @@ class SAMEDecoder : public Component {
   void begin_new_capture_(int preamble_len, bool fallback);
   void vote_and_emit_(bool from_timeout, bool fallback_synced);
   void finish_burst_();
+  void compute_coeffs_();
+  void update_agc_(float mag);
+  bool ab_preamble_ok_() const;
+  void note_emit_();
 
   bool parse_header_(const std::string &header, SameAlert &out);
   bool header_is_strictly_valid_(const std::string &header);
+  bool header_passes_semantic_(const SameAlert &a) const;
   bool same_message_as_current_(const std::string &new_burst);
   bool fuzzy_equal_(const std::string &a, const std::string &b);
   std::string canonicalize_front_(const std::string &voted);
@@ -100,6 +113,7 @@ class SAMEDecoder : public Component {
 
   uint32_t sample_rate_{48000};
   float gain_{1.0f};
+  float freq_offset_hz_{0.0f};
   sensor::Sensor *decode_count_sensor_{nullptr};
   text_sensor::TextSensor *last_raw_sensor_{nullptr};
   std::vector<AlertTrigger *> alert_triggers_;
@@ -139,16 +153,15 @@ class SAMEDecoder : public Component {
   bool     was_idle_{true};
 
   // Idle->active edge window: Tier-4 bare-"ZC" acquisition is allowed ONLY for
-  // a short span of samples right after a silence->signal transition (a message
-  // demonstrably beginning), and only in HUNT_SYNC. This prevents a weak 16-bit
-  // trigger from firing mid-stream or during steady noise. Counted down in
-  // feed_sample_ from IDLE_EDGE_SAMPLES at each rising edge.
+  // a short span of samples right after a silence->signal transition.
   uint32_t idle_edge_samples_{0};
   static constexpr uint32_t IDLE_EDGE_SAMPLES = 48000;   // ~1.0 s at 48 kHz
 
-  // ---- Timing / sampling ----
-  static constexpr float SAMPLES_PER_BIT = 92.16f;
-  static constexpr float PHASE_INC       = 1.0f / 92.16f;
+  // ---- Timing / sampling (dynamic) ----
+  float samples_per_bit_{92.16f};
+  float phase_inc_{1.0f / 92.16f};
+  float coeff_mark_{1.926090f};
+  float coeff_space_{1.958313f};
   static constexpr int   GWIN            = 64;
   static constexpr int   RINGLEN         = 256;
   int16_t ring_[RINGLEN];
@@ -160,6 +173,17 @@ class SAMEDecoder : public Component {
   static constexpr float SOFT_KNEE    = 24576.0f;
   static float soft_clip_(float v);
 
+  // ---- Soft AGC ----
+  bool  agc_enable_{true};
+  float agc_target_{8000.0f};
+  float agc_min_gain_{0.25f};
+  float agc_max_gain_{64.0f};
+  float agc_gain_{1.0f};
+  float agc_peak_{0.0f};
+  static constexpr float AGC_PEAK_ALPHA = 0.001f;
+  static constexpr float AGC_ATTACK     = 0.002f;
+  static constexpr float AGC_RELEASE    = 0.0002f;
+
   // ---- Timing recovery (early/late gate) ----
   static constexpr int   CENTER_LAG      = GWIN / 2;
   static constexpr int   TR_DELTA        = 12;
@@ -167,14 +191,23 @@ class SAMEDecoder : public Component {
   static constexpr float TR_KI           = 0.0015f;
   static constexpr float TR_CONF_MIN     = 0.20f;
   static constexpr float TR_DPHI_CLAMP   = 0.125f;
-  static constexpr float TR_WOFF_CLAMP   = 0.002f * PHASE_INC;
+  float   tr_woff_clamp_{0.002f * (1.0f / 92.16f)};
   float   w_off_{0.0f};
   uint32_t samples_seen_{0};
 
-  // ---- Burst-collection timeout ----
+  // ---- Burst-collection timeout + post-emit dead-time ----
   uint32_t last_burst_ms_{0};
   std::atomic<uint32_t> timeout_ms_{3000};
-  static constexpr uint32_t SINGLE_BURST_MIN_MS = 7000;
+  uint32_t single_burst_min_ms_{7000};
+  uint32_t post_emit_dead_ms_{1500};
+  uint32_t last_emit_ms_{0};
+
+  // ---- AB preamble correlator (16 x 0xAB = 128 bits of 10101011) ----
+  // Sliding 16-bit window looking for 0xAB pattern. Count consecutive
+  // matching bytes; arm ZCZC tiers only after AB_MIN_MATCH bytes.
+  uint16_t ab_shift_{0};
+  int      ab_match_count_{0};
+  static constexpr int AB_MIN_MATCH = 4;   // ~4 of the 16 preambles is enough to arm
 
   // ---- Sync / framing ----
   enum Phase { HUNT_SYNC, CAPTURE };
@@ -196,9 +229,6 @@ class SAMEDecoder : public Component {
       (static_cast<uint32_t>('Z'));
 
   // Tier 3: boundary-clipped 24-bit variants of ZCZC.
-  //   'CZC' = last char of the leading 'Z' lost (window holds C,Z,C).
-  //   'ZCZ' = trailing 'C' not yet arrived / clipped (window holds Z,C,Z).
-  // Window low byte = first received char.
   static constexpr uint32_t SYNC_CZC_24 =
       (static_cast<uint32_t>('C') << 16) |
       (static_cast<uint32_t>('Z') << 8) |
@@ -238,6 +268,11 @@ class SAMEDecoder : public Component {
   int   tail_count_{0};
   static constexpr int TAIL_MIN = 14;
   static constexpr int TAIL_COMPLETE = 21;
+
+  // ---- EOM (NNNN) detection ----
+  // After a header session we also watch for the end-of-message marker.
+  // Four consecutive 'N' characters close the session cleanly.
+  int eom_n_count_{0};
 };
 
 }  // namespace same_decoder
