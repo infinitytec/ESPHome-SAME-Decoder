@@ -62,6 +62,7 @@ float SAMEDecoder::soft_clip_(float v) {
 void SAMEDecoder::setup() {
   ESP_LOGCONFIG(TAG, "SAME decoder ready (timing-recovery, gain=%.1f).", this->gain_);
   this->reset_capture_();
+  this->last_feed_ms_.store(millis(), std::memory_order_relaxed);
 }
 
 void SAMEDecoder::set_api_connected(bool connected) {
@@ -69,6 +70,10 @@ void SAMEDecoder::set_api_connected(bool connected) {
     this->api_connected_ = connected;
     this->api_connected_changed_.store(true, std::memory_order_release);
   }
+}
+
+uint32_t SAMEDecoder::ms_since_last_feed() const {
+  return (uint32_t) (millis() - this->last_feed_ms_.load(std::memory_order_relaxed));
 }
 
 void SAMEDecoder::loop() {
@@ -104,6 +109,7 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "  Same-message match: ORG/EEE fuzzy, area+timing EXACT");
   ESP_LOGCONFIG(TAG, "  Dedup: session-based; immediate-dup guard %" PRIu32 " ms", IMMEDIATE_DUP_MS);
   ESP_LOGCONFIG(TAG, "  Re-arm sync cleanly after each burst (catch tight repeats).");
+  ESP_LOGCONFIG(TAG, "  Idle re-prime: feed-gap %" PRIu32 " ms + energy rising edge.", FEED_GAP_MS);
   ESP_LOGCONFIG(TAG, "  Weak-evidence gate: structural only (UNKNOWN codes fire).");
   ESP_LOGCONFIG(TAG, "  Single-burst emit: structurally valid only, after >= %" PRIu32 " ms", SINGLE_BURST_MIN_MS);
   ESP_LOGCONFIG(TAG, "  Burst timeout (>=2 bursts): %" PRIu32 " ms", this->timeout_ms_.load(std::memory_order_relaxed));
@@ -111,7 +117,28 @@ void SAMEDecoder::dump_config() {
                 (unsigned) this->alert_triggers_.size(), (unsigned) this->sync_triggers_.size());
 }
 
+// Re-prime the whole detector to a clean, cold-start state. Called at an
+// idle->active transition so the FIRST real message after idle decodes without
+// needing a burst or two to warm up the timing loop.
+void SAMEDecoder::reprime_detector_() {
+  ESP_LOGD(TAG, "Idle->active: re-priming detector.");
+  this->reset_capture_();
+  for (int i = 0; i < RINGLEN; i++) this->ring_[i] = 0;
+  this->ring_pos_ = 0;
+  this->phase_ = 0.0f;
+  this->w_off_ = 0.0f;
+  this->samples_seen_ = 0;
+}
+
 void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
+  // ---- Idle-recovery: feed-gap detection (wall clock) ----
+  uint32_t now = millis();
+  uint32_t prev = this->last_feed_ms_.exchange(now, std::memory_order_relaxed);
+  if (prev != 0 && (uint32_t) (now - prev) >= FEED_GAP_MS) {
+    // The audio feed paused and resumed -> cold detector. Re-prime.
+    this->reprime_detector_();
+  }
+
   const size_t n = data.size() / 2;
   const int16_t *samples = reinterpret_cast<const int16_t *>(data.data());
   for (size_t i = 0; i < n; i++) {
@@ -130,6 +157,24 @@ static inline uint32_t effective_timeout(int burst_idx, uint32_t slider_ms, uint
 }
 
 void SAMEDecoder::feed_sample_(int16_t s) {
+  // ---- Idle-recovery: energy rising-edge detection ----
+  // Track a slow envelope of the RAW input magnitude (pre-gain-ish; s is post-
+  // gain but the ratio test is scale-tolerant). If we were idle (envelope below
+  // the silence floor) and the instantaneous magnitude jumps well above it, a
+  // message is starting after quiet -> re-prime at the rising edge.
+  float mag = std::fabs((float) s);
+  this->env_slow_ += ENV_ALPHA * (mag - this->env_slow_);
+  if (this->was_idle_) {
+    if (mag > ENV_SILENCE * ENV_RISE_MULT) {
+      this->was_idle_ = false;
+      this->reprime_detector_();
+      // fall through and process this sample from the clean state
+    }
+  } else {
+    if (this->env_slow_ < ENV_SILENCE)
+      this->was_idle_ = true;
+  }
+
   this->ring_[this->ring_pos_] = s;
   this->ring_pos_ = (this->ring_pos_ + 1) % RINGLEN;
   if (this->samples_seen_ < 0x7fffffff) this->samples_seen_++;
@@ -197,11 +242,6 @@ void SAMEDecoder::feed_sample_(int16_t s) {
   }
 }
 
-// Re-arm the sync hunter to a CLEAN state so a tightly-spaced repeat burst
-// (~1 s after the previous one) is reliably re-acquired. This clears the byte
-// assembler AND neutralizes the timing-recovery bias (w_off_) and phase that the
-// just-finished burst left locked - stale lock was causing the 2nd/3rd repeats
-// to be missed (every message decoded on burst 0 only, then timed out).
 void SAMEDecoder::rearm_sync_() {
   this->phase_state_ = HUNT_SYNC;
   this->sync_shift_ = 0;
@@ -324,7 +364,6 @@ void SAMEDecoder::finish_burst_() {
     this->early_emitted_ = true;
   }
 
-  // Re-arm cleanly for the NEXT tightly-spaced repeat burst.
   this->rearm_sync_();
 }
 
@@ -399,11 +438,6 @@ void SAMEDecoder::emit_bit_(bool bit) {
   }
 }
 
-// Weak-evidence gate: structural checks only. The "must be a known event code"
-// requirement has been REMOVED so an UNKNOWN-but-structurally-valid header
-// (e.g. a rare/new code, or a national code not yet in the table) still fires -
-// it decodes with the raw code as its name and "Unknown" severity. Structural
-// checks are retained so garbled noise cannot fire as a bogus alert.
 bool SAMEDecoder::header_is_strictly_valid_(const std::string &header) {
   if (header.rfind("ZCZC", 0) != 0) return false;
   if (header.find('+') == std::string::npos) return false;
@@ -496,7 +530,7 @@ std::string SAMEDecoder::describe_(const std::string &code) {
   auto it = SAME_EVENT_CODES.find(code);
   if (it != SAME_EVENT_CODES.end())
     return it->second.name;
-  return code;   // unknown code -> raw code as the name
+  return code;
 }
 
 std::string SAMEDecoder::severity_for_(const std::string &code) {
