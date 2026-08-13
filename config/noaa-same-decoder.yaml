@@ -16,13 +16,12 @@ esphome:
       - select.set:
           id: same_adc_input
           option: "LINE1"
-      # --- ES8388 input PGA gain (ADCControl1 = reg 0x09) ---
-      #   0x88=+24dB (over-drove line-in) | 0x66=+18dB (current) | 0x44=+12dB
+      # ES8388 input PGA gain: 0x88=+24dB | 0x66=+18dB (current) | 0x44=+12dB
       - delay: 200ms
       - lambda: |-
           std::vector<uint8_t> buf;
           buf.push_back(0x09);
-          buf.push_back(0x66);                       // +18 dB L & R
+          buf.push_back(0x66);
           id(bus_a).write(0x10, buf.data(), buf.size());
           uint8_t reg = 0x09;
           uint8_t readback = 0;
@@ -45,19 +44,21 @@ psram:
 logger:
   level: DEBUG                          # DEBUG for testing; raise to INFO in production
 
-# Time source is needed for the "Last Alert" timestamp sensor to show wall-clock time.
+# Local time comes from Home Assistant (inherits HA's configured timezone).
 time:
   - platform: homeassistant
     id: ha_time
+    on_time_sync:
+      then:
+        # If an alert was decoded before time synced, its timestamp may be blank;
+        # nothing else needed here - decodes after sync stamp correctly.
+        - lambda: 'ESP_LOGI("same", "Time synced from Home Assistant.");'
 
 api:
   encryption:
     key: !secret noaa_same_decoder__encryption_key
-  reboot_timeout: 30min                 # explicit, non-zero: no silent reboot-cycling
-  max_send_queue: 20                    # above ESP32 default (8) for stall tolerance
-  # Keep the decoder's api_connected_ flag in sync with the REAL connection state.
-  # The triggers catch transitions; the interval below catches the boot case and
-  # any missed edge.
+  reboot_timeout: 30min
+  max_send_queue: 20
   on_client_connected:
     - lambda: 'id(same_dec).set_api_connected(true);'
   on_client_disconnected:
@@ -133,11 +134,8 @@ button:
     id: same_restart
     icon: "mdi:restart"
 
-# --- Periodic API-state sync (fixes the false "offline" buffering) ---
-# Drives the decoder's api_connected_ flag from the REAL api.connected condition
-# every 2s. NOTE: per ESPHome docs, api.connected counts ANY client - including
-# a remote log viewer - so while you're watching logs it reads "connected" even
-# if HA specifically dropped. For guaranteed delivery to HA that's acceptable.
+# Periodic API-state sync (fixes false "offline" buffering). api.connected counts
+# ANY client incl. a remote log viewer - acceptable for guaranteed HA delivery.
 interval:
   - interval: 2s
     then:
@@ -149,7 +147,6 @@ interval:
           else:
             - lambda: 'id(same_dec).set_api_connected(false);'
 
-# On-board LED - read-only "Decode In Progress" indicator (LED4 = GPIO22, active-LOW)
 output:
   - platform: gpio
     id: led_decode_output
@@ -210,7 +207,6 @@ sensor:
     entity_category: diagnostic
     disabled_by_default: true
 
-  # CPU frequency as a PERCENTAGE of the 240 MHz max.
   - platform: debug
     cpu_frequency:
       name: "CPU Usage"
@@ -221,8 +217,7 @@ sensor:
       entity_category: diagnostic
       disabled_by_default: true
       filters:
-        - lambda: 'return x / 240000000.0 * 100.0;'   # Hz -> % of 240 MHz
-    # Free heap as a PERCENTAGE of total internal heap.
+        - lambda: 'return x / 240000000.0 * 100.0;'
     free:
       name: "Memory Free"
       id: mem_free_pct
@@ -233,7 +228,6 @@ sensor:
       disabled_by_default: true
       filters:
         - lambda: |-
-            // x is free bytes. Convert to % of total internal heap.
             float total = (float) heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
             if (total <= 0) return 0.0;
             return x / total * 100.0;
@@ -243,15 +237,11 @@ text_sensor:
     id: same_last_raw
     name: "SAME Last Raw Header"
 
-  # Last-Alert Timestamp (diagnostic, ENABLED by default). Updates on EVERY
-  # decode - including weekly tests - so during quiet weather you can confirm
-  # the receive chain is alive. Formatted local time from the HA time source.
   - platform: template
     id: same_last_alert_time
     name: "SAME Last Alert Time"
     device_class: timestamp
     entity_category: diagnostic
-    # value is published from the on_alert automation below
 
 same_decoder:
   id: same_dec
@@ -270,15 +260,17 @@ same_decoder:
     then:
       - output.turn_off: led_decode_output
       - lambda: 'id(decode_in_progress).publish_state(false);'
-      # Stamp the last-alert time (ISO-8601, device_class timestamp).
+      # Stamp last-alert time on every emitted alert (incl. reissued corrections).
+      # ha_time.now() is LOCAL (HA's zone); %z emits the real offset so HA and DST
+      # are handled automatically. If time isn't synced yet, log instead.
       - lambda: |-
           auto t = id(ha_time).now();
           if (t.is_valid()) {
-            char buf[32];
-            // ISO-8601 with 'Z'; HA renders it in the user's local zone.
-            snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
-                     t.year, t.month, t.day_of_month, t.hour, t.minute, t.second);
+            char buf[40];
+            t.strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z");
             id(same_last_alert_time).publish_state(buf);
+          } else {
+            ESP_LOGW("same", "Alert decoded but time not synced yet; timestamp not published.");
           }
       - homeassistant.event:
           event: esphome.same_alert
