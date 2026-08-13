@@ -231,8 +231,17 @@ text_sensor:
     entity_category: diagnostic
 
 same_decoder:
-  id: same_dec
-  gain: 256.0                    # matches the lowered slider default
+  id: same
+  sample_rate: 48000
+  gain: 8.0                    # base gain before AGC
+  freq_offset_hz: 0.0          # fine-tune if radio is slightly off
+  agc_enable: true
+  agc_target: 8000
+  agc_min_gain: 0.25
+  agc_max_gain: 32.0
+  timeout_ms: 3000             # multi-burst timeout
+  single_burst_min_ms: 7000    # lone-burst wait
+  post_emit_dead_ms: 1500      # force re-acquisition after emit
   sample_rate: 48000
   decode_count_sensor: same_decode_count
   last_raw_sensor: same_last_raw
