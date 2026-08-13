@@ -75,6 +75,7 @@ class SAMEDecoder : public Component {
  protected:
   void feed_sample_(int16_t s);
   void emit_bit_(bool bit);
+  void rearm_sync_();
   void reset_capture_();
   void begin_new_capture_(bool fallback);
   void vote_and_emit_(bool from_timeout, bool fallback_synced);
