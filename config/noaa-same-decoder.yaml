@@ -44,14 +44,11 @@ psram:
 logger:
   level: DEBUG                          # DEBUG for testing; raise to INFO in production
 
-# Local time comes from Home Assistant (inherits HA's configured timezone).
 time:
   - platform: homeassistant
     id: ha_time
     on_time_sync:
       then:
-        # If an alert was decoded before time synced, its timestamp may be blank;
-        # nothing else needed here - decodes after sync stamp correctly.
         - lambda: 'ESP_LOGI("same", "Time synced from Home Assistant.");'
 
 api:
@@ -134,8 +131,6 @@ button:
     id: same_restart
     icon: "mdi:restart"
 
-# Periodic API-state sync (fixes false "offline" buffering). api.connected counts
-# ANY client incl. a remote log viewer - acceptable for guaranteed HA delivery.
 interval:
   - interval: 2s
     then:
@@ -207,17 +202,8 @@ sensor:
     entity_category: diagnostic
     disabled_by_default: true
 
+  # CPU sensor removed (read a fixed 240 MHz -> meaningless 100%). RAM % kept.
   - platform: debug
-    cpu_frequency:
-      name: "CPU Usage"
-      id: cpu_pct
-      unit_of_measurement: "%"
-      accuracy_decimals: 0
-      icon: "mdi:cpu-32-bit"
-      entity_category: diagnostic
-      disabled_by_default: true
-      filters:
-        - lambda: 'return x / 240000000.0 * 100.0;'
     free:
       name: "Memory Free"
       id: mem_free_pct
@@ -260,9 +246,6 @@ same_decoder:
     then:
       - output.turn_off: led_decode_output
       - lambda: 'id(decode_in_progress).publish_state(false);'
-      # Stamp last-alert time on every emitted alert (incl. reissued corrections).
-      # ha_time.now() is LOCAL (HA's zone); %z emits the real offset so HA and DST
-      # are handled automatically. If time isn't synced yet, log instead.
       - lambda: |-
           auto t = id(ha_time).now();
           if (t.is_valid()) {
