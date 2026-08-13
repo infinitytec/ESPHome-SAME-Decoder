@@ -138,11 +138,44 @@ button:
     id: same_restart
     icon: "mdi:restart"
 
+# -----------------------------------------------------------------------------
+#  On-board LED outputs (AI-Thinker ESP32-A1S Audio Kit).
+#  Board LED map (per user's board notes):
+#    LED1 = battery charge   (hardware, NOT GPIO-controllable)
+#    LED2 = battery standby  (hardware, NOT GPIO-controllable)
+#    LED3 = 3V3 power        (hardware, always on when powered - cannot be
+#                             turned off in software; this is the "always-on"
+#                             LED you saw at power-up)
+#    LED4 = GPIO22           (GPIO-controllable)  <-- used here
+#    LED5 = GPIO19           (GPIO-controllable, but SHARED with Key 3)
+#
+#  These LEDs are active-LOW on this board, so `inverted: true`.
+#  We drive LED4 (GPIO22) as the "decode-in-progress" indicator. GPIO22 is
+#  preferred over GPIO19 because GPIO19 is shared with Key 3 and would conflict
+#  if that key is ever enabled.
+# -----------------------------------------------------------------------------
+output:
+  - platform: gpio
+    id: led_decode_output
+    pin:
+      number: GPIO22
+      inverted: true                   # active-LOW LED on this board
+
+light:
+  - platform: binary
+    id: decode_light
+    name: "SAME Decode In Progress"
+    output: led_decode_output
+    icon: "mdi:access-point"
+    restore_mode: ALWAYS_OFF           # off at boot; turns on when a signal (ZCZC) is detected
+
 # Runtime-adjustable controls (sliders).
 #  - SAME Software Gain: multiplies incoming PCM before the demod. Persists.
 #  - SAME Burst Timeout: if 1-2 header bursts are collected but the 3rd never
-#    arrives within this many seconds, emit what we have and reset (diagnostic,
-#    disabled by default).
+#    arrives within this many seconds, emit what we have and reset. Now enabled
+#    by default and defaulted to 3s so a missed/clipped burst on a live radio
+#    feed is flushed promptly (the C++ early-emit handles the file case where
+#    audio ends before the timeout could fire).
 #
 #  NOTE: template numbers use `optimistic: true` (+ restore_value/initial_value)
 #  and therefore CANNOT also define a `lambda:` value-reader (ESPHome forbids
@@ -161,7 +194,7 @@ number:
     mode: slider
     optimistic: true
     restore_value: true
-    initial_value: 128
+    initial_value: 192                 # raised default for low-level line-in captures
     set_action:
       - lambda: 'id(same_dec).set_gain(x);'
 
@@ -176,9 +209,8 @@ number:
     mode: slider
     optimistic: true
     restore_value: true
-    initial_value: 5
+    initial_value: 3                   # shortened backstop for live feeds (was 5)
     entity_category: config
-    disabled_by_default: true
     set_action:
       - lambda: 'id(same_dec).set_timeout_ms((uint32_t) (x * 1000.0f));'
 
@@ -226,15 +258,29 @@ text_sensor:
 #  event name + default severity per 3-letter SAME code.
 #    REAL    = present in the SAME header
 #    DERIVED = computed (code table, purge->timestamp, hash)
+#
+#  on_sync fires the moment a ZCZC preamble is acquired (signal detected /
+#  decode-in-progress). We use it to light LED4 (GPIO22). The light auto-turns
+#  off after 8s, and on_alert also turns it off as a backstop once a decode
+#  completes.
 # -----------------------------------------------------------------------------
 same_decoder:
   id: same_dec
-  gain: 128.0
+  gain: 192.0
   sample_rate: 48000
   decode_count_sensor: same_decode_count
   last_raw_sensor: same_last_raw
+  on_sync:
+    then:
+      # Signal detected: turn the decode-in-progress LED on, then auto-off after
+      # 8s in case no full decode completes (e.g. a clipped/failed burst).
+      - light.turn_on: decode_light
+      - delay: 8s
+      - light.turn_off: decode_light
   on_alert:
     then:
+      # Backstop: a full decode finished, clear the decode-in-progress LED.
+      - light.turn_off: decode_light
       - homeassistant.event:
           event: esphome.same_alert
           data:
