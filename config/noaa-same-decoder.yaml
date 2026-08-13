@@ -16,18 +16,20 @@ esphome:
       - select.set:
           id: same_adc_input
           option: "LINE1"
-      # ES8388 input PGA gain: 0x88=+24dB | 0x66=+18dB (current) | 0x44=+12dB
+      # ES8388 input PGA gain (ADCControl1 = reg 0x09):
+      #   0x88=+24dB (over-drove line-in) | 0x77=+21dB (current) | 0x66=+18dB | 0x44=+12dB
+      # Raised to +21 dB per testing: more analog gain, less software gain = cleaner.
       - delay: 200ms
       - lambda: |-
           std::vector<uint8_t> buf;
           buf.push_back(0x09);
-          buf.push_back(0x66);
+          buf.push_back(0x77);                       // +21 dB L & R
           id(bus_a).write(0x10, buf.data(), buf.size());
           uint8_t reg = 0x09;
           uint8_t readback = 0;
           id(bus_a).write(0x10, &reg, 1, false);
           id(bus_a).read(0x10, &readback, 1);
-          ESP_LOGI("es8388", "ADCControl1 wrote 0x66, readback=0x%02X", readback);
+          ESP_LOGI("es8388", "ADCControl1 wrote 0x77, readback=0x%02X", readback);
       - microphone.capture: same_mic
 
 esp32:
@@ -166,7 +168,7 @@ number:
     mode: slider
     optimistic: true
     restore_value: true
-    initial_value: 128
+    initial_value: 256          # lowered: analog PGA now carries more of the gain
     set_action:
       - lambda: 'id(same_dec).set_gain(x);'
 
@@ -202,7 +204,6 @@ sensor:
     entity_category: diagnostic
     disabled_by_default: true
 
-  # CPU sensor removed (read a fixed 240 MHz -> meaningless 100%). RAM % kept.
   - platform: debug
     free:
       name: "Memory Free"
@@ -231,7 +232,7 @@ text_sensor:
 
 same_decoder:
   id: same_dec
-  gain: 128.0
+  gain: 256.0                    # matches the lowered slider default
   sample_rate: 48000
   decode_count_sensor: same_decode_count
   last_raw_sensor: same_last_raw
