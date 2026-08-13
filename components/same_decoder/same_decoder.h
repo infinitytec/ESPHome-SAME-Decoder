@@ -22,6 +22,7 @@ struct SameAlert {
   std::string originator;
   std::string status;
   std::string areas_csv;
+  std::string timing;        // valid-time + issue-time tail, e.g. "+0030-2780415"
   std::string onset_iso;
   std::string expires_iso;
   std::string sender;
@@ -82,6 +83,7 @@ class SAMEDecoder : public Component {
   bool parse_header_(const std::string &header, SameAlert &out);
   bool header_is_strictly_valid_(const std::string &header);
   bool same_message_as_current_(const std::string &new_burst);
+  bool fuzzy_equal_(const std::string &a, const std::string &b);
   std::string describe_(const std::string &code);
   std::string severity_for_(const std::string &code);
   bool is_known_code_(const std::string &code);
@@ -117,21 +119,8 @@ class SAMEDecoder : public Component {
   std::vector<SameAlert> pending_;
 
   // ---- Dedup: SESSION-based (not wall-clock window) ----
-  // Within ONE capture session (the up-to-3 bursts of a single message), the
-  // early 2-burst emit and the 3-burst re-vote dedup against each other by
-  // header: identical -> suppress, different -> reissue a correction. A NEW
-  // capture session (a fresh ZCZC/ZC- that does NOT match the in-progress
-  // message) CLEARS the per-session dedup, so any new message ALWAYS fires -
-  // even one that looks identical to a prior message.
-  //   session_emitted_header_ : the header this session has already emitted
-  //                             ("" = nothing emitted yet this session).
-  // A tiny cross-session guard still swallows an OBVIOUS immediate duplicate:
-  // if a brand-new session emits the EXACT same header as the immediately
-  // previous emit within IMMEDIATE_DUP_MS (~one burst spacing), it is treated
-  // as the same message spilling over and suppressed. Beyond that window, it
-  // fires. This honors "unless clearly the same message and immediately there".
-  std::string session_emitted_header_;              // emitted within current session
-  std::string last_global_header_;                  // last header emitted (any session)
+  std::string session_emitted_header_;
+  std::string last_global_header_;
   uint32_t    last_global_ms_{0};
   static constexpr uint32_t IMMEDIATE_DUP_MS = 3000;   // tight same-message spill guard
 
@@ -198,10 +187,9 @@ class SAMEDecoder : public Component {
   bool bursts_agree_(int count);
   bool early_emitted_{false};
 
-  // How many leading chars of a forming burst to compare when deciding whether
-  // a new ZCZC belongs to the SAME message (burst 2/3) or is a NEW message.
-  // The ORG-EEE-PSSCCC prefix diverges quickly between different messages.
-  static constexpr size_t SAME_MSG_PREFIX_CMP = 12;
+  // Fuzzy tolerance (fraction of differing chars) used only for ORG/EEE when
+  // deciding same-vs-new message. Area and timing are compared EXACTLY.
+  static constexpr float FIELD_FUZZ = 0.20f;
 
   // ---- Header termination (structure-driven) ----
   bool  plus_seen_{false};
