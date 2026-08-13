@@ -104,11 +104,12 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "  Software gain: %.1f", this->gain_);
   ESP_LOGCONFIG(TAG, "  Soft-clip knee: %.0f (rail %.0f)", SOFT_KNEE, SAMPLE_MAX);
   ESP_LOGCONFIG(TAG, "  Timing loop: Kp=%.3f Ki=%.4f delta=%d conf_min=%.2f", TR_KP, TR_KI, TR_DELTA, TR_CONF_MIN);
-  ESP_LOGCONFIG(TAG, "  Sync: ZCZC fuzzy Hamming <= %d; fallback ZC- exact (Hamming 0)", SYNC_MAX_HAMMING);
+  ESP_LOGCONFIG(TAG, "  Acquisition tiers: 1)ZCZC fuzzy H<=%d + misreads  2)ZC- 24b", SYNC_MAX_HAMMING);
+  ESP_LOGCONFIG(TAG, "                     3)CZC/ZCZ 24b  4)ZC 16b (idle-edge guarded)");
   ESP_LOGCONFIG(TAG, "  Collect all 3 bursts; early-emit at %d agreeing", MIN_BURSTS_TO_EMIT);
   ESP_LOGCONFIG(TAG, "  Same-message match: ORG/EEE fuzzy, area+timing EXACT");
   ESP_LOGCONFIG(TAG, "  Dedup: session-based; immediate-dup guard %" PRIu32 " ms", IMMEDIATE_DUP_MS);
-  ESP_LOGCONFIG(TAG, "  Re-arm sync cleanly after each burst (catch tight repeats).");
+  ESP_LOGCONFIG(TAG, "  Re-arm sync after each burst; front canonicalized to 'ZCZC-'.");
   ESP_LOGCONFIG(TAG, "  Idle re-prime: feed-gap %" PRIu32 " ms + energy rising edge.", FEED_GAP_MS);
   ESP_LOGCONFIG(TAG, "  Weak-evidence gate: structural only (UNKNOWN codes fire).");
   ESP_LOGCONFIG(TAG, "  Single-burst emit: structurally valid only, after >= %" PRIu32 " ms", SINGLE_BURST_MIN_MS);
@@ -117,9 +118,6 @@ void SAMEDecoder::dump_config() {
                 (unsigned) this->alert_triggers_.size(), (unsigned) this->sync_triggers_.size());
 }
 
-// Re-prime the whole detector to a clean, cold-start state. Called at an
-// idle->active transition so the FIRST real message after idle decodes without
-// needing a burst or two to warm up the timing loop.
 void SAMEDecoder::reprime_detector_() {
   ESP_LOGD(TAG, "Idle->active: re-priming detector.");
   this->reset_capture_();
@@ -131,12 +129,13 @@ void SAMEDecoder::reprime_detector_() {
 }
 
 void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
-  // ---- Idle-recovery: feed-gap detection (wall clock) ----
   uint32_t now = millis();
   uint32_t prev = this->last_feed_ms_.exchange(now, std::memory_order_relaxed);
   if (prev != 0 && (uint32_t) (now - prev) >= FEED_GAP_MS) {
-    // The audio feed paused and resumed -> cold detector. Re-prime.
     this->reprime_detector_();
+    // A feed gap also implies a message may be starting: open the idle-edge
+    // window so Tier-4 bare-ZC acquisition is permitted briefly.
+    this->idle_edge_samples_ = IDLE_EDGE_SAMPLES;
   }
 
   const size_t n = data.size() / 2;
@@ -157,23 +156,20 @@ static inline uint32_t effective_timeout(int burst_idx, uint32_t slider_ms, uint
 }
 
 void SAMEDecoder::feed_sample_(int16_t s) {
-  // ---- Idle-recovery: energy rising-edge detection ----
-  // Track a slow envelope of the RAW input magnitude (pre-gain-ish; s is post-
-  // gain but the ratio test is scale-tolerant). If we were idle (envelope below
-  // the silence floor) and the instantaneous magnitude jumps well above it, a
-  // message is starting after quiet -> re-prime at the rising edge.
   float mag = std::fabs((float) s);
   this->env_slow_ += ENV_ALPHA * (mag - this->env_slow_);
   if (this->was_idle_) {
     if (mag > ENV_SILENCE * ENV_RISE_MULT) {
       this->was_idle_ = false;
       this->reprime_detector_();
-      // fall through and process this sample from the clean state
+      // Silence->signal edge: open the Tier-4 idle-edge window.
+      this->idle_edge_samples_ = IDLE_EDGE_SAMPLES;
     }
   } else {
     if (this->env_slow_ < ENV_SILENCE)
       this->was_idle_ = true;
   }
+  if (this->idle_edge_samples_ > 0) this->idle_edge_samples_--;
 
   this->ring_[this->ring_pos_] = s;
   this->ring_pos_ = (this->ring_pos_ + 1) % RINGLEN;
@@ -264,9 +260,22 @@ void SAMEDecoder::reset_capture_() {
   for (int i = 0; i < 3; i++) this->bursts_[i].clear();
 }
 
-void SAMEDecoder::begin_new_capture_(bool fallback) {
+// Seed the current burst with the correct leading characters for whichever
+// acquisition tier fired. preamble_len is how many of the 'ZCZC' chars we can
+// account for from the sync pattern:
+//   4 -> "ZCZC"        (Tier 1 / misread)
+//   3 -> "ZCZ"         (Tier 3)
+//   2 -> "ZC"          (Tier 4)
+// We always seed at least "ZC"; canonicalize_front_() guarantees the final
+// voted header begins "ZCZC-" regardless. fallback (ZC- tier) also appends '-'.
+void SAMEDecoder::begin_new_capture_(int preamble_len, bool fallback) {
   this->phase_state_ = CAPTURE;
-  this->cur_burst_ = "ZCZC";
+  if (preamble_len >= 4)
+    this->cur_burst_ = "ZCZC";
+  else if (preamble_len == 3)
+    this->cur_burst_ = "ZCZ";
+  else
+    this->cur_burst_ = "ZC";
   this->cur_byte_ = 0;
   this->cur_nbits_ = 0;
   this->plus_seen_ = false;
@@ -367,29 +376,59 @@ void SAMEDecoder::finish_burst_() {
   this->rearm_sync_();
 }
 
+// Tiered acquisition. IMPORTANT: all tiers only run in HUNT_SYNC. Once we are in
+// CAPTURE (a burst is being decoded), a 'ZC'/'ZCZC' in the data stream is just
+// burst content and NEVER re-triggers sync - so an in-progress signal is never
+// interrupted, exactly as required.
 void SAMEDecoder::emit_bit_(bool bit) {
   if (this->phase_state_ == HUNT_SYNC) {
     this->sync_shift_ = (this->sync_shift_ >> 1) | ((uint32_t) (bit ? 1u : 0u) << 31);
 
+    // Tier 1: full ZCZC, fuzzy Hamming <= 1.
     uint32_t diffbits = this->sync_shift_ ^ SYNC_ZCZC;
     int hamming = __builtin_popcount(diffbits);
-    bool primary = (hamming <= SYNC_MAX_HAMMING);
+    bool t1 = (hamming <= SYNC_MAX_HAMMING);
 
-    bool fallback = false;
-    if (!primary) {
-      fallback = ((this->sync_shift_ & MASK24) == SYNC_ZC_DASH_24);
+    // Tier 1b: structural misreads of ZCZC that keep the Z_C_ skeleton but
+    // exceed Hamming 1 (e.g. two-bit damage on a single character). We accept a
+    // slightly wider Hamming (<=3) ONLY when the two 'C' nibble anchors are
+    // intact, which keeps false accepts low.
+    bool t1b = false;
+    if (!t1) {
+      // bytes: b0=first Z, b1=first C, b2=second Z, b3=second C (low->high)
+      uint8_t b1 = (uint8_t) ((this->sync_shift_ >> 8) & 0xFF);
+      uint8_t b3 = (uint8_t) ((this->sync_shift_ >> 24) & 0xFF);
+      if (b1 == (uint8_t) 'C' && b3 == (uint8_t) 'C' && hamming <= 3)
+        t1b = true;
     }
 
-    if (primary || fallback) {
-      bool fb = fallback && !primary;
+    // Tier 2: ZC- (24-bit exact).
+    bool t2 = ((this->sync_shift_ & MASK24) == SYNC_ZC_DASH_24);
+
+    // Tier 3: CZC / ZCZ (24-bit exact) boundary-clip variants.
+    bool t3 = ((this->sync_shift_ & MASK24) == SYNC_CZC_24) ||
+              ((this->sync_shift_ & MASK24) == SYNC_ZCZ_24);
+
+    // Tier 4: bare ZC (16-bit exact) - ONLY within the idle-edge window.
+    bool t4 = (this->idle_edge_samples_ > 0) &&
+              ((this->sync_shift_ & MASK16) == SYNC_ZC_16);
+
+    if (t1 || t1b || t2 || t3 || t4) {
+      int preamble_len;
+      bool fb = false;
+      const char *tier;
+      if (t1 || t1b) { preamble_len = 4; tier = t1 ? "ZCZC" : "ZCZC(misread)"; }
+      else if (t2)   { preamble_len = 2; fb = true; tier = "ZC- fallback"; }
+      else if (t3)   { preamble_len = 3; tier = "CZC/ZCZ clip"; }
+      else           { preamble_len = 2; tier = "ZC idle-edge"; }
+
       if (this->burst_idx_ == 0)
-        this->fallback_sync_used_ = fb;
-      ESP_LOGD(TAG, "%s sync found%s. Byte-aligned capture starting.",
-               fb ? "Fallback ZC-" : "ZCZC",
-               fb ? " (first ZC assumed lost)" : "");
+        this->fallback_sync_used_ = fb || t3 || t4;   // weaker tiers => treat as weak evidence
+
+      ESP_LOGD(TAG, "Sync acquired via %s. Byte-aligned capture starting.", tier);
       uint32_t p = this->sync_pending_.load(std::memory_order_relaxed);
       if (p < 8) this->sync_pending_.store(p + 1, std::memory_order_release);
-      this->begin_new_capture_(fb);
+      this->begin_new_capture_(preamble_len, fb);
     }
     return;
   }
@@ -448,6 +487,30 @@ bool SAMEDecoder::header_is_strictly_valid_(const std::string &header) {
   return true;
 }
 
+// Canonicalize the front of a voted header so it ALWAYS begins with "ZCZC-".
+// Weaker acquisition tiers may have seeded "ZC", "ZCZ", or "ZC-" as the front,
+// or dropped a boundary char. We locate the real body (originator field onward)
+// and rebuild a clean "ZCZC-<rest>".
+std::string SAMEDecoder::canonicalize_front_(const std::string &voted) {
+  // If it already starts with a full ZCZC-, keep as-is.
+  if (voted.rfind("ZCZC-", 0) == 0)
+    return voted;
+
+  // Find the body start: the first '-' in the string. The preamble (ZCZC or a
+  // clipped variant) is always before the first '-'; the originator field
+  // starts right after it.
+  size_t dash = voted.find('-');
+  if (dash == std::string::npos) {
+    // No dash at all - can't locate body; best effort: strip any leading
+    // Z/C run and prepend the canonical preamble.
+    size_t i = 0;
+    while (i < voted.size() && (voted[i] == 'Z' || voted[i] == 'C')) i++;
+    return std::string("ZCZC-") + voted.substr(i);
+  }
+  std::string body = voted.substr(dash + 1);   // everything after the preamble's dash
+  return std::string("ZCZC-") + body;
+}
+
 void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
   size_t maxlen = 0;
   for (int i = 0; i < 3; i++) maxlen = std::max(maxlen, this->bursts_[i].size());
@@ -465,13 +528,15 @@ void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
     if (best) voted += best;
   }
 
-  ESP_LOGD(TAG, "Voted header: '%s'", sanitize_ascii(voted).c_str());
-  size_t z = voted.find("ZCZC");
-  if (z == std::string::npos) {
-    ESP_LOGW(TAG, "Voted header missing ZCZC; discarding.");
+  // Front-canonicalize so the compiled header always begins "ZCZC-".
+  std::string header = this->canonicalize_front_(voted);
+  ESP_LOGD(TAG, "Voted header: '%s' -> canonical '%s'",
+           sanitize_ascii(voted).c_str(), sanitize_ascii(header).c_str());
+
+  if (header.rfind("ZCZC", 0) != 0) {
+    ESP_LOGW(TAG, "Canonical header missing ZCZC; discarding.");
     return;
   }
-  std::string header = voted.substr(z);
 
   int collected = 0;
   for (int i = 0; i < 3; i++) if (!this->bursts_[i].empty()) collected++;
