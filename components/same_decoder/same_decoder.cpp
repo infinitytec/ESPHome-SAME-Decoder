@@ -103,7 +103,7 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "  Collect all 3 bursts; early-emit at %d agreeing", MIN_BURSTS_TO_EMIT);
   ESP_LOGCONFIG(TAG, "  Same-message match: ORG/EEE fuzzy, area+timing EXACT");
   ESP_LOGCONFIG(TAG, "  Dedup: session-based; immediate-dup guard %" PRIu32 " ms", IMMEDIATE_DUP_MS);
-  ESP_LOGCONFIG(TAG, "  New differing ZCZC preempts stale collection.");
+  ESP_LOGCONFIG(TAG, "  Re-arm sync cleanly after each burst (catch tight repeats).");
   ESP_LOGCONFIG(TAG, "  Single-burst emit: strictly valid only, after >= %" PRIu32 " ms", SINGLE_BURST_MIN_MS);
   ESP_LOGCONFIG(TAG, "  Burst timeout (>=2 bursts): %" PRIu32 " ms", this->timeout_ms_.load(std::memory_order_relaxed));
   ESP_LOGCONFIG(TAG, "  Alert triggers: %u, sync triggers: %u",
@@ -196,15 +196,26 @@ void SAMEDecoder::feed_sample_(int16_t s) {
   }
 }
 
-void SAMEDecoder::reset_capture_() {
+// Re-arm the sync hunter to a CLEAN state so a tightly-spaced repeat burst
+// (~1 s after the previous one) is reliably re-acquired. This clears the byte
+// assembler AND neutralizes the timing-recovery bias (w_off_) and phase that the
+// just-finished burst left locked - stale lock was causing the 2nd/3rd repeats
+// to be missed (every message decoded on burst 0 only, then timed out).
+void SAMEDecoder::rearm_sync_() {
   this->phase_state_ = HUNT_SYNC;
   this->sync_shift_ = 0;
   this->cur_byte_ = 0;
   this->cur_nbits_ = 0;
   this->cur_burst_.clear();
-  this->burst_idx_ = 0;
   this->plus_seen_ = false;
   this->tail_count_ = 0;
+  this->w_off_ = 0.0f;
+  this->phase_ = 0.0f;
+}
+
+void SAMEDecoder::reset_capture_() {
+  this->rearm_sync_();
+  this->burst_idx_ = 0;
   this->last_burst_ms_ = 0;
   this->early_emitted_ = false;
   this->fallback_sync_used_ = false;
@@ -238,8 +249,6 @@ bool SAMEDecoder::bursts_agree_(int count) {
   return frac <= BURST_MAX_MISMATCH;
 }
 
-// Fuzzy string equality: true if the fraction of differing chars is within
-// FIELD_FUZZ (length mismatch counts as differences). Used for ORG/EEE only.
 bool SAMEDecoder::fuzzy_equal_(const std::string &a, const std::string &b) {
   size_t overlap = std::min(a.size(), b.size());
   size_t longer = std::max(a.size(), b.size());
@@ -251,34 +260,23 @@ bool SAMEDecoder::fuzzy_equal_(const std::string &a, const std::string &b) {
   return ((float) diff / (float) longer) <= FIELD_FUZZ;
 }
 
-// Decide whether a newly-formed burst belongs to the SAME message currently
-// being collected (burst 2/3) or is a NEW message. We PARSE both headers and
-// compare fields: ORG and EEE fuzzy (a bit-error shouldn't split a real same-
-// message burst), but AREA and TIMING must match EXACTLY - a different county
-// list or a different valid-time genuinely IS a different alert.
-// If the new burst is too short to parse fully, fall back to comparing whatever
-// fields exist (at least ORG/EEE); "can't tell yet" -> treat as continuation so
-// we never prematurely split a real same-message burst.
 bool SAMEDecoder::same_message_as_current_(const std::string &new_burst) {
-  if (this->burst_idx_ == 0) return true;   // no reference yet
+  if (this->burst_idx_ == 0) return true;
   const std::string &ref = this->bursts_[0];
 
   SameAlert ra, rb;
   bool pa = this->parse_header_(ref, ra);
   bool pb = this->parse_header_(new_burst, rb);
 
-  // If either can't be parsed to fields yet, fall back to a lenient prefix
-  // compare (ORG-EEE region). Treat inconclusive as "same" to avoid splitting.
   if (!pa || !pb) {
     size_t cmp = std::min({(size_t) 12, ref.size(), new_burst.size()});
-    if (cmp < 8) return true;   // too little to judge -> continuation
+    if (cmp < 8) return true;
     size_t diff = 0;
     for (size_t i = 0; i < cmp; i++)
       if (ref[i] != new_burst[i]) diff++;
     return ((float) diff / (float) cmp) <= FIELD_FUZZ;
   }
 
-  // ORG and EEE: fuzzy. AREA and TIMING: exact.
   if (!this->fuzzy_equal_(ra.originator, rb.originator)) return false;
   if (!this->fuzzy_equal_(ra.event_code, rb.event_code)) return false;
   if (ra.areas_csv != rb.areas_csv) return false;
@@ -298,30 +296,19 @@ void SAMEDecoder::finish_burst_() {
 
   std::string this_burst = this->cur_burst_;
 
-  // New message arrived mid-collection: finalize old session, restart fresh.
   if (this->burst_idx_ >= 1 && !this->same_message_as_current_(this_burst)) {
     ESP_LOGD(TAG, "New differing burst mid-collection: finalizing old session, starting new.");
     this->reset_capture_();
     this->bursts_[0] = this_burst;
     this->burst_idx_ = 1;
-    this->cur_burst_.clear();
-    this->plus_seen_ = false;
-    this->tail_count_ = 0;
     this->last_burst_ms_ = millis();
-    this->phase_state_ = HUNT_SYNC;
-    this->sync_shift_ = 0;
-    this->cur_byte_ = 0;
-    this->cur_nbits_ = 0;
+    this->rearm_sync_();
     return;
   }
 
-  // Same message (or first burst): normal collection.
   if (this->burst_idx_ < 3)
     this->bursts_[this->burst_idx_] = this_burst;
   this->burst_idx_++;
-  this->cur_burst_.clear();
-  this->plus_seen_ = false;
-  this->tail_count_ = 0;
   this->last_burst_ms_ = millis();
 
   if (this->burst_idx_ >= 3) {
@@ -336,10 +323,8 @@ void SAMEDecoder::finish_burst_() {
     this->early_emitted_ = true;
   }
 
-  this->phase_state_ = HUNT_SYNC;
-  this->sync_shift_ = 0;
-  this->cur_byte_ = 0;
-  this->cur_nbits_ = 0;
+  // Re-arm cleanly for the NEXT tightly-spaced repeat burst.
+  this->rearm_sync_();
 }
 
 void SAMEDecoder::emit_bit_(bool bit) {
@@ -384,12 +369,7 @@ void SAMEDecoder::emit_bit_(bool bit) {
     if (this->cur_burst_.size() >= 4) {
       this->finish_burst_();
     } else {
-      this->phase_state_ = HUNT_SYNC;
-      this->sync_shift_ = 0;
-      this->cur_byte_ = 0;
-      this->cur_nbits_ = 0;
-      this->plus_seen_ = false;
-      this->tail_count_ = 0;
+      this->rearm_sync_();
     }
     return;
   }
@@ -545,8 +525,6 @@ bool SAMEDecoder::parse_header_(const std::string &header, SameAlert &out) {
   out.event_name = this->describe_(out.event_code);
   out.severity   = this->severity_for_(out.event_code);
 
-  // Areas: parts from index 3 up to (and including) the block containing '+'.
-  // The '+' marks the end of the area list and the start of the valid-time.
   std::string areas;
   std::string timing;
   for (size_t i = 3; i < parts.size(); i++) {
@@ -557,11 +535,9 @@ bool SAMEDecoder::parse_header_(const std::string &header, SameAlert &out) {
         if (!areas.empty()) areas += ",";
         areas += last_area;
       }
-      // Build the timing tail: "+TTTT" from this block, then the following
-      // block (JJJHHMM issue time) if present. e.g. "+0030-2780415".
-      timing = parts[i].substr(plus);           // "+TTTT"
+      timing = parts[i].substr(plus);
       if (i + 1 < parts.size())
-        timing += "-" + parts[i + 1];           // "-JJJHHMM"
+        timing += "-" + parts[i + 1];
       break;
     }
     if (!areas.empty()) areas += ",";
