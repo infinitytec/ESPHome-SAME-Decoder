@@ -64,8 +64,18 @@ void SAMEDecoder::setup() {
 }
 
 // Runs on the MAIN loop thread. Drain ALL queued alerts (produced by mic_task)
-// and perform all Native API interaction here where it is thread-safe.
+// and perform all Native API interaction here where it is thread-safe. Also
+// drain any pending ZCZC-sync notifications and fire the sync triggers here so
+// their actions (e.g. lighting an LED) run on the main thread.
 void SAMEDecoder::loop() {
+  // Fire sync (decode-in-progress) triggers for each pending ZCZC acquisition.
+  uint32_t pending = this->sync_pending_.exchange(0, std::memory_order_acq_rel);
+  while (pending > 0) {
+    for (auto *t : this->sync_triggers_)
+      t->trigger();
+    pending--;
+  }
+
   uint32_t head = this->q_head_.load(std::memory_order_relaxed);
   while (head != this->q_tail_.load(std::memory_order_acquire)) {
     SameAlert a = this->alert_queue_[head];
@@ -82,10 +92,13 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "  Samples/bit: %.2f, Goertzel window: %d, ring: %d", SAMPLES_PER_BIT, GWIN, RINGLEN);
   ESP_LOGCONFIG(TAG, "  Goertzel coeffs: mark=%.6f space=%.6f", COEFF_MARK, COEFF_SPACE);
   ESP_LOGCONFIG(TAG, "  Timing loop: Kp=%.3f Ki=%.4f delta=%d conf_min=%.2f", TR_KP, TR_KI, TR_DELTA, TR_CONF_MIN);
+  ESP_LOGCONFIG(TAG, "  Sync fuzzy Hamming tolerance: %d bit(s)", SYNC_MAX_HAMMING);
+  ESP_LOGCONFIG(TAG, "  Early-emit: >=%d agreeing bursts (max mismatch %.0f%%)", MIN_BURSTS_TO_EMIT, BURST_MAX_MISMATCH * 100.0f);
   ESP_LOGCONFIG(TAG, "  Header end: dash>=%d, fallback>=%d chars after '+'", TAIL_MIN, TAIL_COMPLETE);
   ESP_LOGCONFIG(TAG, "  Burst timeout: %" PRIu32 " ms", this->timeout_ms_.load(std::memory_order_relaxed));
   ESP_LOGCONFIG(TAG, "  Alert queue depth: %d", ALERT_Q_LEN);
   ESP_LOGCONFIG(TAG, "  Alert triggers: %u", (unsigned) this->alert_triggers_.size());
+  ESP_LOGCONFIG(TAG, "  Sync triggers: %u", (unsigned) this->sync_triggers_.size());
 }
 
 void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
@@ -194,8 +207,29 @@ void SAMEDecoder::reset_capture_() {
   for (int i = 0; i < 3; i++) this->bursts_[i].clear();
 }
 
-// Store the completed burst, log it, and either vote (after 3) or hunt for the
-// next repeat's ZCZC.
+// True if the first `count` collected bursts agree closely enough to emit
+// without waiting for a 3rd. Compares the two most-recent bursts character by
+// character over their overlapping length; if the fraction of differing chars
+// is at or below BURST_MAX_MISMATCH, they "agree". Only meaningful for
+// count >= 2; a single burst never satisfies this.
+bool SAMEDecoder::bursts_agree_(int count) {
+  if (count < 2) return false;
+  const std::string &a = this->bursts_[count - 1];
+  const std::string &b = this->bursts_[count - 2];
+  size_t overlap = std::min(a.size(), b.size());
+  if (overlap == 0) return false;
+  size_t diff = 0;
+  for (size_t i = 0; i < overlap; i++)
+    if (a[i] != b[i]) diff++;
+  // Penalize length mismatch by counting the unmatched tail as differences.
+  size_t longer = std::max(a.size(), b.size());
+  diff += (longer - overlap);
+  float frac = (float) diff / (float) longer;
+  return frac <= BURST_MAX_MISMATCH;
+}
+
+// Store the completed burst, log it, and either vote (after enough agreeing
+// bursts, or after 3) or hunt for the next repeat's ZCZC.
 void SAMEDecoder::finish_burst_() {
   // Hex+ASCII diagnostic of the assembled burst.
   std::string hex;
@@ -217,6 +251,14 @@ void SAMEDecoder::finish_burst_() {
   if (this->burst_idx_ >= 3) {
     this->vote_and_emit_();
     this->reset_capture_();
+  } else if (this->burst_idx_ >= MIN_BURSTS_TO_EMIT && this->bursts_agree_(this->burst_idx_)) {
+    // Early-emit: enough repeats collected and they agree closely, so we do
+    // not need to wait for the (possibly clipped/absent) 3rd burst. This is the
+    // fix for trimmed test files where only 2 bursts ever arrive and the
+    // mic_task timeout cannot fire after the audio ends.
+    ESP_LOGD(TAG, "Early emit: %d agreeing bursts (no need to wait for 3rd).", this->burst_idx_);
+    this->vote_and_emit_();
+    this->reset_capture_();
   } else {
     // Next repeat: hunt for its ZCZC again (robust to gaps between bursts).
     this->phase_state_ = HUNT_SYNC;
@@ -235,9 +277,17 @@ void SAMEDecoder::emit_bit_(bool bit) {
     // 'ZCZC' LSB-first bitstream: Z=0x5A->01011010, C=0x43->11000010 (LSB-first
     // per-byte), concatenated = 01011010 11000010 01011010 11000010.
     // Assembled into a 32-bit word as received (first bit -> LSB after 32 shifts):
-    // We match SYNC_ZCZC computed to equal that received pattern.
-    if (this->sync_shift_ == SYNC_ZCZC) {
-      ESP_LOGD(TAG, "ZCZC sync found. Byte-aligned capture starting.");
+    // We match SYNC_ZCZC computed to equal that received pattern. To tolerate a
+    // marginally-clipped or noisy preamble we accept the window when it is
+    // within SYNC_MAX_HAMMING bits of the ideal pattern (fuzzy match).
+    uint32_t diffbits = this->sync_shift_ ^ SYNC_ZCZC;
+    int hamming = __builtin_popcount(diffbits);
+    if (hamming <= SYNC_MAX_HAMMING) {
+      ESP_LOGD(TAG, "ZCZC sync found (hamming=%d). Byte-aligned capture starting.", hamming);
+      // Notify main loop so the decode-in-progress (sync) triggers fire there.
+      // Saturate at a small ceiling so we never overflow if loop() is slow.
+      uint32_t p = this->sync_pending_.load(std::memory_order_relaxed);
+      if (p < 8) this->sync_pending_.store(p + 1, std::memory_order_release);
       this->phase_state_ = CAPTURE;
       // Seed the burst with the known "ZCZC" we just matched.
       this->cur_burst_ = "ZCZC";
