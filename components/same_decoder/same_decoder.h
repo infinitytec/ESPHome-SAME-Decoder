@@ -60,7 +60,6 @@ class SAMEDecoder : public Component {
 
   void feed_bytes(const std::vector<uint8_t> &data);
 
-  // Diagnostics: ms since the last feed_bytes() call (main-loop readable).
   uint32_t ms_since_last_feed() const;
 
   std::string last_alert_id() const { return this->last_.id; }
@@ -81,7 +80,7 @@ class SAMEDecoder : public Component {
   void rearm_sync_();
   void reprime_detector_();
   void reset_capture_();
-  void begin_new_capture_(bool fallback);
+  void begin_new_capture_(int preamble_len, bool fallback);
   void vote_and_emit_(bool from_timeout, bool fallback_synced);
   void finish_burst_();
 
@@ -89,6 +88,7 @@ class SAMEDecoder : public Component {
   bool header_is_strictly_valid_(const std::string &header);
   bool same_message_as_current_(const std::string &new_burst);
   bool fuzzy_equal_(const std::string &a, const std::string &b);
+  std::string canonicalize_front_(const std::string &voted);
   std::string describe_(const std::string &code);
   std::string severity_for_(const std::string &code);
   bool is_known_code_(const std::string &code);
@@ -130,26 +130,21 @@ class SAMEDecoder : public Component {
   static constexpr uint32_t IMMEDIATE_DUP_MS = 3000;
 
   // ---- Idle-recovery / detector re-priming ----
-  // After the board sits idle, the timing-recovery loop goes "cold" (stale
-  // phase_/w_off_, and the early/late gate has been chewing on near-silence).
-  // The first real message then needs a burst or two to re-converge, so its
-  // ZCZC preamble is missed and only a later repeat locks. We fix this by
-  // RE-PRIMING the detector to a clean state at any idle->active transition,
-  // detected two independent ways (robust to both failure shapes):
-  //   (1) FEED GAP: >FEED_GAP_MS wall-clock since the previous feed_bytes()
-  //       call (handles on_data actually pausing during idle).
-  //   (2) IDLE-ENERGY RISING EDGE: a slow envelope of |sample| sits below a
-  //       silence floor, then rises sharply (handles on_data continuing to
-  //       fire with quiet samples during idle).
-  // A re-prime is harmless if it fires at a quiet moment - it only resets
-  // timing state - so thresholds are deliberately loose.
   std::atomic<uint32_t> last_feed_ms_{0};
-  static constexpr uint32_t FEED_GAP_MS = 250;      // feed pause => re-prime
-  float    env_slow_{0.0f};                          // slow |sample| envelope
-  static constexpr float ENV_ALPHA      = 0.0003f;   // envelope smoothing
-  static constexpr float ENV_SILENCE    = 200.0f;    // "idle" floor (pre-gain units approx)
-  static constexpr float ENV_RISE_MULT  = 4.0f;      // rising-edge multiple over floor
-  bool     was_idle_{true};                          // envelope-idle latch
+  static constexpr uint32_t FEED_GAP_MS = 250;
+  float    env_slow_{0.0f};
+  static constexpr float ENV_ALPHA      = 0.0003f;
+  static constexpr float ENV_SILENCE    = 200.0f;
+  static constexpr float ENV_RISE_MULT  = 4.0f;
+  bool     was_idle_{true};
+
+  // Idle->active edge window: Tier-4 bare-"ZC" acquisition is allowed ONLY for
+  // a short span of samples right after a silence->signal transition (a message
+  // demonstrably beginning), and only in HUNT_SYNC. This prevents a weak 16-bit
+  // trigger from firing mid-stream or during steady noise. Counted down in
+  // feed_sample_ from IDLE_EDGE_SAMPLES at each rising edge.
+  uint32_t idle_edge_samples_{0};
+  static constexpr uint32_t IDLE_EDGE_SAMPLES = 48000;   // ~1.0 s at 48 kHz
 
   // ---- Timing / sampling ----
   static constexpr float SAMPLES_PER_BIT = 92.16f;
@@ -186,6 +181,7 @@ class SAMEDecoder : public Component {
   Phase   phase_state_{HUNT_SYNC};
   uint32_t sync_shift_{0};
 
+  // Tier 1: full 'ZCZC' (32-bit), fuzzy Hamming <= 1.
   static constexpr uint32_t SYNC_ZCZC =
       (static_cast<uint32_t>('C') << 24) |
       (static_cast<uint32_t>('Z') << 16) |
@@ -193,10 +189,31 @@ class SAMEDecoder : public Component {
       (static_cast<uint32_t>('Z'));
   static constexpr int SYNC_MAX_HAMMING = 1;
 
+  // Tier 2: 'ZC-' (24-bit exact) - first 'ZC' assumed lost, dash survived.
   static constexpr uint32_t SYNC_ZC_DASH_24 =
       (static_cast<uint32_t>('-') << 16) |
       (static_cast<uint32_t>('C') << 8) |
       (static_cast<uint32_t>('Z'));
+
+  // Tier 3: boundary-clipped 24-bit variants of ZCZC.
+  //   'CZC' = last char of the leading 'Z' lost (window holds C,Z,C).
+  //   'ZCZ' = trailing 'C' not yet arrived / clipped (window holds Z,C,Z).
+  // Window low byte = first received char.
+  static constexpr uint32_t SYNC_CZC_24 =
+      (static_cast<uint32_t>('C') << 16) |
+      (static_cast<uint32_t>('Z') << 8) |
+      (static_cast<uint32_t>('C'));
+  static constexpr uint32_t SYNC_ZCZ_24 =
+      (static_cast<uint32_t>('Z') << 16) |
+      (static_cast<uint32_t>('C') << 8) |
+      (static_cast<uint32_t>('Z'));
+
+  // Tier 4: bare 'ZC' (16-bit exact), GUARDED by idle-edge window only.
+  static constexpr uint32_t SYNC_ZC_16 =
+      (static_cast<uint32_t>('C') << 8) |
+      (static_cast<uint32_t>('Z'));
+
+  static constexpr uint32_t MASK16 = 0x0000FFFFu;
   static constexpr uint32_t MASK24 = 0x00FFFFFFu;
   bool fallback_sync_used_{false};
 
