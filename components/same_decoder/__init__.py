@@ -19,12 +19,14 @@ CODEOWNERS = ["@infinitytec"]
 CONF_DECODE_COUNT_SENSOR = "decode_count_sensor"
 CONF_LAST_RAW_SENSOR = "last_raw_sensor"
 CONF_ON_ALERT = "on_alert"
+CONF_ON_SYNC = "on_sync"
 CONF_GAIN = "gain"
 
 same_decoder_ns = cg.esphome_ns.namespace("same_decoder")
 SAMEDecoder = same_decoder_ns.class_("SAMEDecoder", cg.Component)
 
 AlertTrigger = same_decoder_ns.class_("AlertTrigger", automation.Trigger.template())
+SyncTrigger = same_decoder_ns.class_("SyncTrigger", automation.Trigger.template())
 
 CONFIG_SCHEMA = cv.Schema(
     {
@@ -36,6 +38,11 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_ON_ALERT): automation.validate_automation(
             {
                 cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(AlertTrigger),
+            }
+        ),
+        cv.Optional(CONF_ON_SYNC): automation.validate_automation(
+            {
+                cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(SyncTrigger),
             }
         ),
     }
@@ -60,3 +67,8 @@ async def to_code(config):
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID])
         await automation.build_automation(trigger, [], conf)
         cg.add(var.register_alert_trigger(trigger))
+
+    for conf in config.get(CONF_ON_SYNC, []):
+        trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID])
+        await automation.build_automation(trigger, [], conf)
+        cg.add(var.register_sync_trigger(trigger))
