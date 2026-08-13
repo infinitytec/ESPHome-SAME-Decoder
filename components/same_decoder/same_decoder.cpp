@@ -101,7 +101,8 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "  Timing loop: Kp=%.3f Ki=%.4f delta=%d conf_min=%.2f", TR_KP, TR_KI, TR_DELTA, TR_CONF_MIN);
   ESP_LOGCONFIG(TAG, "  Sync: ZCZC fuzzy Hamming <= %d; fallback ZC- exact (Hamming 0)", SYNC_MAX_HAMMING);
   ESP_LOGCONFIG(TAG, "  Collect all 3 bursts; early-emit at %d agreeing", MIN_BURSTS_TO_EMIT);
-  ESP_LOGCONFIG(TAG, "  Dedup on full voted header, window %" PRIu32 " ms (differing header = reissue)", DEDUP_WINDOW_MS);
+  ESP_LOGCONFIG(TAG, "  Dedup: session-based; immediate-dup guard %" PRIu32 " ms", IMMEDIATE_DUP_MS);
+  ESP_LOGCONFIG(TAG, "  New differing ZCZC preempts stale collection.");
   ESP_LOGCONFIG(TAG, "  Single-burst emit: strictly valid only, after >= %" PRIu32 " ms", SINGLE_BURST_MIN_MS);
   ESP_LOGCONFIG(TAG, "  Burst timeout (>=2 bursts): %" PRIu32 " ms", this->timeout_ms_.load(std::memory_order_relaxed));
   ESP_LOGCONFIG(TAG, "  Alert triggers: %u, sync triggers: %u",
@@ -206,7 +207,22 @@ void SAMEDecoder::reset_capture_() {
   this->last_burst_ms_ = 0;
   this->early_emitted_ = false;
   this->fallback_sync_used_ = false;
+  this->session_emitted_header_.clear();   // new session -> clear per-session dedup
   for (int i = 0; i < 3; i++) this->bursts_[i].clear();
+}
+
+// Prepare CAPTURE state for a new burst that has just synced. Does NOT touch
+// burst collection state (bursts_, burst_idx_) - used both for the first burst
+// of a session and for subsequent bursts of the same message.
+void SAMEDecoder::begin_new_capture_(bool fallback) {
+  this->phase_state_ = CAPTURE;
+  this->cur_burst_ = "ZCZC";
+  this->cur_byte_ = 0;
+  this->cur_nbits_ = 0;
+  this->plus_seen_ = false;
+  this->tail_count_ = 0;
+  if (fallback)
+    this->cur_burst_ += '-';
 }
 
 bool SAMEDecoder::bursts_agree_(int count) {
@@ -224,12 +240,31 @@ bool SAMEDecoder::bursts_agree_(int count) {
   return frac <= BURST_MAX_MISMATCH;
 }
 
-// Keep collecting all three bursts. Emit early once 2 agree (fast delivery) but
-// DO NOT reset - keep capturing burst 3 so the majority vote can improve. The
-// header-based dedup in vote_and_emit_ suppresses an identical re-vote and
-// RE-EMITS a corrected one. NOTE: early_emitted_ and fallback_sync_used_ are
-// NOT reset here - only reset_capture_ clears them, so they persist across the
-// bursts of one message.
+// Decide whether a newly-formed burst belongs to the SAME message currently
+// being collected (i.e. it's burst 2 or 3 of that message) or is a NEW message.
+// Compare the leading prefix (ORG-EEE-PSSCCC...) of the new burst against the
+// first already-collected burst of this session. If they match closely, it's
+// the same message; otherwise it's new.
+bool SAMEDecoder::same_message_as_current_(const std::string &new_burst) {
+  if (this->burst_idx_ == 0) return true;   // no reference yet; treat as continuation
+  const std::string &ref = this->bursts_[0];
+  size_t cmp = std::min({(size_t) SAME_MSG_PREFIX_CMP, ref.size(), new_burst.size()});
+  if (cmp == 0) return false;
+  size_t diff = 0;
+  for (size_t i = 0; i < cmp; i++)
+    if (ref[i] != new_burst[i]) diff++;
+  float frac = (float) diff / (float) cmp;
+  return frac <= BURST_MAX_MISMATCH;
+}
+
+// A completed burst. Two cases:
+//  (1) It matches the message currently being collected -> it's burst 2/3;
+//      store it, possibly early-emit / final-vote.
+//  (2) It does NOT match (a NEW message arrived while we were still waiting for
+//      the old message's 3rd burst) -> finalize the old session (its early emit
+//      already went out) and START FRESH with this burst as burst 0 of the new
+//      message. This is the "new ZCZC preempts stale collection" fix so a
+//      back-to-back alert is never missed.
 void SAMEDecoder::finish_burst_() {
   std::string hex;
   char tmp[4];
@@ -240,8 +275,33 @@ void SAMEDecoder::finish_burst_() {
   ESP_LOGD(TAG, "Burst %d ascii: '%s'", this->burst_idx_, sanitize_ascii(this->cur_burst_).c_str());
   ESP_LOGD(TAG, "Burst %d hex : %s", this->burst_idx_, hex.c_str());
 
+  std::string this_burst = this->cur_burst_;
+
+  // If we already have bursts collected and this one is from a DIFFERENT
+  // message, close out the old session and restart with this as burst 0.
+  if (this->burst_idx_ >= 1 && !this->same_message_as_current_(this_burst)) {
+    ESP_LOGD(TAG, "New differing burst mid-collection: finalizing old session, starting new.");
+    // Old session's early emit already fired (if it had 2 agreeing bursts).
+    // Nothing more to emit for it here. Reset session dedup + collection.
+    this->reset_capture_();
+    // Seed the new session with this burst as burst 0.
+    this->bursts_[0] = this_burst;
+    this->burst_idx_ = 1;
+    this->cur_burst_.clear();
+    this->plus_seen_ = false;
+    this->tail_count_ = 0;
+    this->last_burst_ms_ = millis();
+    // Hunt for the next repeat of the NEW message.
+    this->phase_state_ = HUNT_SYNC;
+    this->sync_shift_ = 0;
+    this->cur_byte_ = 0;
+    this->cur_nbits_ = 0;
+    return;
+  }
+
+  // Same message (or first burst): normal collection.
   if (this->burst_idx_ < 3)
-    this->bursts_[this->burst_idx_] = this->cur_burst_;
+    this->bursts_[this->burst_idx_] = this_burst;
   this->burst_idx_++;
   this->cur_burst_.clear();
   this->plus_seen_ = false;
@@ -249,8 +309,6 @@ void SAMEDecoder::finish_burst_() {
   this->last_burst_ms_ = millis();
 
   if (this->burst_idx_ >= 3) {
-    // Full set: final (best) vote. If it differs from the early emit, this
-    // reissues a correction; if identical, dedup suppresses it.
     this->vote_and_emit_(false, this->fallback_sync_used_);
     this->reset_capture_();
     return;
@@ -283,20 +341,17 @@ void SAMEDecoder::emit_bit_(bool bit) {
     }
 
     if (primary || fallback) {
-      this->fallback_sync_used_ = fallback && !primary;
+      bool fb = fallback && !primary;
+      // Only overwrite the session's fallback flag when starting the FIRST
+      // burst; for later bursts keep whatever the session began with.
+      if (this->burst_idx_ == 0)
+        this->fallback_sync_used_ = fb;
       ESP_LOGD(TAG, "%s sync found%s. Byte-aligned capture starting.",
-               this->fallback_sync_used_ ? "Fallback ZC-" : "ZCZC",
-               this->fallback_sync_used_ ? " (first ZC assumed lost)" : "");
+               fb ? "Fallback ZC-" : "ZCZC",
+               fb ? " (first ZC assumed lost)" : "");
       uint32_t p = this->sync_pending_.load(std::memory_order_relaxed);
       if (p < 8) this->sync_pending_.store(p + 1, std::memory_order_release);
-      this->phase_state_ = CAPTURE;
-      this->cur_burst_ = "ZCZC";
-      this->cur_byte_ = 0;
-      this->cur_nbits_ = 0;
-      this->plus_seen_ = false;
-      this->tail_count_ = 0;
-      if (this->fallback_sync_used_)
-        this->cur_burst_ += '-';
+      this->begin_new_capture_(fb);
     }
     return;
   }
@@ -361,14 +416,20 @@ bool SAMEDecoder::header_is_strictly_valid_(const std::string &header) {
   return true;
 }
 
-// Vote across all collected bursts and emit, with strict gating + header dedup.
+// Vote across all collected bursts and emit, with strict gating + SESSION dedup.
 //  from_timeout    : this emit was triggered by the collection timeout.
 //  fallback_synced : the capture began via the ZC- fallback (untrusted preamble).
 // STRICT GATE (weak evidence): a lone timeout burst OR any fallback-synced
 // capture must pass header_is_strictly_valid_.
-// DEDUP / REISSUE (option b): key on the FULL VOTED HEADER within
-// DEDUP_WINDOW_MS. Identical header -> suppress. DIFFERENT header (the 3-burst
-// consensus corrected the early 2-burst emit) -> RE-EMIT the correction.
+// DEDUP (session-based):
+//   - If this SESSION already emitted this exact header -> suppress (its own
+//     repeat/3rd-burst confirmation).
+//   - If this SESSION already emitted a DIFFERENT header -> reissue (the
+//     3-burst consensus corrected the early 2-burst emit).
+//   - Cross-session immediate-dup guard: if a brand-new session emits the same
+//     header as the immediately previous emit within IMMEDIATE_DUP_MS, treat it
+//     as the same message spilling over and suppress. Otherwise it fires - so a
+//     new (even identical) alert after the guard window ALWAYS fires.
 void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
   size_t maxlen = 0;
   for (int i = 0; i < 3; i++) maxlen = std::max(maxlen, this->bursts_[i].size());
@@ -411,22 +472,35 @@ void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
   if (!this->parse_header_(header, alert))
     return;
 
-  // Header-based dedup / reissue.
   uint32_t now = millis();
-  bool within_window = (!this->last_emitted_header_.empty()) &&
-                       ((uint32_t) (now - this->last_emitted_ms_) <= DEDUP_WINDOW_MS);
-  if (within_window && this->last_emitted_header_ == header) {
-    ESP_LOGD(TAG, "Duplicate header suppressed (%s, within dedup window).", alert.event_code.c_str());
-    // Refresh the timestamp so a long repeat train keeps the window alive.
-    this->last_emitted_ms_ = now;
-    return;
-  }
-  if (within_window && this->last_emitted_header_ != header) {
-    ESP_LOGI(TAG, "New consensus differs from prior emit; reissuing corrected alert.");
+
+  // ---- SESSION dedup ----
+  if (!this->session_emitted_header_.empty()) {
+    if (this->session_emitted_header_ == header) {
+      ESP_LOGD(TAG, "Same-session duplicate header suppressed (%s).", alert.event_code.c_str());
+      return;
+    }
+    ESP_LOGI(TAG, "Same-session consensus changed; reissuing corrected alert.");
+  } else {
+    // First emit of THIS session. Apply the tight cross-session immediate-dup
+    // guard: swallow only an obvious same-message spillover.
+    bool immediate_same = (!this->last_global_header_.empty()) &&
+                          (this->last_global_header_ == header) &&
+                          ((uint32_t) (now - this->last_global_ms_) <= IMMEDIATE_DUP_MS);
+    if (immediate_same) {
+      ESP_LOGD(TAG, "Immediate cross-session duplicate suppressed (%s within %" PRIu32 " ms).",
+               alert.event_code.c_str(), IMMEDIATE_DUP_MS);
+      // Mark session as emitted this header so later re-votes stay quiet too.
+      this->session_emitted_header_ = header;
+      this->last_global_header_ = header;
+      this->last_global_ms_ = now;
+      return;
+    }
   }
 
-  this->last_emitted_header_ = header;
-  this->last_emitted_ms_ = now;
+  this->session_emitted_header_ = header;
+  this->last_global_header_ = header;
+  this->last_global_ms_ = now;
   this->publish_alert_(alert);
 }
 
