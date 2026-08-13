@@ -75,11 +75,13 @@ class SAMEDecoder : public Component {
   void feed_sample_(int16_t s);
   void emit_bit_(bool bit);
   void reset_capture_();
+  void begin_new_capture_(bool fallback);
   void vote_and_emit_(bool from_timeout, bool fallback_synced);
   void finish_burst_();
 
   bool parse_header_(const std::string &header, SameAlert &out);
   bool header_is_strictly_valid_(const std::string &header);
+  bool same_message_as_current_(const std::string &new_burst);
   std::string describe_(const std::string &code);
   std::string severity_for_(const std::string &code);
   bool is_known_code_(const std::string &code);
@@ -114,18 +116,24 @@ class SAMEDecoder : public Component {
   static constexpr size_t PENDING_MAX = 16;
   std::vector<SameAlert> pending_;
 
-  // ---- Deduplication / reissue-on-new-consensus ----
-  // We KEEP COLLECTING all three bursts even after an early 2-burst emit so the
-  // extra burst can improve the majority vote. Dedup now keys on the FULL VOTED
-  // HEADER STRING (not just the alert ID). Within DEDUP_WINDOW_MS:
-  //   - identical voted header  -> suppress (it's the same message repeat)
-  //   - DIFFERENT voted header  -> RE-EMIT (the 3-burst consensus corrected the
-  //                                2-burst early emit; option (b) = reissue)
-  // This deliberately allows one real message to fire twice (original + a
-  // corrected reissue); downstream automations handle that.
-  std::string last_emitted_header_;
-  uint32_t    last_emitted_ms_{0};
-  static constexpr uint32_t DEDUP_WINDOW_MS = 12000;   // repeats within 12s = same message
+  // ---- Dedup: SESSION-based (not wall-clock window) ----
+  // Within ONE capture session (the up-to-3 bursts of a single message), the
+  // early 2-burst emit and the 3-burst re-vote dedup against each other by
+  // header: identical -> suppress, different -> reissue a correction. A NEW
+  // capture session (a fresh ZCZC/ZC- that does NOT match the in-progress
+  // message) CLEARS the per-session dedup, so any new message ALWAYS fires -
+  // even one that looks identical to a prior message.
+  //   session_emitted_header_ : the header this session has already emitted
+  //                             ("" = nothing emitted yet this session).
+  // A tiny cross-session guard still swallows an OBVIOUS immediate duplicate:
+  // if a brand-new session emits the EXACT same header as the immediately
+  // previous emit within IMMEDIATE_DUP_MS (~one burst spacing), it is treated
+  // as the same message spilling over and suppressed. Beyond that window, it
+  // fires. This honors "unless clearly the same message and immediately there".
+  std::string session_emitted_header_;              // emitted within current session
+  std::string last_global_header_;                  // last header emitted (any session)
+  uint32_t    last_global_ms_{0};
+  static constexpr uint32_t IMMEDIATE_DUP_MS = 3000;   // tight same-message spill guard
 
   // ---- Timing / sampling ----
   static constexpr float SAMPLES_PER_BIT = 92.16f;
@@ -189,6 +197,11 @@ class SAMEDecoder : public Component {
   static constexpr float BURST_MAX_MISMATCH = 0.10f;
   bool bursts_agree_(int count);
   bool early_emitted_{false};
+
+  // How many leading chars of a forming burst to compare when deciding whether
+  // a new ZCZC belongs to the SAME message (burst 2/3) or is a NEW message.
+  // The ORG-EEE-PSSCCC prefix diverges quickly between different messages.
+  static constexpr size_t SAME_MSG_PREFIX_CMP = 12;
 
   // ---- Header termination (structure-driven) ----
   bool  plus_seen_{false};
