@@ -101,6 +101,7 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "  Timing loop: Kp=%.3f Ki=%.4f delta=%d conf_min=%.2f", TR_KP, TR_KI, TR_DELTA, TR_CONF_MIN);
   ESP_LOGCONFIG(TAG, "  Sync: ZCZC fuzzy Hamming <= %d; fallback ZC- exact (Hamming 0)", SYNC_MAX_HAMMING);
   ESP_LOGCONFIG(TAG, "  Collect all 3 bursts; early-emit at %d agreeing", MIN_BURSTS_TO_EMIT);
+  ESP_LOGCONFIG(TAG, "  Same-message match: ORG/EEE fuzzy, area+timing EXACT");
   ESP_LOGCONFIG(TAG, "  Dedup: session-based; immediate-dup guard %" PRIu32 " ms", IMMEDIATE_DUP_MS);
   ESP_LOGCONFIG(TAG, "  New differing ZCZC preempts stale collection.");
   ESP_LOGCONFIG(TAG, "  Single-burst emit: strictly valid only, after >= %" PRIu32 " ms", SINGLE_BURST_MIN_MS);
@@ -207,13 +208,10 @@ void SAMEDecoder::reset_capture_() {
   this->last_burst_ms_ = 0;
   this->early_emitted_ = false;
   this->fallback_sync_used_ = false;
-  this->session_emitted_header_.clear();   // new session -> clear per-session dedup
+  this->session_emitted_header_.clear();
   for (int i = 0; i < 3; i++) this->bursts_[i].clear();
 }
 
-// Prepare CAPTURE state for a new burst that has just synced. Does NOT touch
-// burst collection state (bursts_, burst_idx_) - used both for the first burst
-// of a session and for subsequent bursts of the same message.
 void SAMEDecoder::begin_new_capture_(bool fallback) {
   this->phase_state_ = CAPTURE;
   this->cur_burst_ = "ZCZC";
@@ -240,31 +238,54 @@ bool SAMEDecoder::bursts_agree_(int count) {
   return frac <= BURST_MAX_MISMATCH;
 }
 
-// Decide whether a newly-formed burst belongs to the SAME message currently
-// being collected (i.e. it's burst 2 or 3 of that message) or is a NEW message.
-// Compare the leading prefix (ORG-EEE-PSSCCC...) of the new burst against the
-// first already-collected burst of this session. If they match closely, it's
-// the same message; otherwise it's new.
-bool SAMEDecoder::same_message_as_current_(const std::string &new_burst) {
-  if (this->burst_idx_ == 0) return true;   // no reference yet; treat as continuation
-  const std::string &ref = this->bursts_[0];
-  size_t cmp = std::min({(size_t) SAME_MSG_PREFIX_CMP, ref.size(), new_burst.size()});
-  if (cmp == 0) return false;
+// Fuzzy string equality: true if the fraction of differing chars is within
+// FIELD_FUZZ (length mismatch counts as differences). Used for ORG/EEE only.
+bool SAMEDecoder::fuzzy_equal_(const std::string &a, const std::string &b) {
+  size_t overlap = std::min(a.size(), b.size());
+  size_t longer = std::max(a.size(), b.size());
+  if (longer == 0) return true;
   size_t diff = 0;
-  for (size_t i = 0; i < cmp; i++)
-    if (ref[i] != new_burst[i]) diff++;
-  float frac = (float) diff / (float) cmp;
-  return frac <= BURST_MAX_MISMATCH;
+  for (size_t i = 0; i < overlap; i++)
+    if (a[i] != b[i]) diff++;
+  diff += (longer - overlap);
+  return ((float) diff / (float) longer) <= FIELD_FUZZ;
 }
 
-// A completed burst. Two cases:
-//  (1) It matches the message currently being collected -> it's burst 2/3;
-//      store it, possibly early-emit / final-vote.
-//  (2) It does NOT match (a NEW message arrived while we were still waiting for
-//      the old message's 3rd burst) -> finalize the old session (its early emit
-//      already went out) and START FRESH with this burst as burst 0 of the new
-//      message. This is the "new ZCZC preempts stale collection" fix so a
-//      back-to-back alert is never missed.
+// Decide whether a newly-formed burst belongs to the SAME message currently
+// being collected (burst 2/3) or is a NEW message. We PARSE both headers and
+// compare fields: ORG and EEE fuzzy (a bit-error shouldn't split a real same-
+// message burst), but AREA and TIMING must match EXACTLY - a different county
+// list or a different valid-time genuinely IS a different alert.
+// If the new burst is too short to parse fully, fall back to comparing whatever
+// fields exist (at least ORG/EEE); "can't tell yet" -> treat as continuation so
+// we never prematurely split a real same-message burst.
+bool SAMEDecoder::same_message_as_current_(const std::string &new_burst) {
+  if (this->burst_idx_ == 0) return true;   // no reference yet
+  const std::string &ref = this->bursts_[0];
+
+  SameAlert ra, rb;
+  bool pa = this->parse_header_(ref, ra);
+  bool pb = this->parse_header_(new_burst, rb);
+
+  // If either can't be parsed to fields yet, fall back to a lenient prefix
+  // compare (ORG-EEE region). Treat inconclusive as "same" to avoid splitting.
+  if (!pa || !pb) {
+    size_t cmp = std::min({(size_t) 12, ref.size(), new_burst.size()});
+    if (cmp < 8) return true;   // too little to judge -> continuation
+    size_t diff = 0;
+    for (size_t i = 0; i < cmp; i++)
+      if (ref[i] != new_burst[i]) diff++;
+    return ((float) diff / (float) cmp) <= FIELD_FUZZ;
+  }
+
+  // ORG and EEE: fuzzy. AREA and TIMING: exact.
+  if (!this->fuzzy_equal_(ra.originator, rb.originator)) return false;
+  if (!this->fuzzy_equal_(ra.event_code, rb.event_code)) return false;
+  if (ra.areas_csv != rb.areas_csv) return false;
+  if (ra.timing != rb.timing) return false;
+  return true;
+}
+
 void SAMEDecoder::finish_burst_() {
   std::string hex;
   char tmp[4];
@@ -277,21 +298,16 @@ void SAMEDecoder::finish_burst_() {
 
   std::string this_burst = this->cur_burst_;
 
-  // If we already have bursts collected and this one is from a DIFFERENT
-  // message, close out the old session and restart with this as burst 0.
+  // New message arrived mid-collection: finalize old session, restart fresh.
   if (this->burst_idx_ >= 1 && !this->same_message_as_current_(this_burst)) {
     ESP_LOGD(TAG, "New differing burst mid-collection: finalizing old session, starting new.");
-    // Old session's early emit already fired (if it had 2 agreeing bursts).
-    // Nothing more to emit for it here. Reset session dedup + collection.
     this->reset_capture_();
-    // Seed the new session with this burst as burst 0.
     this->bursts_[0] = this_burst;
     this->burst_idx_ = 1;
     this->cur_burst_.clear();
     this->plus_seen_ = false;
     this->tail_count_ = 0;
     this->last_burst_ms_ = millis();
-    // Hunt for the next repeat of the NEW message.
     this->phase_state_ = HUNT_SYNC;
     this->sync_shift_ = 0;
     this->cur_byte_ = 0;
@@ -320,7 +336,6 @@ void SAMEDecoder::finish_burst_() {
     this->early_emitted_ = true;
   }
 
-  // Continue collecting: hunt for the next repeat's preamble.
   this->phase_state_ = HUNT_SYNC;
   this->sync_shift_ = 0;
   this->cur_byte_ = 0;
@@ -342,8 +357,6 @@ void SAMEDecoder::emit_bit_(bool bit) {
 
     if (primary || fallback) {
       bool fb = fallback && !primary;
-      // Only overwrite the session's fallback flag when starting the FIRST
-      // burst; for later bursts keep whatever the session began with.
       if (this->burst_idx_ == 0)
         this->fallback_sync_used_ = fb;
       ESP_LOGD(TAG, "%s sync found%s. Byte-aligned capture starting.",
@@ -416,20 +429,6 @@ bool SAMEDecoder::header_is_strictly_valid_(const std::string &header) {
   return true;
 }
 
-// Vote across all collected bursts and emit, with strict gating + SESSION dedup.
-//  from_timeout    : this emit was triggered by the collection timeout.
-//  fallback_synced : the capture began via the ZC- fallback (untrusted preamble).
-// STRICT GATE (weak evidence): a lone timeout burst OR any fallback-synced
-// capture must pass header_is_strictly_valid_.
-// DEDUP (session-based):
-//   - If this SESSION already emitted this exact header -> suppress (its own
-//     repeat/3rd-burst confirmation).
-//   - If this SESSION already emitted a DIFFERENT header -> reissue (the
-//     3-burst consensus corrected the early 2-burst emit).
-//   - Cross-session immediate-dup guard: if a brand-new session emits the same
-//     header as the immediately previous emit within IMMEDIATE_DUP_MS, treat it
-//     as the same message spilling over and suppress. Otherwise it fires - so a
-//     new (even identical) alert after the guard window ALWAYS fires.
 void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
   size_t maxlen = 0;
   for (int i = 0; i < 3; i++) maxlen = std::max(maxlen, this->bursts_[i].size());
@@ -474,7 +473,6 @@ void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
 
   uint32_t now = millis();
 
-  // ---- SESSION dedup ----
   if (!this->session_emitted_header_.empty()) {
     if (this->session_emitted_header_ == header) {
       ESP_LOGD(TAG, "Same-session duplicate header suppressed (%s).", alert.event_code.c_str());
@@ -482,15 +480,12 @@ void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
     }
     ESP_LOGI(TAG, "Same-session consensus changed; reissuing corrected alert.");
   } else {
-    // First emit of THIS session. Apply the tight cross-session immediate-dup
-    // guard: swallow only an obvious same-message spillover.
     bool immediate_same = (!this->last_global_header_.empty()) &&
                           (this->last_global_header_ == header) &&
                           ((uint32_t) (now - this->last_global_ms_) <= IMMEDIATE_DUP_MS);
     if (immediate_same) {
       ESP_LOGD(TAG, "Immediate cross-session duplicate suppressed (%s within %" PRIu32 " ms).",
                alert.event_code.c_str(), IMMEDIATE_DUP_MS);
-      // Mark session as emitted this header so later re-votes stay quiet too.
       this->session_emitted_header_ = header;
       this->last_global_header_ = header;
       this->last_global_ms_ = now;
@@ -523,7 +518,7 @@ std::string SAMEDecoder::severity_for_(const std::string &code) {
 }
 
 std::string SAMEDecoder::make_id_(const SameAlert &a) {
-  std::string key = a.event_code + "|" + a.areas_csv + "|" + a.onset_iso;
+  std::string key = a.event_code + "|" + a.areas_csv + "|" + a.timing;
   size_t h = std::hash<std::string>{}(key);
   std::ostringstream os;
   os << std::hex << h;
@@ -550,7 +545,10 @@ bool SAMEDecoder::parse_header_(const std::string &header, SameAlert &out) {
   out.event_name = this->describe_(out.event_code);
   out.severity   = this->severity_for_(out.event_code);
 
+  // Areas: parts from index 3 up to (and including) the block containing '+'.
+  // The '+' marks the end of the area list and the start of the valid-time.
   std::string areas;
+  std::string timing;
   for (size_t i = 3; i < parts.size(); i++) {
     size_t plus = parts[i].find('+');
     if (plus != std::string::npos) {
@@ -559,12 +557,18 @@ bool SAMEDecoder::parse_header_(const std::string &header, SameAlert &out) {
         if (!areas.empty()) areas += ",";
         areas += last_area;
       }
+      // Build the timing tail: "+TTTT" from this block, then the following
+      // block (JJJHHMM issue time) if present. e.g. "+0030-2780415".
+      timing = parts[i].substr(plus);           // "+TTTT"
+      if (i + 1 < parts.size())
+        timing += "-" + parts[i + 1];           // "-JJJHHMM"
       break;
     }
     if (!areas.empty()) areas += ",";
     areas += parts[i];
   }
   out.areas_csv = areas;
+  out.timing = timing;
 
   out.status = (out.event_code == "RWT" || out.event_code == "RMT" ||
                 out.event_code == "DMO" || out.event_code == "NPT")
