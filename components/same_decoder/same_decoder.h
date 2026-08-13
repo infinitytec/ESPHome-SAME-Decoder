@@ -58,6 +58,11 @@ class SAMEDecoder : public Component {
   void register_alert_trigger(AlertTrigger *t) { this->alert_triggers_.push_back(t); }
   void register_sync_trigger(SyncTrigger *t) { this->sync_triggers_.push_back(t); }
 
+  // Called from YAML (api on_client_connected / on_client_disconnected) to tell
+  // the decoder whether the Native API is currently usable. When it transitions
+  // to connected, loop() flushes any alerts that were buffered while offline.
+  void set_api_connected(bool connected);
+
   void feed_bytes(const std::vector<uint8_t> &data);
 
   std::string last_alert_id() const { return this->last_.id; }
@@ -85,6 +90,8 @@ class SAMEDecoder : public Component {
   std::string make_id_(const SameAlert &a);
   void publish_alert_(const SameAlert &a);
   void dispatch_alert_(const SameAlert &a);
+  void deliver_or_buffer_(const SameAlert &a);
+  void flush_pending_();
 
   uint32_t sample_rate_{48000};
   float gain_{1.0f};
@@ -97,50 +104,59 @@ class SAMEDecoder : public Component {
   uint32_t decode_count_{0};
 
   // ---- Cross-thread hand-off (mic_task -> main loop) ----
-  // The DSP runs on the microphone task. publish_state()/Trigger::trigger()
-  // send Native API traffic and MUST run on the main loop thread, so we queue
-  // decoded alerts here and dispatch them from loop(). Lock-free single-
-  // producer (mic_task) / single-consumer (loop) ring buffer so closely-spaced
-  // alerts are not dropped (only dropped if the queue is genuinely full).
   static constexpr int ALERT_Q_LEN = 4;
   SameAlert alert_queue_[ALERT_Q_LEN];
   std::atomic<uint32_t> q_head_{0};   // consumer index (written by loop)
   std::atomic<uint32_t> q_tail_{0};   // producer index (written by mic_task)
 
   // ---- Sync-detected hand-off (mic_task -> main loop) ----
-  // ZCZC acquisition happens on mic_task; the sync trigger must fire on the
-  // main loop. A single atomic "pending" counter is incremented on mic_task
-  // and drained (fired) in loop(). We only need edge notification, so a small
-  // saturating counter is sufficient and lock-free.
   std::atomic<uint32_t> sync_pending_{0};
+
+  // ---- Guaranteed alert delivery (survive brief API disconnects) ----
+  // homeassistant.event is fire-and-forget: if the API is disconnected when an
+  // alert is dispatched, the event is silently dropped. For a safety decoder we
+  // must not lose a decode during a momentary reconnect. So dispatch_alert_()
+  // calls deliver_or_buffer_(): if the API is connected, fire immediately;
+  // otherwise stash the alert in pending_. On the next connect
+  // (set_api_connected(true)), loop() calls flush_pending_() to fire every
+  // buffered alert in order. All of this runs on the main loop thread.
+  bool api_connected_{false};
+  std::atomic<bool> api_connected_changed_{false};   // set by set_api_connected(), drained in loop()
+  static constexpr size_t PENDING_MAX = 16;           // max buffered alerts across a disconnect
+  std::vector<SameAlert> pending_;                    // alerts awaiting a live API
 
   // ---- Timing / sampling ----
   static constexpr float SAMPLES_PER_BIT = 92.16f;
   static constexpr float PHASE_INC       = 1.0f / 92.16f;   // 0.01085069 nominal
   static constexpr int   GWIN            = 64;              // Goertzel window (< bit)
-  static constexpr int   RINGLEN         = 256;            // ring size (grown for early/late windows)
+  static constexpr int   RINGLEN         = 256;            // ring size
   int16_t ring_[RINGLEN];                                   // circular sample history
   int     ring_pos_{0};
   float   phase_{0.0f};                                     // bit-clock phase accumulator
 
+  // ---- Soft clipping (input headroom) ----
+  // The hardware PGA (ES8388 ADCControl1) plus the software gain can drive
+  // samples past full scale. Hard-clipping to +-32767 turns the AFSK tones into
+  // square waves and destroys the mark/space Goertzel ratio, which is fatal for
+  // marginal/trimmed captures. Instead we soft-clip with a tanh-style knee: the
+  // signal is linear up to SOFT_KNEE and then compresses smoothly toward the
+  // rail, preserving tone shape even when the slider is pushed high.
+  static constexpr float SAMPLE_MAX   = 32767.0f;
+  static constexpr float SOFT_KNEE    = 24576.0f;          // 0.75 * full scale: linear below this
+  static float soft_clip_(float v);
+
   // ---- Timing recovery (early/late gate) ----
-  static constexpr int   CENTER_LAG      = GWIN / 2;        // window end sits this far back of "now"
-  static constexpr int   TR_DELTA        = 12;             // early/late offset in samples
-  static constexpr float TR_KP           = 0.06f;          // proportional phase gain
-  static constexpr float TR_KI           = 0.0015f;        // integral rate gain
-  static constexpr float TR_CONF_MIN     = 0.20f;          // min confidence to adapt (lowered for low-level captures)
-  static constexpr float TR_DPHI_CLAMP   = 0.125f;         // max per-bit phase nudge (bit fraction)
-  static constexpr float TR_WOFF_CLAMP   = 0.002f * PHASE_INC;  // max rate correction (+-0.2%)
+  static constexpr int   CENTER_LAG      = GWIN / 2;
+  static constexpr int   TR_DELTA        = 12;
+  static constexpr float TR_KP           = 0.06f;
+  static constexpr float TR_KI           = 0.0015f;
+  static constexpr float TR_CONF_MIN     = 0.20f;          // lowered for low-level captures
+  static constexpr float TR_DPHI_CLAMP   = 0.125f;
+  static constexpr float TR_WOFF_CLAMP   = 0.002f * PHASE_INC;
   float   w_off_{0.0f};
   uint32_t samples_seen_{0};
 
   // ---- Burst-collection timeout (Option A, mic_task driven) ----
-  // If we have collected 1-2 header bursts but the 3rd never arrives within
-  // timeout_ms_, emit what we have and reset so a missed burst does not block
-  // the next alert. Checked inside feed_sample_ (mic_task), so all burst state
-  // stays single-threaded. Note: if the audio feed goes fully silent, mic_task
-  // stops running and the timeout cannot fire - acceptable for a continuous
-  // radio feed. timeout_ms_ is atomic so the main-loop slider can adjust it.
   uint32_t last_burst_ms_{0};
   std::atomic<uint32_t> timeout_ms_{3000};
 
@@ -149,13 +165,6 @@ class SAMEDecoder : public Component {
   Phase   phase_state_{HUNT_SYNC};
   uint32_t sync_shift_{0};
 
-  // LSB-first 'ZCZC' = 0x5A 0x43 0x5A 0x43 transmitted LSB-first.
-  // As a 32-bit value with FIRST-received bit in LSB position of the window,
-  // the assembled pattern is 0x435A435A. The hunt shifter inserts the newest
-  // bit at bit 31 and shifts older bits toward LSB, so after 32 bits the first
-  // received 'Z' occupies the low byte and the last received 'C' the high byte.
-  // Built from characters so the value can't silently drift again:
-  //   high byte -> last received 'C', low byte -> first received 'Z'.
   static constexpr uint32_t SYNC_ZCZC =
       (static_cast<uint32_t>('C') << 24) |
       (static_cast<uint32_t>('Z') << 16) |
@@ -164,8 +173,6 @@ class SAMEDecoder : public Component {
 
   // Fuzzy ZCZC match tolerance: accept the preamble if the rolling 32-bit
   // window is within this Hamming distance of the ideal SYNC_ZCZC pattern.
-  // 1 tolerates a single flipped bit in the preamble so a marginally-clipped
-  // or noisy first burst still acquires. Kept small to bound false-sync risk.
   static constexpr int SYNC_MAX_HAMMING = 1;
 
   // ---- Byte / burst assembly ----
@@ -177,33 +184,15 @@ class SAMEDecoder : public Component {
   static constexpr int MAX_HEADER_BYTES = 268;
 
   // ---- Early-emit on agreeing bursts ----
-  // A full SAME message repeats the header 3x so a receiver can majority-vote.
-  // If the first repeat is clipped/lost (common on trimmed test files), only 2
-  // bursts arrive and, on a file feed, the mic_task timeout cannot fire once
-  // audio ends - so the two good bursts would be discarded. To fix this we
-  // emit as soon as 2 collected bursts agree closely (below the mismatch
-  // ceiling), rather than always waiting for the 3rd. 3 bursts still vote as
-  // before. This preserves the majority-vote guarantee while recovering
-  // otherwise-lost 2-burst decodes.
   static constexpr int MIN_BURSTS_TO_EMIT = 2;              // emit once this many agree
   static constexpr float BURST_MAX_MISMATCH = 0.10f;        // <=10% differing chars = "agree"
   bool bursts_agree_(int count);
 
   // ---- Header termination (structure-driven) ----
-  // A ZCZC header ends at the trailing '-' after the fixed tail
-  // "+TTTT-JJJHHMM-LLLLLLLL". It does NOT contain "NNNN" (that is a separate
-  // End-Of-Message transmission). We anchor on '+', then count the fixed tail.
-  //  PRIMARY  : stop at the closing '-' once past TAIL_MIN.
-  //  FALLBACK : if that dash is missed/garbled, stop once the full fixed tail
-  //             length (TAIL_COMPLETE chars) has been consumed - the header is
-  //             structurally complete by then, so an otherwise-good decode is
-  //             not lost.
-  // TAIL_MIN     = 4(TTTT) +1(-) +7(JJJHHMM) +1(-) +1 = 14 (earliest valid dash)
-  // TAIL_COMPLETE= 4(TTTT) +1(-) +7(JJJHHMM) +1(-) +8(LLLLLLLL) = 21 (tail done)
-  bool  plus_seen_{false};                                  // have we seen '+' yet
-  int   tail_count_{0};                                     // chars counted since '+'
-  static constexpr int TAIL_MIN = 14;                       // min tail chars before closing '-'
-  static constexpr int TAIL_COMPLETE = 21;                  // full fixed tail length after '+'
+  bool  plus_seen_{false};
+  int   tail_count_{0};
+  static constexpr int TAIL_MIN = 14;
+  static constexpr int TAIL_COMPLETE = 21;
 };
 
 }  // namespace same_decoder
