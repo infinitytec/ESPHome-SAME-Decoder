@@ -16,9 +16,10 @@ namespace same_decoder {
 
 static const char *const TAG = "same_decoder";
 
-static constexpr float COEFF_MARK  = 1.926090f;
-static constexpr float COEFF_SPACE = 1.958313f;
-
+// Replace any byte that is not printable 7-bit ASCII (0x20..0x7E) with '?'.
+// SAME headers are pure ASCII by spec; anything else is capture noise.
+// This guarantees the string we hand to the ESPHome API (a protobuf UTF-8 string)
+// is always valid UTF-8 and cannot crash the connection.
 static std::string sanitize_ascii(const std::string &in) {
   std::string out;
   out.reserve(in.size());
@@ -59,8 +60,56 @@ float SAMEDecoder::soft_clip_(float v) {
   return sign * compressed;
 }
 
+void SAMEDecoder::compute_coeffs_() {
+  // Dynamic Goertzel coefficients and bit timing from configured sample rate
+  // plus optional frequency offset (radio / crystal drift compensation).
+  const float sr = (float) this->sample_rate_;
+  const float mark_hz  = 2083.333333f + this->freq_offset_hz_;
+  const float space_hz = 1562.5f      + this->freq_offset_hz_;
+  this->coeff_mark_  = 2.0f * std::cos(2.0f * (float) M_PI * mark_hz  / sr);
+  this->coeff_space_ = 2.0f * std::cos(2.0f * (float) M_PI * space_hz / sr);
+
+  // Exact SAME bit rate is 520 + 5/6 = 520.8333... baud
+  const float baud = 520.0f + 5.0f / 6.0f;
+  this->samples_per_bit_ = sr / baud;
+  this->phase_inc_ = 1.0f / this->samples_per_bit_;
+  this->tr_woff_clamp_ = 0.002f * this->phase_inc_;
+
+  ESP_LOGCONFIG(TAG, "Coeffs recomputed: sr=%" PRIu32 " mark=%.3f space=%.3f spb=%.3f",
+                this->sample_rate_, this->coeff_mark_, this->coeff_space_, this->samples_per_bit_);
+}
+
+void SAMEDecoder::set_sample_rate(uint32_t rate) {
+  this->sample_rate_ = rate;
+  this->compute_coeffs_();
+}
+
+void SAMEDecoder::update_agc_(float mag) {
+  if (!this->agc_enable_)
+    return;
+
+  // Slow peak tracker
+  if (mag > this->agc_peak_)
+    this->agc_peak_ += AGC_ATTACK * (mag - this->agc_peak_);
+  else
+    this->agc_peak_ += AGC_RELEASE * (mag - this->agc_peak_);
+
+  if (this->agc_peak_ < 1.0f)
+    this->agc_peak_ = 1.0f;
+
+  // Desired gain to reach target
+  float desired = this->agc_target_ / this->agc_peak_;
+  if (desired < this->agc_min_gain_) desired = this->agc_min_gain_;
+  if (desired > this->agc_max_gain_) desired = this->agc_max_gain_;
+
+  // Smooth the gain itself
+  this->agc_gain_ += 0.001f * (desired - this->agc_gain_);
+}
+
 void SAMEDecoder::setup() {
-  ESP_LOGCONFIG(TAG, "SAME decoder ready (timing-recovery, gain=%.1f).", this->gain_);
+  this->compute_coeffs_();
+  ESP_LOGCONFIG(TAG, "SAME decoder ready (timing-recovery, gain=%.1f, agc=%s).",
+                this->gain_, this->agc_enable_ ? "on" : "off");
   this->reset_capture_();
   this->last_feed_ms_.store(millis(), std::memory_order_relaxed);
 }
@@ -101,19 +150,26 @@ void SAMEDecoder::loop() {
 void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "SAME Decoder:");
   ESP_LOGCONFIG(TAG, "  Sample rate: %" PRIu32 " Hz", this->sample_rate_);
-  ESP_LOGCONFIG(TAG, "  Software gain: %.1f", this->gain_);
+  ESP_LOGCONFIG(TAG, "  Base gain: %.1f  AGC: %s (target=%.0f min=%.2f max=%.1f)",
+                this->gain_, this->agc_enable_ ? "on" : "off",
+                this->agc_target_, this->agc_min_gain_, this->agc_max_gain_);
+  ESP_LOGCONFIG(TAG, "  Freq offset: %.1f Hz", this->freq_offset_hz_);
+  ESP_LOGCONFIG(TAG, "  Samples/bit: %.2f, Goertzel window: %d", this->samples_per_bit_, GWIN);
+  ESP_LOGCONFIG(TAG, "  Goertzel coeffs: mark=%.6f space=%.6f", this->coeff_mark_, this->coeff_space_);
   ESP_LOGCONFIG(TAG, "  Soft-clip knee: %.0f (rail %.0f)", SOFT_KNEE, SAMPLE_MAX);
   ESP_LOGCONFIG(TAG, "  Timing loop: Kp=%.3f Ki=%.4f delta=%d conf_min=%.2f", TR_KP, TR_KI, TR_DELTA, TR_CONF_MIN);
   ESP_LOGCONFIG(TAG, "  Acquisition tiers: 1)ZCZC fuzzy H<=%d + misreads  2)ZC- 24b", SYNC_MAX_HAMMING);
   ESP_LOGCONFIG(TAG, "                     3)CZC/ZCZ 24b  4)ZC 16b (idle-edge guarded)");
+  ESP_LOGCONFIG(TAG, "  AB preamble arm: >= %d matching 0xAB bytes", AB_MIN_MATCH);
   ESP_LOGCONFIG(TAG, "  Collect all 3 bursts; early-emit at %d agreeing", MIN_BURSTS_TO_EMIT);
   ESP_LOGCONFIG(TAG, "  Same-message match: ORG/EEE fuzzy, area+timing EXACT");
   ESP_LOGCONFIG(TAG, "  Dedup: session-based; immediate-dup guard %" PRIu32 " ms", IMMEDIATE_DUP_MS);
   ESP_LOGCONFIG(TAG, "  Re-arm sync after each burst; front canonicalized to 'ZCZC-'.");
   ESP_LOGCONFIG(TAG, "  Idle re-prime: feed-gap %" PRIu32 " ms + energy rising edge.", FEED_GAP_MS);
-  ESP_LOGCONFIG(TAG, "  Weak-evidence gate: structural only (UNKNOWN codes fire).");
-  ESP_LOGCONFIG(TAG, "  Single-burst emit: structurally valid only, after >= %" PRIu32 " ms", SINGLE_BURST_MIN_MS);
+  ESP_LOGCONFIG(TAG, "  Weak-evidence gate: structural + semantic validation.");
+  ESP_LOGCONFIG(TAG, "  Single-burst emit: structurally valid only, after >= %" PRIu32 " ms", this->single_burst_min_ms_);
   ESP_LOGCONFIG(TAG, "  Burst timeout (>=2 bursts): %" PRIu32 " ms", this->timeout_ms_.load(std::memory_order_relaxed));
+  ESP_LOGCONFIG(TAG, "  Post-emit dead-time: %" PRIu32 " ms", this->post_emit_dead_ms_);
   ESP_LOGCONFIG(TAG, "  Alert triggers: %u, sync triggers: %u",
                 (unsigned) this->alert_triggers_.size(), (unsigned) this->sync_triggers_.size());
 }
@@ -126,6 +182,9 @@ void SAMEDecoder::reprime_detector_() {
   this->phase_ = 0.0f;
   this->w_off_ = 0.0f;
   this->samples_seen_ = 0;
+  this->ab_shift_ = 0;
+  this->ab_match_count_ = 0;
+  this->eom_n_count_ = 0;
 }
 
 void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
@@ -142,6 +201,8 @@ void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
   const int16_t *samples = reinterpret_cast<const int16_t *>(data.data());
   for (size_t i = 0; i < n; i++) {
     float v = (float) samples[i] * this->gain_;
+    // Soft AGC applied after base gain
+    v *= this->agc_gain_;
     v = soft_clip_(v);
     if (v >  32767.0f) v =  32767.0f;
     if (v < -32768.0f) v = -32768.0f;
@@ -157,6 +218,8 @@ static inline uint32_t effective_timeout(int burst_idx, uint32_t slider_ms, uint
 
 void SAMEDecoder::feed_sample_(int16_t s) {
   float mag = std::fabs((float) s);
+  this->update_agc_(mag);
+
   this->env_slow_ += ENV_ALPHA * (mag - this->env_slow_);
   if (this->was_idle_) {
     if (mag > ENV_SILENCE * ENV_RISE_MULT) {
@@ -171,14 +234,23 @@ void SAMEDecoder::feed_sample_(int16_t s) {
   }
   if (this->idle_edge_samples_ > 0) this->idle_edge_samples_--;
 
+  // Post-emit dead-time: ignore everything for a short period after an alert
+  // so a late third burst cannot be glued onto the next message.
+  if (this->last_emit_ms_ != 0 &&
+      (uint32_t) (millis() - this->last_emit_ms_) < this->post_emit_dead_ms_) {
+    return;
+  }
+
   this->ring_[this->ring_pos_] = s;
   this->ring_pos_ = (this->ring_pos_ + 1) % RINGLEN;
   if (this->samples_seen_ < 0x7fffffff) this->samples_seen_++;
 
-  this->phase_ += (PHASE_INC + this->w_off_);
+  this->phase_ += (this->phase_inc_ + this->w_off_);
   if (this->phase_ < 1.0f) {
     if (this->burst_idx_ >= 1 && this->burst_idx_ < 3 && this->last_burst_ms_ != 0) {
-      uint32_t to = effective_timeout(this->burst_idx_, this->timeout_ms_.load(std::memory_order_relaxed), SINGLE_BURST_MIN_MS);
+      uint32_t to = effective_timeout(this->burst_idx_,
+                                      this->timeout_ms_.load(std::memory_order_relaxed),
+                                      this->single_burst_min_ms_);
       if ((uint32_t) (millis() - this->last_burst_ms_) >= to) {
         ESP_LOGD(TAG, "Burst timeout (%d burst(s), %" PRIu32 " ms): flushing.", this->burst_idx_, to);
         this->vote_and_emit_(true, this->fallback_sync_used_);
@@ -195,16 +267,16 @@ void SAMEDecoder::feed_sample_(int16_t s) {
   int t_early  = (t_center - TR_DELTA + RINGLEN) % RINGLEN;
   int t_late   = (t_center + TR_DELTA) % RINGLEN;
 
-  float em_c = goertzel_ring_end(this->ring_, RINGLEN, t_center, GWIN, COEFF_MARK);
-  float es_c = goertzel_ring_end(this->ring_, RINGLEN, t_center, GWIN, COEFF_SPACE);
+  float em_c = goertzel_ring_end(this->ring_, RINGLEN, t_center, GWIN, this->coeff_mark_);
+  float es_c = goertzel_ring_end(this->ring_, RINGLEN, t_center, GWIN, this->coeff_space_);
   bool bit = em_c > es_c;
 
   bool primed = this->samples_seen_ >= (uint32_t) (CENTER_LAG + TR_DELTA + GWIN + 2);
   if (primed) {
-    float em_e = goertzel_ring_end(this->ring_, RINGLEN, t_early, GWIN, COEFF_MARK);
-    float es_e = goertzel_ring_end(this->ring_, RINGLEN, t_early, GWIN, COEFF_SPACE);
-    float em_l = goertzel_ring_end(this->ring_, RINGLEN, t_late,  GWIN, COEFF_MARK);
-    float es_l = goertzel_ring_end(this->ring_, RINGLEN, t_late,  GWIN, COEFF_SPACE);
+    float em_e = goertzel_ring_end(this->ring_, RINGLEN, t_early, GWIN, this->coeff_mark_);
+    float es_e = goertzel_ring_end(this->ring_, RINGLEN, t_early, GWIN, this->coeff_space_);
+    float em_l = goertzel_ring_end(this->ring_, RINGLEN, t_late,  GWIN, this->coeff_mark_);
+    float es_l = goertzel_ring_end(this->ring_, RINGLEN, t_late,  GWIN, this->coeff_space_);
 
     float d_early = std::fabs(em_e - es_e);
     float d_late  = std::fabs(em_l - es_l);
@@ -222,14 +294,16 @@ void SAMEDecoder::feed_sample_(int16_t s) {
     this->phase_ += dphi;
 
     this->w_off_ += TR_KI * e;
-    if (this->w_off_ >  TR_WOFF_CLAMP) this->w_off_ =  TR_WOFF_CLAMP;
-    if (this->w_off_ < -TR_WOFF_CLAMP) this->w_off_ = -TR_WOFF_CLAMP;
+    if (this->w_off_ >  this->tr_woff_clamp_) this->w_off_ =  this->tr_woff_clamp_;
+    if (this->w_off_ < -this->tr_woff_clamp_) this->w_off_ = -this->tr_woff_clamp_;
   }
 
   this->emit_bit_(bit);
 
   if (this->burst_idx_ >= 1 && this->burst_idx_ < 3 && this->last_burst_ms_ != 0) {
-    uint32_t to = effective_timeout(this->burst_idx_, this->timeout_ms_.load(std::memory_order_relaxed), SINGLE_BURST_MIN_MS);
+    uint32_t to = effective_timeout(this->burst_idx_,
+                                    this->timeout_ms_.load(std::memory_order_relaxed),
+                                    this->single_burst_min_ms_);
     if ((uint32_t) (millis() - this->last_burst_ms_) >= to) {
       ESP_LOGD(TAG, "Burst timeout (%d burst(s), %" PRIu32 " ms): flushing.", this->burst_idx_, to);
       this->vote_and_emit_(true, this->fallback_sync_used_);
@@ -248,6 +322,7 @@ void SAMEDecoder::rearm_sync_() {
   this->tail_count_ = 0;
   this->w_off_ = 0.0f;
   this->phase_ = 0.0f;
+  this->eom_n_count_ = 0;
 }
 
 void SAMEDecoder::reset_capture_() {
@@ -258,6 +333,13 @@ void SAMEDecoder::reset_capture_() {
   this->fallback_sync_used_ = false;
   this->session_emitted_header_.clear();
   for (int i = 0; i < 3; i++) this->bursts_[i].clear();
+  this->ab_shift_ = 0;
+  this->ab_match_count_ = 0;
+  this->eom_n_count_ = 0;
+}
+
+bool SAMEDecoder::ab_preamble_ok_() const {
+  return this->ab_match_count_ >= AB_MIN_MATCH;
 }
 
 // Seed the current burst with the correct leading characters for whichever
@@ -280,6 +362,7 @@ void SAMEDecoder::begin_new_capture_(int preamble_len, bool fallback) {
   this->cur_nbits_ = 0;
   this->plus_seen_ = false;
   this->tail_count_ = 0;
+  this->eom_n_count_ = 0;
   if (fallback)
     this->cur_burst_ += '-';
 }
@@ -380,9 +463,35 @@ void SAMEDecoder::finish_burst_() {
 // CAPTURE (a burst is being decoded), a 'ZC'/'ZCZC' in the data stream is just
 // burst content and NEVER re-triggers sync - so an in-progress signal is never
 // interrupted, exactly as required.
+//
+// AB preamble correlator: we only accept ZCZC tiers after seeing a sufficient
+// run of 0xAB bytes (the official 16-byte preamble). This improves bit-phase
+// lock and reduces false triggers on noise.
 void SAMEDecoder::emit_bit_(bool bit) {
   if (this->phase_state_ == HUNT_SYNC) {
     this->sync_shift_ = (this->sync_shift_ >> 1) | ((uint32_t) (bit ? 1u : 0u) << 31);
+
+    // ---- AB preamble correlator (sliding 8-bit window looking for 0xAB) ----
+    // Accumulate bits into a byte; every 8 bits check against 0xAB.
+    static uint8_t ab_byte = 0;
+    static int ab_nbits = 0;
+    ab_byte = (ab_byte >> 1) | (bit ? 0x80 : 0);
+    ab_nbits++;
+    if (ab_nbits >= 8) {
+      ab_nbits = 0;
+      if (ab_byte == 0xAB) {
+        if (this->ab_match_count_ < 32) this->ab_match_count_++;
+      } else {
+        // Allow a little tolerance: decay rather than hard reset so a single
+        // bit error does not throw away the whole preamble run.
+        if (this->ab_match_count_ > 0) this->ab_match_count_--;
+      }
+    }
+
+    // Only arm the ZCZC hunters after we have seen enough of the AB preamble.
+    // This is the primary reliability improvement for acquisition.
+    if (!this->ab_preamble_ok_())
+      return;
 
     // Tier 1: full ZCZC, fuzzy Hamming <= 1.
     uint32_t diffbits = this->sync_shift_ ^ SYNC_ZCZC;
@@ -395,7 +504,6 @@ void SAMEDecoder::emit_bit_(bool bit) {
     // intact, which keeps false accepts low.
     bool t1b = false;
     if (!t1) {
-      // bytes: b0=first Z, b1=first C, b2=second Z, b3=second C (low->high)
       uint8_t b1 = (uint8_t) ((this->sync_shift_ >> 8) & 0xFF);
       uint8_t b3 = (uint8_t) ((this->sync_shift_ >> 24) & 0xFF);
       if (b1 == (uint8_t) 'C' && b3 == (uint8_t) 'C' && hamming <= 3)
@@ -425,7 +533,8 @@ void SAMEDecoder::emit_bit_(bool bit) {
       if (this->burst_idx_ == 0)
         this->fallback_sync_used_ = fb || t3 || t4;   // weaker tiers => treat as weak evidence
 
-      ESP_LOGD(TAG, "Sync acquired via %s. Byte-aligned capture starting.", tier);
+      ESP_LOGD(TAG, "Sync acquired via %s (AB matches=%d). Byte-aligned capture starting.",
+               tier, this->ab_match_count_);
       uint32_t p = this->sync_pending_.load(std::memory_order_relaxed);
       if (p < 8) this->sync_pending_.store(p + 1, std::memory_order_release);
       this->begin_new_capture_(preamble_len, fb);
@@ -433,6 +542,7 @@ void SAMEDecoder::emit_bit_(bool bit) {
     return;
   }
 
+  // ---- CAPTURE state ----
   this->cur_byte_ >>= 1;
   if (bit) this->cur_byte_ |= 0x80;
   this->cur_nbits_++;
@@ -443,6 +553,23 @@ void SAMEDecoder::emit_bit_(bool bit) {
   char c = (char) this->cur_byte_;
   this->cur_byte_ = 0;
   this->cur_nbits_ = 0;
+
+  // EOM (NNNN) detection while in CAPTURE or after a session.
+  // Four consecutive 'N' characters cleanly close the current session.
+  if (c == 'N') {
+    this->eom_n_count_++;
+    if (this->eom_n_count_ >= 4) {
+      ESP_LOGD(TAG, "EOM (NNNN) detected - closing session.");
+      if (this->burst_idx_ >= 1) {
+        // We have partial data; flush what we have.
+        this->vote_and_emit_(true, this->fallback_sync_used_);
+      }
+      this->reset_capture_();
+      return;
+    }
+  } else {
+    this->eom_n_count_ = 0;
+  }
 
   if (!is_valid_same_char(c)) {
     if (this->cur_burst_.size() >= 4) {
@@ -487,6 +614,39 @@ bool SAMEDecoder::header_is_strictly_valid_(const std::string &header) {
   return true;
 }
 
+bool SAMEDecoder::header_passes_semantic_(const SameAlert &a) const {
+  // Originator and event code must be exactly 3 characters
+  if (a.originator.size() != 3 || a.event_code.size() != 3)
+    return false;
+
+  // Prefer known event codes; unknown codes are still allowed but logged
+  // (the caller decides whether to treat them as weak).
+  // Area codes should look roughly like FIPS (6 digits) or be empty.
+  if (!a.areas_csv.empty()) {
+    // Quick sanity: each area token should be mostly digits
+    size_t digits = 0, total = 0;
+    for (char c : a.areas_csv) {
+      if (c == ',') continue;
+      total++;
+      if (c >= '0' && c <= '9') digits++;
+    }
+    if (total > 0 && (float) digits / (float) total < 0.7f)
+      return false;
+  }
+
+  // Timing field (if present) should contain digits and optional +
+  if (!a.timing.empty()) {
+    bool has_digit = false;
+    for (char c : a.timing) {
+      if (c >= '0' && c <= '9') has_digit = true;
+    }
+    if (!has_digit)
+      return false;
+  }
+
+  return true;
+}
+
 // Canonicalize the front of a voted header so it ALWAYS begins with "ZCZC-".
 // Weaker acquisition tiers may have seeded "ZC", "ZCZ", or "ZC-" as the front,
 // or dropped a boundary char. We locate the real body (originator field onward)
@@ -509,6 +669,10 @@ std::string SAMEDecoder::canonicalize_front_(const std::string &voted) {
   }
   std::string body = voted.substr(dash + 1);   // everything after the preamble's dash
   return std::string("ZCZC-") + body;
+}
+
+void SAMEDecoder::note_emit_() {
+  this->last_emit_ms_ = millis();
 }
 
 void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
@@ -548,12 +712,18 @@ void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
                sanitize_ascii(header).c_str());
       return;
     }
-    ESP_LOGI(TAG, "Weak-evidence emit accepted (structurally valid).");
   }
 
   SameAlert alert;
   if (!this->parse_header_(header, alert))
     return;
+
+  // Stronger semantic validation (requested improvement #6)
+  if (!this->header_passes_semantic_(alert)) {
+    ESP_LOGW(TAG, "Header failed semantic validation; discarding: '%s'",
+             sanitize_ascii(header).c_str());
+    return;
+  }
 
   if (!this->is_known_code_(alert.event_code)) {
     ESP_LOGW(TAG, "Unknown event code '%s' - firing as Unknown severity.", alert.event_code.c_str());
@@ -584,6 +754,7 @@ void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
   this->session_emitted_header_ = header;
   this->last_global_header_ = header;
   this->last_global_ms_ = now;
+  this->note_emit_();          // start post-emit dead-time
   this->publish_alert_(alert);
 }
 
