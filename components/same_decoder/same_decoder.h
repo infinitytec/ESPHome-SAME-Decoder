@@ -22,7 +22,7 @@ struct SameAlert {
   std::string originator;
   std::string status;
   std::string areas_csv;
-  std::string timing;        // valid-time + issue-time tail, e.g. "+0030-2780415"
+  std::string timing;
   std::string onset_iso;
   std::string expires_iso;
   std::string sender;
@@ -60,6 +60,9 @@ class SAMEDecoder : public Component {
 
   void feed_bytes(const std::vector<uint8_t> &data);
 
+  // Diagnostics: ms since the last feed_bytes() call (main-loop readable).
+  uint32_t ms_since_last_feed() const;
+
   std::string last_alert_id() const { return this->last_.id; }
   std::string last_event_code() const { return this->last_.event_code; }
   std::string last_event_name() const { return this->last_.event_name; }
@@ -76,6 +79,7 @@ class SAMEDecoder : public Component {
   void feed_sample_(int16_t s);
   void emit_bit_(bool bit);
   void rearm_sync_();
+  void reprime_detector_();
   void reset_capture_();
   void begin_new_capture_(bool fallback);
   void vote_and_emit_(bool from_timeout, bool fallback_synced);
@@ -123,7 +127,29 @@ class SAMEDecoder : public Component {
   std::string session_emitted_header_;
   std::string last_global_header_;
   uint32_t    last_global_ms_{0};
-  static constexpr uint32_t IMMEDIATE_DUP_MS = 3000;   // tight same-message spill guard
+  static constexpr uint32_t IMMEDIATE_DUP_MS = 3000;
+
+  // ---- Idle-recovery / detector re-priming ----
+  // After the board sits idle, the timing-recovery loop goes "cold" (stale
+  // phase_/w_off_, and the early/late gate has been chewing on near-silence).
+  // The first real message then needs a burst or two to re-converge, so its
+  // ZCZC preamble is missed and only a later repeat locks. We fix this by
+  // RE-PRIMING the detector to a clean state at any idle->active transition,
+  // detected two independent ways (robust to both failure shapes):
+  //   (1) FEED GAP: >FEED_GAP_MS wall-clock since the previous feed_bytes()
+  //       call (handles on_data actually pausing during idle).
+  //   (2) IDLE-ENERGY RISING EDGE: a slow envelope of |sample| sits below a
+  //       silence floor, then rises sharply (handles on_data continuing to
+  //       fire with quiet samples during idle).
+  // A re-prime is harmless if it fires at a quiet moment - it only resets
+  // timing state - so thresholds are deliberately loose.
+  std::atomic<uint32_t> last_feed_ms_{0};
+  static constexpr uint32_t FEED_GAP_MS = 250;      // feed pause => re-prime
+  float    env_slow_{0.0f};                          // slow |sample| envelope
+  static constexpr float ENV_ALPHA      = 0.0003f;   // envelope smoothing
+  static constexpr float ENV_SILENCE    = 200.0f;    // "idle" floor (pre-gain units approx)
+  static constexpr float ENV_RISE_MULT  = 4.0f;      // rising-edge multiple over floor
+  bool     was_idle_{true};                          // envelope-idle latch
 
   // ---- Timing / sampling ----
   static constexpr float SAMPLES_PER_BIT = 92.16f;
@@ -188,8 +214,6 @@ class SAMEDecoder : public Component {
   bool bursts_agree_(int count);
   bool early_emitted_{false};
 
-  // Fuzzy tolerance (fraction of differing chars) used only for ORG/EEE when
-  // deciding same-vs-new message. Area and timing are compared EXACTLY.
   static constexpr float FIELD_FUZZ = 0.20f;
 
   // ---- Header termination (structure-driven) ----
