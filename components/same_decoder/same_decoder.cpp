@@ -98,13 +98,12 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "  Sample rate: %" PRIu32 " Hz", this->sample_rate_);
   ESP_LOGCONFIG(TAG, "  Software gain: %.1f", this->gain_);
   ESP_LOGCONFIG(TAG, "  Soft-clip knee: %.0f (rail %.0f)", SOFT_KNEE, SAMPLE_MAX);
-  ESP_LOGCONFIG(TAG, "  Samples/bit: %.2f, Goertzel window: %d, ring: %d", SAMPLES_PER_BIT, GWIN, RINGLEN);
   ESP_LOGCONFIG(TAG, "  Timing loop: Kp=%.3f Ki=%.4f delta=%d conf_min=%.2f", TR_KP, TR_KI, TR_DELTA, TR_CONF_MIN);
-  ESP_LOGCONFIG(TAG, "  Sync fuzzy Hamming tolerance: %d bit(s)", SYNC_MAX_HAMMING);
-  ESP_LOGCONFIG(TAG, "  Early-emit: >=%d agreeing bursts (max mismatch %.0f%%)", MIN_BURSTS_TO_EMIT, BURST_MAX_MISMATCH * 100.0f);
-  ESP_LOGCONFIG(TAG, "  Single-burst emit: only if strictly valid, after >= %" PRIu32 " ms", SINGLE_BURST_MIN_MS);
+  ESP_LOGCONFIG(TAG, "  Sync: ZCZC fuzzy Hamming <= %d; fallback ZC- exact (Hamming 0)", SYNC_MAX_HAMMING);
+  ESP_LOGCONFIG(TAG, "  Collect all 3 bursts; early-emit at %d agreeing", MIN_BURSTS_TO_EMIT);
+  ESP_LOGCONFIG(TAG, "  Dedup on full voted header, window %" PRIu32 " ms (differing header = reissue)", DEDUP_WINDOW_MS);
+  ESP_LOGCONFIG(TAG, "  Single-burst emit: strictly valid only, after >= %" PRIu32 " ms", SINGLE_BURST_MIN_MS);
   ESP_LOGCONFIG(TAG, "  Burst timeout (>=2 bursts): %" PRIu32 " ms", this->timeout_ms_.load(std::memory_order_relaxed));
-  ESP_LOGCONFIG(TAG, "  Alert queue depth: %d, pending buffer max: %u", ALERT_Q_LEN, (unsigned) PENDING_MAX);
   ESP_LOGCONFIG(TAG, "  Alert triggers: %u, sync triggers: %u",
                 (unsigned) this->alert_triggers_.size(), (unsigned) this->sync_triggers_.size());
 }
@@ -121,9 +120,6 @@ void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
   }
 }
 
-// Effective timeout depends on how many bursts we have: a lone burst waits the
-// longer SINGLE_BURST_MIN_MS floor so real repeats can arrive first; >=2 bursts
-// use the normal (slider) timeout.
 static inline uint32_t effective_timeout(int burst_idx, uint32_t slider_ms, uint32_t single_min_ms) {
   if (burst_idx <= 1)
     return slider_ms > single_min_ms ? slider_ms : single_min_ms;
@@ -141,7 +137,7 @@ void SAMEDecoder::feed_sample_(int16_t s) {
       uint32_t to = effective_timeout(this->burst_idx_, this->timeout_ms_.load(std::memory_order_relaxed), SINGLE_BURST_MIN_MS);
       if ((uint32_t) (millis() - this->last_burst_ms_) >= to) {
         ESP_LOGD(TAG, "Burst timeout (%d burst(s), %" PRIu32 " ms): flushing.", this->burst_idx_, to);
-        this->vote_and_emit_(true);
+        this->vote_and_emit_(true, this->fallback_sync_used_);
         this->reset_capture_();
       }
     }
@@ -192,7 +188,7 @@ void SAMEDecoder::feed_sample_(int16_t s) {
     uint32_t to = effective_timeout(this->burst_idx_, this->timeout_ms_.load(std::memory_order_relaxed), SINGLE_BURST_MIN_MS);
     if ((uint32_t) (millis() - this->last_burst_ms_) >= to) {
       ESP_LOGD(TAG, "Burst timeout (%d burst(s), %" PRIu32 " ms): flushing.", this->burst_idx_, to);
-      this->vote_and_emit_(true);
+      this->vote_and_emit_(true, this->fallback_sync_used_);
       this->reset_capture_();
     }
   }
@@ -208,6 +204,8 @@ void SAMEDecoder::reset_capture_() {
   this->plus_seen_ = false;
   this->tail_count_ = 0;
   this->last_burst_ms_ = 0;
+  this->early_emitted_ = false;
+  this->fallback_sync_used_ = false;
   for (int i = 0; i < 3; i++) this->bursts_[i].clear();
 }
 
@@ -226,6 +224,12 @@ bool SAMEDecoder::bursts_agree_(int count) {
   return frac <= BURST_MAX_MISMATCH;
 }
 
+// Keep collecting all three bursts. Emit early once 2 agree (fast delivery) but
+// DO NOT reset - keep capturing burst 3 so the majority vote can improve. The
+// header-based dedup in vote_and_emit_ suppresses an identical re-vote and
+// RE-EMITS a corrected one. NOTE: early_emitted_ and fallback_sync_used_ are
+// NOT reset here - only reset_capture_ clears them, so they persist across the
+// bursts of one message.
 void SAMEDecoder::finish_burst_() {
   std::string hex;
   char tmp[4];
@@ -236,7 +240,8 @@ void SAMEDecoder::finish_burst_() {
   ESP_LOGD(TAG, "Burst %d ascii: '%s'", this->burst_idx_, sanitize_ascii(this->cur_burst_).c_str());
   ESP_LOGD(TAG, "Burst %d hex : %s", this->burst_idx_, hex.c_str());
 
-  this->bursts_[this->burst_idx_] = this->cur_burst_;
+  if (this->burst_idx_ < 3)
+    this->bursts_[this->burst_idx_] = this->cur_burst_;
   this->burst_idx_++;
   this->cur_burst_.clear();
   this->plus_seen_ = false;
@@ -244,18 +249,24 @@ void SAMEDecoder::finish_burst_() {
   this->last_burst_ms_ = millis();
 
   if (this->burst_idx_ >= 3) {
-    this->vote_and_emit_(false);
+    // Full set: final (best) vote. If it differs from the early emit, this
+    // reissues a correction; if identical, dedup suppresses it.
+    this->vote_and_emit_(false, this->fallback_sync_used_);
     this->reset_capture_();
-  } else if (this->burst_idx_ >= MIN_BURSTS_TO_EMIT && this->bursts_agree_(this->burst_idx_)) {
-    ESP_LOGD(TAG, "Early emit: %d agreeing bursts.", this->burst_idx_);
-    this->vote_and_emit_(false);
-    this->reset_capture_();
-  } else {
-    this->phase_state_ = HUNT_SYNC;
-    this->sync_shift_ = 0;
-    this->cur_byte_ = 0;
-    this->cur_nbits_ = 0;
+    return;
   }
+
+  if (this->burst_idx_ >= MIN_BURSTS_TO_EMIT && !this->early_emitted_ && this->bursts_agree_(this->burst_idx_)) {
+    ESP_LOGD(TAG, "Early emit: %d agreeing bursts (still collecting burst 3).", this->burst_idx_);
+    this->vote_and_emit_(false, this->fallback_sync_used_);
+    this->early_emitted_ = true;
+  }
+
+  // Continue collecting: hunt for the next repeat's preamble.
+  this->phase_state_ = HUNT_SYNC;
+  this->sync_shift_ = 0;
+  this->cur_byte_ = 0;
+  this->cur_nbits_ = 0;
 }
 
 void SAMEDecoder::emit_bit_(bool bit) {
@@ -264,8 +275,18 @@ void SAMEDecoder::emit_bit_(bool bit) {
 
     uint32_t diffbits = this->sync_shift_ ^ SYNC_ZCZC;
     int hamming = __builtin_popcount(diffbits);
-    if (hamming <= SYNC_MAX_HAMMING) {
-      ESP_LOGD(TAG, "ZCZC sync found (hamming=%d). Byte-aligned capture starting.", hamming);
+    bool primary = (hamming <= SYNC_MAX_HAMMING);
+
+    bool fallback = false;
+    if (!primary) {
+      fallback = ((this->sync_shift_ & MASK24) == SYNC_ZC_DASH_24);
+    }
+
+    if (primary || fallback) {
+      this->fallback_sync_used_ = fallback && !primary;
+      ESP_LOGD(TAG, "%s sync found%s. Byte-aligned capture starting.",
+               this->fallback_sync_used_ ? "Fallback ZC-" : "ZCZC",
+               this->fallback_sync_used_ ? " (first ZC assumed lost)" : "");
       uint32_t p = this->sync_pending_.load(std::memory_order_relaxed);
       if (p < 8) this->sync_pending_.store(p + 1, std::memory_order_release);
       this->phase_state_ = CAPTURE;
@@ -274,6 +295,8 @@ void SAMEDecoder::emit_bit_(bool bit) {
       this->cur_nbits_ = 0;
       this->plus_seen_ = false;
       this->tail_count_ = 0;
+      if (this->fallback_sync_used_)
+        this->cur_burst_ += '-';
     }
     return;
   }
@@ -327,22 +350,26 @@ void SAMEDecoder::emit_bit_(bool bit) {
   }
 }
 
-// Strict structural + known-code validity check for a single header string.
-// Used to gate single-burst emits (hybrid option c): a lone burst may only be
-// emitted if it is a complete, well-formed header AND its event code is known.
-// Per option (x), ANY known code qualifies (tests included).
 bool SAMEDecoder::header_is_strictly_valid_(const std::string &header) {
   if (header.rfind("ZCZC", 0) != 0) return false;
-  if (header.find('+') == std::string::npos) return false;   // must have the '+' tail marker
+  if (header.find('+') == std::string::npos) return false;
   SameAlert probe;
   if (!this->parse_header_(header, probe)) return false;
   if (probe.event_code.size() != 3) return false;
-  if (!this->is_known_code_(probe.event_code)) return false; // known code required
-  if (probe.originator.size() != 3) return false;            // ORG must be 3 chars
+  if (!this->is_known_code_(probe.event_code)) return false;
+  if (probe.originator.size() != 3) return false;
   return true;
 }
 
-void SAMEDecoder::vote_and_emit_(bool from_timeout) {
+// Vote across all collected bursts and emit, with strict gating + header dedup.
+//  from_timeout    : this emit was triggered by the collection timeout.
+//  fallback_synced : the capture began via the ZC- fallback (untrusted preamble).
+// STRICT GATE (weak evidence): a lone timeout burst OR any fallback-synced
+// capture must pass header_is_strictly_valid_.
+// DEDUP / REISSUE (option b): key on the FULL VOTED HEADER within
+// DEDUP_WINDOW_MS. Identical header -> suppress. DIFFERENT header (the 3-burst
+// consensus corrected the early 2-burst emit) -> RE-EMIT the correction.
+void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
   size_t maxlen = 0;
   for (int i = 0; i < 3; i++) maxlen = std::max(maxlen, this->bursts_[i].size());
   std::string voted;
@@ -367,27 +394,40 @@ void SAMEDecoder::vote_and_emit_(bool from_timeout) {
   }
   std::string header = voted.substr(z);
 
-  // Count how many bursts actually contributed to this vote.
   int collected = 0;
   for (int i = 0; i < 3; i++) if (!this->bursts_[i].empty()) collected++;
 
-  // Hybrid (c): if this emit is driven by a timeout with only ONE burst, apply
-  // the strict validity gate. A single burst is only trustworthy enough to emit
-  // if it is a complete, well-formed header with a known event code (option x:
-  // any known code, tests included). Multi-burst emits (voting/agreement) keep
-  // their existing behavior.
-  if (from_timeout && collected < 2) {
+  bool weak = (from_timeout && collected < 2) || fallback_synced;
+  if (weak) {
     if (!this->header_is_strictly_valid_(header)) {
-      ESP_LOGW(TAG, "Single-burst timeout emit rejected (failed strict validity): '%s'",
+      ESP_LOGW(TAG, "Weak-evidence emit rejected (failed strict validity): '%s'",
                sanitize_ascii(header).c_str());
       return;
     }
-    ESP_LOGI(TAG, "Single-burst emit accepted (strictly valid).");
+    ESP_LOGI(TAG, "Weak-evidence emit accepted (strictly valid).");
   }
 
   SameAlert alert;
-  if (this->parse_header_(header, alert))
-    this->publish_alert_(alert);
+  if (!this->parse_header_(header, alert))
+    return;
+
+  // Header-based dedup / reissue.
+  uint32_t now = millis();
+  bool within_window = (!this->last_emitted_header_.empty()) &&
+                       ((uint32_t) (now - this->last_emitted_ms_) <= DEDUP_WINDOW_MS);
+  if (within_window && this->last_emitted_header_ == header) {
+    ESP_LOGD(TAG, "Duplicate header suppressed (%s, within dedup window).", alert.event_code.c_str());
+    // Refresh the timestamp so a long repeat train keeps the window alive.
+    this->last_emitted_ms_ = now;
+    return;
+  }
+  if (within_window && this->last_emitted_header_ != header) {
+    ESP_LOGI(TAG, "New consensus differs from prior emit; reissuing corrected alert.");
+  }
+
+  this->last_emitted_header_ = header;
+  this->last_emitted_ms_ = now;
+  this->publish_alert_(alert);
 }
 
 bool SAMEDecoder::is_known_code_(const std::string &code) {
