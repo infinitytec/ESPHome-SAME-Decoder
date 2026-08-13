@@ -75,7 +75,7 @@ class SAMEDecoder : public Component {
   void feed_sample_(int16_t s);
   void emit_bit_(bool bit);
   void reset_capture_();
-  void vote_and_emit_(bool from_timeout);
+  void vote_and_emit_(bool from_timeout, bool fallback_synced);
   void finish_burst_();
 
   bool parse_header_(const std::string &header, SameAlert &out);
@@ -109,15 +109,23 @@ class SAMEDecoder : public Component {
   std::atomic<uint32_t> sync_pending_{0};
 
   // ---- Guaranteed alert delivery (survive brief API disconnects) ----
-  // api_connected_ is now driven by set_api_connected(), which the YAML calls
-  // periodically from the REAL api.connected condition (plus connect/disconnect
-  // triggers). This fixes the earlier bug where the flag stayed false at boot
-  // and every alert was wrongly buffered. On a false->true transition, loop()
-  // flushes any alerts buffered during the outage.
   bool api_connected_{false};
   std::atomic<bool> api_connected_changed_{false};
   static constexpr size_t PENDING_MAX = 16;
   std::vector<SameAlert> pending_;
+
+  // ---- Deduplication / reissue-on-new-consensus ----
+  // We KEEP COLLECTING all three bursts even after an early 2-burst emit so the
+  // extra burst can improve the majority vote. Dedup now keys on the FULL VOTED
+  // HEADER STRING (not just the alert ID). Within DEDUP_WINDOW_MS:
+  //   - identical voted header  -> suppress (it's the same message repeat)
+  //   - DIFFERENT voted header  -> RE-EMIT (the 3-burst consensus corrected the
+  //                                2-burst early emit; option (b) = reissue)
+  // This deliberately allows one real message to fire twice (original + a
+  // corrected reissue); downstream automations handle that.
+  std::string last_emitted_header_;
+  uint32_t    last_emitted_ms_{0};
+  static constexpr uint32_t DEDUP_WINDOW_MS = 12000;   // repeats within 12s = same message
 
   // ---- Timing / sampling ----
   static constexpr float SAMPLES_PER_BIT = 92.16f;
@@ -145,15 +153,9 @@ class SAMEDecoder : public Component {
   uint32_t samples_seen_{0};
 
   // ---- Burst-collection timeout ----
-  // timeout_ms_ is the runtime slider. But a SINGLE burst must wait LONGER than
-  // the normal slider value before it is allowed to emit alone (hybrid option
-  // c), so genuine 2nd/3rd repeats have time to arrive first and satisfy the
-  // 2-agreeing-bursts early-emit path. SINGLE_BURST_MIN_MS is that longer floor;
-  // the effective single-burst timeout is max(timeout_ms_, SINGLE_BURST_MIN_MS).
-  // With >=2 bursts collected, the normal timeout_ms_ applies as before.
   uint32_t last_burst_ms_{0};
   std::atomic<uint32_t> timeout_ms_{3000};
-  static constexpr uint32_t SINGLE_BURST_MIN_MS = 7000;   // lone burst waits >= 7s
+  static constexpr uint32_t SINGLE_BURST_MIN_MS = 7000;
 
   // ---- Sync / framing ----
   enum Phase { HUNT_SYNC, CAPTURE };
@@ -167,6 +169,13 @@ class SAMEDecoder : public Component {
       (static_cast<uint32_t>('Z'));
   static constexpr int SYNC_MAX_HAMMING = 1;
 
+  static constexpr uint32_t SYNC_ZC_DASH_24 =
+      (static_cast<uint32_t>('-') << 16) |
+      (static_cast<uint32_t>('C') << 8) |
+      (static_cast<uint32_t>('Z'));
+  static constexpr uint32_t MASK24 = 0x00FFFFFFu;
+  bool fallback_sync_used_{false};
+
   // ---- Byte / burst assembly ----
   uint8_t     cur_byte_{0};
   int         cur_nbits_{0};
@@ -179,6 +188,7 @@ class SAMEDecoder : public Component {
   static constexpr int MIN_BURSTS_TO_EMIT = 2;
   static constexpr float BURST_MAX_MISMATCH = 0.10f;
   bool bursts_agree_(int count);
+  bool early_emitted_{false};
 
   // ---- Header termination (structure-driven) ----
   bool  plus_seen_{false};
