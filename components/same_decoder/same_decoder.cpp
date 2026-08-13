@@ -16,8 +16,8 @@ namespace same_decoder {
 
 static const char *const TAG = "same_decoder";
 
-static constexpr float COEFF_MARK  = 1.926090f;   // 2*cos(2*pi*2083.33/48000)
-static constexpr float COEFF_SPACE = 1.958313f;   // 2*cos(2*pi*1562.5/48000)
+static constexpr float COEFF_MARK  = 1.926090f;
+static constexpr float COEFF_SPACE = 1.958313f;
 
 static std::string sanitize_ascii(const std::string &in) {
   std::string out;
@@ -49,9 +49,6 @@ static float goertzel_ring_end(const int16_t *ring, int ringlen, int endpos, int
   return s1 * s1 + s2 * s2 - coeff * s1 * s2;
 }
 
-// Soft clipper: linear below +-SOFT_KNEE, then smooth tanh compression up to
-// +-SAMPLE_MAX. Preserves AFSK tone shape when hardware PGA + software gain push
-// the signal hot, instead of hard-clipping into a square wave.
 float SAMEDecoder::soft_clip_(float v) {
   float a = std::fabs(v);
   if (a <= SOFT_KNEE)
@@ -67,12 +64,11 @@ void SAMEDecoder::setup() {
   this->reset_capture_();
 }
 
-// Called from YAML on api.on_client_connected / on_client_disconnected. Only
-// flips an atomic changed-flag + stores the desired state; the flush happens in
-// loop() to keep all Native API interaction on the loop thread.
 void SAMEDecoder::set_api_connected(bool connected) {
-  this->api_connected_ = connected;
-  this->api_connected_changed_.store(true, std::memory_order_release);
+  if (connected != this->api_connected_) {
+    this->api_connected_ = connected;
+    this->api_connected_changed_.store(true, std::memory_order_release);
+  }
 }
 
 void SAMEDecoder::loop() {
@@ -103,16 +99,14 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "  Software gain: %.1f", this->gain_);
   ESP_LOGCONFIG(TAG, "  Soft-clip knee: %.0f (rail %.0f)", SOFT_KNEE, SAMPLE_MAX);
   ESP_LOGCONFIG(TAG, "  Samples/bit: %.2f, Goertzel window: %d, ring: %d", SAMPLES_PER_BIT, GWIN, RINGLEN);
-  ESP_LOGCONFIG(TAG, "  Goertzel coeffs: mark=%.6f space=%.6f", COEFF_MARK, COEFF_SPACE);
   ESP_LOGCONFIG(TAG, "  Timing loop: Kp=%.3f Ki=%.4f delta=%d conf_min=%.2f", TR_KP, TR_KI, TR_DELTA, TR_CONF_MIN);
   ESP_LOGCONFIG(TAG, "  Sync fuzzy Hamming tolerance: %d bit(s)", SYNC_MAX_HAMMING);
   ESP_LOGCONFIG(TAG, "  Early-emit: >=%d agreeing bursts (max mismatch %.0f%%)", MIN_BURSTS_TO_EMIT, BURST_MAX_MISMATCH * 100.0f);
-  ESP_LOGCONFIG(TAG, "  Header end: dash>=%d, fallback>=%d chars after '+'", TAIL_MIN, TAIL_COMPLETE);
-  ESP_LOGCONFIG(TAG, "  Burst timeout: %" PRIu32 " ms", this->timeout_ms_.load(std::memory_order_relaxed));
-  ESP_LOGCONFIG(TAG, "  Alert queue depth: %d", ALERT_Q_LEN);
-  ESP_LOGCONFIG(TAG, "  Pending buffer max: %u alerts", (unsigned) PENDING_MAX);
-  ESP_LOGCONFIG(TAG, "  Alert triggers: %u", (unsigned) this->alert_triggers_.size());
-  ESP_LOGCONFIG(TAG, "  Sync triggers: %u", (unsigned) this->sync_triggers_.size());
+  ESP_LOGCONFIG(TAG, "  Single-burst emit: only if strictly valid, after >= %" PRIu32 " ms", SINGLE_BURST_MIN_MS);
+  ESP_LOGCONFIG(TAG, "  Burst timeout (>=2 bursts): %" PRIu32 " ms", this->timeout_ms_.load(std::memory_order_relaxed));
+  ESP_LOGCONFIG(TAG, "  Alert queue depth: %d, pending buffer max: %u", ALERT_Q_LEN, (unsigned) PENDING_MAX);
+  ESP_LOGCONFIG(TAG, "  Alert triggers: %u, sync triggers: %u",
+                (unsigned) this->alert_triggers_.size(), (unsigned) this->sync_triggers_.size());
 }
 
 void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
@@ -127,6 +121,15 @@ void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
   }
 }
 
+// Effective timeout depends on how many bursts we have: a lone burst waits the
+// longer SINGLE_BURST_MIN_MS floor so real repeats can arrive first; >=2 bursts
+// use the normal (slider) timeout.
+static inline uint32_t effective_timeout(int burst_idx, uint32_t slider_ms, uint32_t single_min_ms) {
+  if (burst_idx <= 1)
+    return slider_ms > single_min_ms ? slider_ms : single_min_ms;
+  return slider_ms;
+}
+
 void SAMEDecoder::feed_sample_(int16_t s) {
   this->ring_[this->ring_pos_] = s;
   this->ring_pos_ = (this->ring_pos_ + 1) % RINGLEN;
@@ -134,11 +137,13 @@ void SAMEDecoder::feed_sample_(int16_t s) {
 
   this->phase_ += (PHASE_INC + this->w_off_);
   if (this->phase_ < 1.0f) {
-    if (this->burst_idx_ >= 1 && this->burst_idx_ < 3 && this->last_burst_ms_ != 0 &&
-        (uint32_t) (millis() - this->last_burst_ms_) >= this->timeout_ms_.load(std::memory_order_relaxed)) {
-      ESP_LOGD(TAG, "Burst timeout: flushing %d partial burst(s).", this->burst_idx_);
-      this->vote_and_emit_();
-      this->reset_capture_();
+    if (this->burst_idx_ >= 1 && this->burst_idx_ < 3 && this->last_burst_ms_ != 0) {
+      uint32_t to = effective_timeout(this->burst_idx_, this->timeout_ms_.load(std::memory_order_relaxed), SINGLE_BURST_MIN_MS);
+      if ((uint32_t) (millis() - this->last_burst_ms_) >= to) {
+        ESP_LOGD(TAG, "Burst timeout (%d burst(s), %" PRIu32 " ms): flushing.", this->burst_idx_, to);
+        this->vote_and_emit_(true);
+        this->reset_capture_();
+      }
     }
     return;
   }
@@ -183,11 +188,13 @@ void SAMEDecoder::feed_sample_(int16_t s) {
 
   this->emit_bit_(bit);
 
-  if (this->burst_idx_ >= 1 && this->burst_idx_ < 3 && this->last_burst_ms_ != 0 &&
-      (uint32_t) (millis() - this->last_burst_ms_) >= this->timeout_ms_.load(std::memory_order_relaxed)) {
-    ESP_LOGD(TAG, "Burst timeout: flushing %d partial burst(s).", this->burst_idx_);
-    this->vote_and_emit_();
-    this->reset_capture_();
+  if (this->burst_idx_ >= 1 && this->burst_idx_ < 3 && this->last_burst_ms_ != 0) {
+    uint32_t to = effective_timeout(this->burst_idx_, this->timeout_ms_.load(std::memory_order_relaxed), SINGLE_BURST_MIN_MS);
+    if ((uint32_t) (millis() - this->last_burst_ms_) >= to) {
+      ESP_LOGD(TAG, "Burst timeout (%d burst(s), %" PRIu32 " ms): flushing.", this->burst_idx_, to);
+      this->vote_and_emit_(true);
+      this->reset_capture_();
+    }
   }
 }
 
@@ -237,11 +244,11 @@ void SAMEDecoder::finish_burst_() {
   this->last_burst_ms_ = millis();
 
   if (this->burst_idx_ >= 3) {
-    this->vote_and_emit_();
+    this->vote_and_emit_(false);
     this->reset_capture_();
   } else if (this->burst_idx_ >= MIN_BURSTS_TO_EMIT && this->bursts_agree_(this->burst_idx_)) {
-    ESP_LOGD(TAG, "Early emit: %d agreeing bursts (no need to wait for 3rd).", this->burst_idx_);
-    this->vote_and_emit_();
+    ESP_LOGD(TAG, "Early emit: %d agreeing bursts.", this->burst_idx_);
+    this->vote_and_emit_(false);
     this->reset_capture_();
   } else {
     this->phase_state_ = HUNT_SYNC;
@@ -320,7 +327,22 @@ void SAMEDecoder::emit_bit_(bool bit) {
   }
 }
 
-void SAMEDecoder::vote_and_emit_() {
+// Strict structural + known-code validity check for a single header string.
+// Used to gate single-burst emits (hybrid option c): a lone burst may only be
+// emitted if it is a complete, well-formed header AND its event code is known.
+// Per option (x), ANY known code qualifies (tests included).
+bool SAMEDecoder::header_is_strictly_valid_(const std::string &header) {
+  if (header.rfind("ZCZC", 0) != 0) return false;
+  if (header.find('+') == std::string::npos) return false;   // must have the '+' tail marker
+  SameAlert probe;
+  if (!this->parse_header_(header, probe)) return false;
+  if (probe.event_code.size() != 3) return false;
+  if (!this->is_known_code_(probe.event_code)) return false; // known code required
+  if (probe.originator.size() != 3) return false;            // ORG must be 3 chars
+  return true;
+}
+
+void SAMEDecoder::vote_and_emit_(bool from_timeout) {
   size_t maxlen = 0;
   for (int i = 0; i < 3; i++) maxlen = std::max(maxlen, this->bursts_[i].size());
   std::string voted;
@@ -343,10 +365,33 @@ void SAMEDecoder::vote_and_emit_() {
     ESP_LOGW(TAG, "Voted header missing ZCZC; discarding.");
     return;
   }
+  std::string header = voted.substr(z);
+
+  // Count how many bursts actually contributed to this vote.
+  int collected = 0;
+  for (int i = 0; i < 3; i++) if (!this->bursts_[i].empty()) collected++;
+
+  // Hybrid (c): if this emit is driven by a timeout with only ONE burst, apply
+  // the strict validity gate. A single burst is only trustworthy enough to emit
+  // if it is a complete, well-formed header with a known event code (option x:
+  // any known code, tests included). Multi-burst emits (voting/agreement) keep
+  // their existing behavior.
+  if (from_timeout && collected < 2) {
+    if (!this->header_is_strictly_valid_(header)) {
+      ESP_LOGW(TAG, "Single-burst timeout emit rejected (failed strict validity): '%s'",
+               sanitize_ascii(header).c_str());
+      return;
+    }
+    ESP_LOGI(TAG, "Single-burst emit accepted (strictly valid).");
+  }
 
   SameAlert alert;
-  if (this->parse_header_(voted.substr(z), alert))
+  if (this->parse_header_(header, alert))
     this->publish_alert_(alert);
+}
+
+bool SAMEDecoder::is_known_code_(const std::string &code) {
+  return SAME_EVENT_CODES.find(code) != SAME_EVENT_CODES.end();
 }
 
 std::string SAMEDecoder::describe_(const std::string &code) {
@@ -448,9 +493,6 @@ void SAMEDecoder::dispatch_alert_(const SameAlert &a) {
   this->deliver_or_buffer_(a);
 }
 
-// If the API is connected, fire the alert trigger now. If not, buffer the alert
-// so it survives a brief disconnect and is delivered on reconnect. The alert
-// trigger reads last_*, so set last_ before firing.
 void SAMEDecoder::deliver_or_buffer_(const SameAlert &a) {
   if (this->api_connected_) {
     this->last_ = a;
