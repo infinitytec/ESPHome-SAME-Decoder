@@ -33,6 +33,14 @@ class AlertTrigger : public Trigger<> {
   AlertTrigger() = default;
 };
 
+// Fires when a ZCZC preamble is acquired (a SAME burst has begun). Used as a
+// "signal detected / decode-in-progress" indicator. Marshalled to the main
+// loop thread (see loop()) so any Native API / light interaction is safe.
+class SyncTrigger : public Trigger<> {
+ public:
+  SyncTrigger() = default;
+};
+
 class SAMEDecoder : public Component {
  public:
   void setup() override;
@@ -48,6 +56,7 @@ class SAMEDecoder : public Component {
   void set_decode_count_sensor(sensor::Sensor *s) { this->decode_count_sensor_ = s; }
   void set_last_raw_sensor(text_sensor::TextSensor *s) { this->last_raw_sensor_ = s; }
   void register_alert_trigger(AlertTrigger *t) { this->alert_triggers_.push_back(t); }
+  void register_sync_trigger(SyncTrigger *t) { this->sync_triggers_.push_back(t); }
 
   void feed_bytes(const std::vector<uint8_t> &data);
 
@@ -82,6 +91,7 @@ class SAMEDecoder : public Component {
   sensor::Sensor *decode_count_sensor_{nullptr};
   text_sensor::TextSensor *last_raw_sensor_{nullptr};
   std::vector<AlertTrigger *> alert_triggers_;
+  std::vector<SyncTrigger *> sync_triggers_;
 
   SameAlert last_{};
   uint32_t decode_count_{0};
@@ -97,6 +107,13 @@ class SAMEDecoder : public Component {
   std::atomic<uint32_t> q_head_{0};   // consumer index (written by loop)
   std::atomic<uint32_t> q_tail_{0};   // producer index (written by mic_task)
 
+  // ---- Sync-detected hand-off (mic_task -> main loop) ----
+  // ZCZC acquisition happens on mic_task; the sync trigger must fire on the
+  // main loop. A single atomic "pending" counter is incremented on mic_task
+  // and drained (fired) in loop(). We only need edge notification, so a small
+  // saturating counter is sufficient and lock-free.
+  std::atomic<uint32_t> sync_pending_{0};
+
   // ---- Timing / sampling ----
   static constexpr float SAMPLES_PER_BIT = 92.16f;
   static constexpr float PHASE_INC       = 1.0f / 92.16f;   // 0.01085069 nominal
@@ -111,7 +128,7 @@ class SAMEDecoder : public Component {
   static constexpr int   TR_DELTA        = 12;             // early/late offset in samples
   static constexpr float TR_KP           = 0.06f;          // proportional phase gain
   static constexpr float TR_KI           = 0.0015f;        // integral rate gain
-  static constexpr float TR_CONF_MIN     = 0.25f;          // min confidence to adapt
+  static constexpr float TR_CONF_MIN     = 0.20f;          // min confidence to adapt (lowered for low-level captures)
   static constexpr float TR_DPHI_CLAMP   = 0.125f;         // max per-bit phase nudge (bit fraction)
   static constexpr float TR_WOFF_CLAMP   = 0.002f * PHASE_INC;  // max rate correction (+-0.2%)
   float   w_off_{0.0f};
@@ -125,7 +142,7 @@ class SAMEDecoder : public Component {
   // stops running and the timeout cannot fire - acceptable for a continuous
   // radio feed. timeout_ms_ is atomic so the main-loop slider can adjust it.
   uint32_t last_burst_ms_{0};
-  std::atomic<uint32_t> timeout_ms_{5000};
+  std::atomic<uint32_t> timeout_ms_{3000};
 
   // ---- Sync / framing ----
   enum Phase { HUNT_SYNC, CAPTURE };
@@ -145,6 +162,12 @@ class SAMEDecoder : public Component {
       (static_cast<uint32_t>('C') << 8) |
       (static_cast<uint32_t>('Z'));                          // == 0x435A435A
 
+  // Fuzzy ZCZC match tolerance: accept the preamble if the rolling 32-bit
+  // window is within this Hamming distance of the ideal SYNC_ZCZC pattern.
+  // 1 tolerates a single flipped bit in the preamble so a marginally-clipped
+  // or noisy first burst still acquires. Kept small to bound false-sync risk.
+  static constexpr int SYNC_MAX_HAMMING = 1;
+
   // ---- Byte / burst assembly ----
   uint8_t     cur_byte_{0};
   int         cur_nbits_{0};
@@ -152,6 +175,19 @@ class SAMEDecoder : public Component {
   std::string bursts_[3];
   int         burst_idx_{0};
   static constexpr int MAX_HEADER_BYTES = 268;
+
+  // ---- Early-emit on agreeing bursts ----
+  // A full SAME message repeats the header 3x so a receiver can majority-vote.
+  // If the first repeat is clipped/lost (common on trimmed test files), only 2
+  // bursts arrive and, on a file feed, the mic_task timeout cannot fire once
+  // audio ends - so the two good bursts would be discarded. To fix this we
+  // emit as soon as 2 collected bursts agree closely (below the mismatch
+  // ceiling), rather than always waiting for the 3rd. 3 bursts still vote as
+  // before. This preserves the majority-vote guarantee while recovering
+  // otherwise-lost 2-burst decodes.
+  static constexpr int MIN_BURSTS_TO_EMIT = 2;              // emit once this many agree
+  static constexpr float BURST_MAX_MISMATCH = 0.10f;        // <=10% differing chars = "agree"
+  bool bursts_agree_(int count);
 
   // ---- Header termination (structure-driven) ----
   // A ZCZC header ends at the trailing '-' after the fixed tail
