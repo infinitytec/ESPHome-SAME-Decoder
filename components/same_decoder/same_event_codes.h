@@ -82,6 +82,7 @@ static const std::map<std::string, EventInfo> SAME_EVENT_CODES = {
   {"RHW", {"Radiological Hazard Warning",   "Extreme",  true }},
   {"SPW", {"Shelter in Place Warning",      "Severe",   true }},
   {"VOW", {"Volcano Warning",               "Severe",   true }},
+  {"NEM". {"National Emergency Message",    "Severe",   true }},
 
   // ---- Administrative (tests default OFF where applicable) ----
   {"ADR", {"Administrative Message",        "Minor",    true  }},
