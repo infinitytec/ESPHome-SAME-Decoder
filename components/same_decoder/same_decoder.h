@@ -149,7 +149,7 @@ class SAMEDecoder : public Component {
   static constexpr float ENV_RISE_MULT = 4.0f;
   bool was_idle_{true};
   uint32_t idle_edge_samples_{0};
-  static constexpr uint32_t IDLE_EDGE_SAMPLES = 48000;
+  static constexpr uint32_t IDLE_EDGE_SAMPLES = 0x7fffffff;  // always armed
 
   // Dynamic timing / Goertzel
   float samples_per_bit_{92.16f};
