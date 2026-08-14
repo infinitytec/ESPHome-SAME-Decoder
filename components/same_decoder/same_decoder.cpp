@@ -94,7 +94,7 @@ void SAMEDecoder::update_agc_(float mag) {
 
 void SAMEDecoder::setup() {
   this->compute_coeffs_();
-  ESP_LOGCONFIG(TAG, "SAME decoder ready (gain=%.1f, agc=%s, ab_req=%s).",
+  ESP_LOGCONFIG(TAG, "SAME decoder ready (ALWAYS WARM, gain=%.1f, agc=%s, ab_req=%s).",
                 this->gain_,
                 this->agc_enable_ ? "on" : "off",
                 this->ab_required_ ? "on" : "off");
@@ -136,7 +136,7 @@ void SAMEDecoder::loop() {
 }
 
 void SAMEDecoder::dump_config() {
-  ESP_LOGCONFIG(TAG, "SAME Decoder:");
+  ESP_LOGCONFIG(TAG, "SAME Decoder (ALWAYS WARM):");
   ESP_LOGCONFIG(TAG, "  Sample rate: %" PRIu32 " Hz", this->sample_rate_);
   ESP_LOGCONFIG(TAG, "  Base gain: %.1f  AGC: %s", this->gain_, this->agc_enable_ ? "on" : "off");
   ESP_LOGCONFIG(TAG, "  Freq offset: %.1f Hz", this->freq_offset_hz_);
@@ -151,7 +151,8 @@ void SAMEDecoder::dump_config() {
 }
 
 void SAMEDecoder::reprime_detector_() {
-  ESP_LOGD(TAG, "Idle->active: re-priming detector.");
+  // Still available for explicit clean-up, but no longer required for acquisition.
+  ESP_LOGD(TAG, "Re-priming detector (explicit).");
   this->reset_capture_();
   for (int i = 0; i < RINGLEN; i++) this->ring_[i] = 0;
   this->ring_pos_ = 0;
@@ -168,8 +169,12 @@ void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
   uint32_t now = millis();
   uint32_t prev = this->last_feed_ms_.exchange(now, std::memory_order_relaxed);
   if (prev != 0 && (uint32_t) (now - prev) >= FEED_GAP_MS) {
-    this->reprime_detector_();
-    this->idle_edge_samples_ = IDLE_EDGE_SAMPLES;
+    // Long gap in audio feed – gentle clean is still useful
+    this->w_off_ = 0.0f;
+    this->phase_ = 0.0f;
+    this->ab_byte_ = 0;
+    this->ab_nbits_ = 0;
+    this->ab_match_count_ = 0;
   }
 
   const size_t n = data.size() / 2;
@@ -195,20 +200,18 @@ void SAMEDecoder::feed_sample_(int16_t s) {
   float mag = std::fabs((float) s);
   this->update_agc_(mag);
 
+  // Envelope tracking kept only for optional future use / diagnostics.
+  // It no longer gates acquisition.
   this->env_slow_ += ENV_ALPHA * (mag - this->env_slow_);
   if (this->was_idle_) {
-    if (mag > ENV_SILENCE * ENV_RISE_MULT) {
+    if (mag > ENV_SILENCE * ENV_RISE_MULT)
       this->was_idle_ = false;
-      this->reprime_detector_();
-      this->idle_edge_samples_ = IDLE_EDGE_SAMPLES;
-    }
   } else {
     if (this->env_slow_ < ENV_SILENCE)
       this->was_idle_ = true;
   }
-  if (this->idle_edge_samples_ > 0) this->idle_edge_samples_--;
 
-  // Post-emit dead-time
+  // Post-emit dead-time (still useful to avoid gluing a late burst)
   if (this->last_emit_ms_ != 0 &&
       (uint32_t) (millis() - this->last_emit_ms_) < this->post_emit_dead_ms_) {
     return;
@@ -217,6 +220,13 @@ void SAMEDecoder::feed_sample_(int16_t s) {
   this->ring_[this->ring_pos_] = s;
   this->ring_pos_ = (this->ring_pos_ + 1) % RINGLEN;
   if (this->samples_seen_ < 0x7fffffff) this->samples_seen_++;
+
+  // Gentle continuous decay of timing offset while hunting.
+  // Keeps the detector "warm" without letting residual drift accumulate over weeks.
+  if (this->phase_state_ == HUNT_SYNC) {
+    this->w_off_ *= 0.9997f;          // very slow decay toward zero
+    if (std::fabs(this->w_off_) < 1e-8f) this->w_off_ = 0.0f;
+  }
 
   this->phase_ += (this->phase_inc_ + this->w_off_);
   if (this->phase_ < 1.0f) {
@@ -416,7 +426,7 @@ void SAMEDecoder::emit_bit_(bool bit) {
   if (this->phase_state_ == HUNT_SYNC) {
     this->sync_shift_ = (this->sync_shift_ >> 1) | ((uint32_t) (bit ? 1u : 0u) << 31);
 
-    // AB correlator (only used when ab_required_ is true)
+    // AB correlator (optional)
     this->ab_byte_ = (this->ab_byte_ >> 1) | (bit ? 0x80 : 0);
     this->ab_nbits_++;
     if (this->ab_nbits_ >= 8) {
@@ -428,10 +438,10 @@ void SAMEDecoder::emit_bit_(bool bit) {
       }
     }
 
-    // Gate only when explicitly enabled
     if (this->ab_required_ && !this->ab_preamble_ok_())
       return;
 
+    // ---- ALWAYS WARM: all tiers available at all times ----
     uint32_t diffbits = this->sync_shift_ ^ SYNC_ZCZC;
     int hamming = __builtin_popcount(diffbits);
     bool t1 = (hamming <= SYNC_MAX_HAMMING);
@@ -447,8 +457,8 @@ void SAMEDecoder::emit_bit_(bool bit) {
     bool t2 = ((this->sync_shift_ & MASK24) == SYNC_ZC_DASH_24);
     bool t3 = ((this->sync_shift_ & MASK24) == SYNC_CZC_24) ||
               ((this->sync_shift_ & MASK24) == SYNC_ZCZ_24);
-    bool t4 = (this->idle_edge_samples_ > 0) &&
-              ((this->sync_shift_ & MASK16) == SYNC_ZC_16);
+    // Tier-4 now always available (IDLE_EDGE_SAMPLES set to max in header)
+    bool t4 = ((this->sync_shift_ & MASK16) == SYNC_ZC_16);
 
     if (t1 || t1b || t2 || t3 || t4) {
       int preamble_len;
@@ -457,7 +467,7 @@ void SAMEDecoder::emit_bit_(bool bit) {
       if (t1 || t1b) { preamble_len = 4; tier = t1 ? "ZCZC" : "ZCZC(misread)"; }
       else if (t2)   { preamble_len = 2; fb = true; tier = "ZC- fallback"; }
       else if (t3)   { preamble_len = 3; tier = "CZC/ZCZ clip"; }
-      else           { preamble_len = 2; tier = "ZC idle-edge"; }
+      else           { preamble_len = 2; tier = "ZC always-warm"; }
 
       if (this->burst_idx_ == 0)
         this->fallback_sync_used_ = fb || t3 || t4;
@@ -539,7 +549,6 @@ bool SAMEDecoder::header_is_strictly_valid_(const std::string &header) {
 bool SAMEDecoder::header_passes_semantic_(const SameAlert &a) const {
   if (a.originator.size() != 3 || a.event_code.size() != 3)
     return false;
-  // Area / timing checks are advisory only
   return true;
 }
 
@@ -557,18 +566,15 @@ std::string SAMEDecoder::canonicalize_front_(const std::string &voted) {
 
 void SAMEDecoder::note_emit_() {
   this->last_emit_ms_ = millis();
-  // Light recovery after every successful emit (including single-burst timeout).
-  // Clears timing offset and AB state so the next header is acquired with a
-  // fresh bit clock.  Does NOT wipe the sample ring (that would discard useful
-  // residual audio).  Also re-opens a short idle-edge window so Tier-4 remains
-  // available for a weak follow-up message.
+  // Light clean after emit – still useful so a late third burst does not
+  // contaminate the next real message. Timing offset and AB state are reset;
+  // the detector remains fully armed (always warm).
   this->w_off_ = 0.0f;
   this->phase_ = 0.0f;
   this->ab_byte_ = 0;
   this->ab_nbits_ = 0;
   this->ab_match_count_ = 0;
   this->eom_n_count_ = 0;
-  this->idle_edge_samples_ = IDLE_EDGE_SAMPLES / 4;   // ~0.25 s at 48 kHz
 }
 
 void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
