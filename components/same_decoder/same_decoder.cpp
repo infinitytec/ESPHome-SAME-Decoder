@@ -1,5 +1,5 @@
 // components/same_decoder/same_decoder.cpp
-// ALWAYS-WARM (protected) + strong post-emit recovery
+// T0 preamble-lock (PRIMARY) + ALWAYS-WARM tiers + strong post-emit recovery
 #include "same_decoder.h"
 #include "same_event_codes.h"
 #include "esphome/core/log.h"
@@ -95,11 +95,13 @@ void SAMEDecoder::update_agc_(float mag) {
 
 void SAMEDecoder::setup() {
   this->compute_coeffs_();
-  ESP_LOGCONFIG(TAG, "SAME decoder ready (ALWAYS-WARM + strong post-emit recovery, gain=%.1f, agc=%s, ab_req=%s).",
+  ESP_LOGCONFIG(TAG, "SAME decoder ready (T0 preamble-lock=%s + ALWAYS-WARM tiers, gain=%.1f, agc=%s, ab_req=%s).",
+                this->preamble_lock_ ? "on" : "off",
                 this->gain_,
                 this->agc_enable_ ? "on" : "off",
                 this->ab_required_ ? "on" : "off");
   this->reset_capture_();
+  this->reset_preamble_detector_();
   this->last_feed_ms_.store(millis(), std::memory_order_relaxed);
 }
 
@@ -127,6 +129,13 @@ void SAMEDecoder::loop() {
     pending--;
   }
 
+  uint32_t eom = this->eom_pending_.exchange(0, std::memory_order_acq_rel);
+  while (eom > 0) {
+    for (auto *t : this->eom_triggers_)
+      t->trigger();
+    eom--;
+  }
+
   uint32_t head = this->q_head_.load(std::memory_order_relaxed);
   while (head != this->q_tail_.load(std::memory_order_acquire)) {
     SameAlert a = this->alert_queue_[head];
@@ -137,18 +146,24 @@ void SAMEDecoder::loop() {
 }
 
 void SAMEDecoder::dump_config() {
-  ESP_LOGCONFIG(TAG, "SAME Decoder (ALWAYS-WARM + strong post-emit recovery):");
+  ESP_LOGCONFIG(TAG, "SAME Decoder (T0 preamble-lock + ALWAYS-WARM tiers):");
   ESP_LOGCONFIG(TAG, "  Sample rate: %" PRIu32 " Hz", this->sample_rate_);
   ESP_LOGCONFIG(TAG, "  Base gain: %.1f  AGC: %s", this->gain_, this->agc_enable_ ? "on" : "off");
   ESP_LOGCONFIG(TAG, "  Freq offset: %.1f Hz", this->freq_offset_hz_);
   ESP_LOGCONFIG(TAG, "  Samples/bit: %.2f  Goertzel window: %d", this->samples_per_bit_, GWIN);
   ESP_LOGCONFIG(TAG, "  Coeffs mark=%.6f space=%.6f", this->coeff_mark_, this->coeff_space_);
+  ESP_LOGCONFIG(TAG, "  T0 preamble lock: %s (min density %.2f, min bits %" PRIu32 ", acq gain %.1f)",
+                this->preamble_lock_ ? "on" : "off",
+                this->preamble_min_density_.load(std::memory_order_relaxed),
+                this->preamble_min_bits_.load(std::memory_order_relaxed),
+                this->preamble_acq_gain_.load(std::memory_order_relaxed));
   ESP_LOGCONFIG(TAG, "  AB preamble required: %s (min match %d)", this->ab_required_ ? "yes" : "no", AB_MIN_MATCH);
   ESP_LOGCONFIG(TAG, "  Timeout (>=2 bursts): %" PRIu32 " ms", this->timeout_ms_.load(std::memory_order_relaxed));
   ESP_LOGCONFIG(TAG, "  Single-burst min: %" PRIu32 " ms", this->single_burst_min_ms_);
   ESP_LOGCONFIG(TAG, "  Post-emit dead-time: %" PRIu32 " ms", this->post_emit_dead_ms_);
-  ESP_LOGCONFIG(TAG, "  Alert triggers: %u  sync triggers: %u",
-                (unsigned) this->alert_triggers_.size(), (unsigned) this->sync_triggers_.size());
+  ESP_LOGCONFIG(TAG, "  Alert triggers: %u  sync triggers: %u  eom triggers: %u",
+                (unsigned) this->alert_triggers_.size(), (unsigned) this->sync_triggers_.size(),
+                (unsigned) this->eom_triggers_.size());
 }
 
 void SAMEDecoder::reprime_detector_() {
@@ -163,7 +178,99 @@ void SAMEDecoder::reprime_detector_() {
   this->ab_nbits_ = 0;
   this->ab_match_count_ = 0;
   this->eom_n_count_ = 0;
+  this->reset_preamble_detector_();
 }
+
+// ---- T0 preamble lock ---------------------------------------------------
+
+void SAMEDecoder::reset_preamble_detector_() {
+  for (int i = 0; i < PRE_WIN; i++) this->pre_hist_[i] = 0;
+  this->pre_hist_pos_ = 0;
+  this->pre_trans_count_ = 0;
+  this->pre_fill_ = 0;
+  this->pre_have_last_ = false;
+  this->pre_last_bit_ = false;
+  this->pre_run_bits_ = 0;
+  this->preamble_locked_ = false;
+}
+
+// Phase-independent preamble detector. Called for every demodulated bit while
+// hunting. Measures transition density over a sliding window; a 0xAB tone is
+// near-alternating, so density -> ~1.0. Tolerates dropped/mistimed bytes because
+// it never assumes byte alignment.
+void SAMEDecoder::update_preamble_detector_(bool bit) {
+  if (!this->preamble_lock_)
+    return;
+
+  uint8_t trans = 0;
+  if (this->pre_have_last_)
+    trans = (bit != this->pre_last_bit_) ? 1 : 0;
+  this->pre_last_bit_ = bit;
+  this->pre_have_last_ = true;
+
+  // Slide the window: subtract the leaving flag, add the entering flag.
+  this->pre_trans_count_ -= this->pre_hist_[this->pre_hist_pos_];
+  this->pre_hist_[this->pre_hist_pos_] = trans;
+  this->pre_trans_count_ += trans;
+  this->pre_hist_pos_ = (this->pre_hist_pos_ + 1) % PRE_WIN;
+  if (this->pre_fill_ < PRE_WIN) this->pre_fill_++;
+
+  // Need a reasonably full window before trusting density.
+  if (this->pre_fill_ < 16)
+    return;
+
+  float density = (float) this->pre_trans_count_ / (float) this->pre_fill_;
+  float min_density = this->preamble_min_density_.load(std::memory_order_relaxed);
+  uint32_t min_bits = this->preamble_min_bits_.load(std::memory_order_relaxed);
+
+  if (density >= min_density) {
+    if (this->pre_run_bits_ < 0x7fffffff) this->pre_run_bits_++;
+    if (!this->preamble_locked_ && this->pre_run_bits_ >= min_bits) {
+      this->enter_preamble_lock_();
+    }
+  } else {
+    // A brief dropout shouldn't instantly kill the run: allow a little slack so
+    // a few missed/mistimed 0xAB bytes don't break the lock.
+    if (this->pre_run_bits_ >= 4)
+      this->pre_run_bits_ -= 4;
+    else
+      this->pre_run_bits_ = 0;
+  }
+}
+
+// T0 fires: we've positively identified a preamble tone. Reset the PLL cleanly
+// and enter fast-acquire so the bit clock converges on the AB run *before* ZCZC.
+void SAMEDecoder::enter_preamble_lock_() {
+  this->preamble_locked_ = true;
+  ESP_LOGD(TAG, "T0 preamble lock (density>=%.2f over %" PRIu32 " bits). Priming clock.",
+           this->preamble_min_density_.load(std::memory_order_relaxed),
+           this->pre_run_bits_);
+
+  // Clean PLL start so the alternating tone drives convergence, not stale noise.
+  this->phase_ = 0.0f;
+  this->w_off_ = 0.0f;
+
+  // Enter fast-acquire: temporarily boost timing-loop authority for a short bit
+  // budget, then fall back to normal tracking gains.
+  this->fast_acquire_ = true;
+  this->fast_acquire_bits_left_ = FAST_ACQUIRE_BITS;
+
+  // Earliest possible user feedback: light the decode LED at the preamble.
+  this->fire_sync_once_();
+}
+
+// Debounced sync fire: one on_sync per acquisition, not once per preamble byte.
+void SAMEDecoder::fire_sync_once_() {
+  uint32_t p = this->sync_pending_.load(std::memory_order_relaxed);
+  if (p < 8) this->sync_pending_.store(p + 1, std::memory_order_release);
+}
+
+void SAMEDecoder::fire_eom_() {
+  uint32_t p = this->eom_pending_.load(std::memory_order_relaxed);
+  if (p < 8) this->eom_pending_.store(p + 1, std::memory_order_release);
+}
+
+// -------------------------------------------------------------------------
 
 void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
   uint32_t now = millis();
@@ -269,14 +376,29 @@ void SAMEDecoder::feed_sample_(int16_t s) {
     float conf  = d_center / (e_center + eps);
     float e = (conf >= TR_CONF_MIN) ? e_raw : 0.0f;
 
-    float dphi = TR_KP * e;
+    // ---- T0 fast-acquire: boost loop authority briefly after preamble lock ----
+    float kp = TR_KP;
+    float ki = TR_KI;
+    float woff_clamp = this->tr_woff_clamp_;
+    if (this->fast_acquire_) {
+      float g = this->preamble_acq_gain_.load(std::memory_order_relaxed);
+      kp *= g;
+      ki *= g;
+      woff_clamp *= g;   // allow a wider pull-in range while acquiring
+      if (this->fast_acquire_bits_left_ > 0)
+        this->fast_acquire_bits_left_--;
+      if (this->fast_acquire_bits_left_ == 0)
+        this->fast_acquire_ = false;
+    }
+
+    float dphi = kp * e;
     if (dphi >  TR_DPHI_CLAMP) dphi =  TR_DPHI_CLAMP;
     if (dphi < -TR_DPHI_CLAMP) dphi = -TR_DPHI_CLAMP;
     this->phase_ += dphi;
 
-    this->w_off_ += TR_KI * e;
-    if (this->w_off_ >  this->tr_woff_clamp_) this->w_off_ =  this->tr_woff_clamp_;
-    if (this->w_off_ < -this->tr_woff_clamp_) this->w_off_ = -this->tr_woff_clamp_;
+    this->w_off_ += ki * e;
+    if (this->w_off_ >  woff_clamp) this->w_off_ =  woff_clamp;
+    if (this->w_off_ < -woff_clamp) this->w_off_ = -woff_clamp;
   }
 
   this->emit_bit_(bit);
@@ -326,6 +448,7 @@ bool SAMEDecoder::ab_preamble_ok_() const {
 
 void SAMEDecoder::begin_new_capture_(int preamble_len, bool fallback) {
   this->phase_state_ = CAPTURE;
+  this->reset_preamble_detector_();   // T0: clear tone tracker on capture start
   if (preamble_len >= 4)
     this->cur_burst_ = "ZCZC";
   else if (preamble_len == 3)
@@ -424,6 +547,9 @@ void SAMEDecoder::finish_burst_() {
 
 void SAMEDecoder::emit_bit_(bool bit) {
   if (this->phase_state_ == HUNT_SYNC) {
+    // ---- T0: feed the phase-independent preamble detector every hunt bit ----
+    this->update_preamble_detector_(bit);
+
     this->sync_shift_ = (this->sync_shift_ >> 1) | ((uint32_t) (bit ? 1u : 0u) << 31);
 
     this->ab_byte_ = (this->ab_byte_ >> 1) | (bit ? 0x80 : 0);
@@ -473,9 +599,13 @@ void SAMEDecoder::emit_bit_(bool bit) {
       if (this->burst_idx_ == 0)
         this->fallback_sync_used_ = fb || t3 || t4;
 
-      ESP_LOGD(TAG, "Sync via %s (AB=%d). Capture start.", tier, this->ab_match_count_);
-      uint32_t p = this->sync_pending_.load(std::memory_order_relaxed);
-      if (p < 8) this->sync_pending_.store(p + 1, std::memory_order_release);
+      ESP_LOGD(TAG, "Sync via %s (AB=%d, T0=%s). Capture start.",
+               tier, this->ab_match_count_, this->preamble_locked_ ? "locked" : "no");
+
+      // If T0 already lit the LED for this acquisition, don't double-fire on_sync.
+      if (!this->preamble_locked_)
+        this->fire_sync_once_();
+
       this->begin_new_capture_(preamble_len, fb);
     }
     return;
@@ -496,9 +626,10 @@ void SAMEDecoder::emit_bit_(bool bit) {
   if (c == 'N') {
     this->eom_n_count_++;
     if (this->eom_n_count_ >= 4) {
-      ESP_LOGD(TAG, "EOM (NNNN) – closing session.");
+      ESP_LOGD(TAG, "EOM (NNNN) - closing session.");
       if (this->burst_idx_ >= 1)
         this->vote_and_emit_(true, this->fallback_sync_used_);
+      this->fire_eom_();          // LED off immediately: message is over
       this->reset_capture_();
       return;
     }
@@ -575,6 +706,11 @@ void SAMEDecoder::note_emit_() {
   this->ab_nbits_ = 0;
   this->ab_match_count_ = 0;
   this->eom_n_count_ = 0;
+
+  // 1b. Clear T0 preamble detector so the next preamble (e.g. EOM) locks clean.
+  this->reset_preamble_detector_();
+  this->fast_acquire_ = false;
+  this->fast_acquire_bits_left_ = 0;
 
   // 2. Zero the entire sample ring so residual audio from the previous
   //    message cannot contaminate the next preamble.
