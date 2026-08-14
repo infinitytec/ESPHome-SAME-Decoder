@@ -40,6 +40,11 @@ class SyncTrigger : public Trigger<> {
   SyncTrigger() = default;
 };
 
+class EomTrigger : public Trigger<> {
+ public:
+  EomTrigger() = default;
+};
+
 class SAMEDecoder : public Component {
  public:
   void setup() override;
@@ -60,10 +65,18 @@ class SAMEDecoder : public Component {
   void set_single_burst_min_ms(uint32_t v) { this->single_burst_min_ms_ = v; }
   void set_post_emit_dead_ms(uint32_t v) { this->post_emit_dead_ms_ = v; }
   void set_ab_required(bool v) { this->ab_required_ = v; }
+
+  // ---- T0 preamble lock ----
+  void set_preamble_lock(bool v) { this->preamble_lock_ = v; }
+  void set_preamble_min_density(float v) { this->preamble_min_density_.store(v, std::memory_order_relaxed); }
+  void set_preamble_min_bits(uint32_t v) { this->preamble_min_bits_.store(v, std::memory_order_relaxed); }
+  void set_preamble_acq_gain(float v) { this->preamble_acq_gain_.store(v, std::memory_order_relaxed); }
+
   void set_decode_count_sensor(sensor::Sensor *s) { this->decode_count_sensor_ = s; }
   void set_last_raw_sensor(text_sensor::TextSensor *s) { this->last_raw_sensor_ = s; }
   void register_alert_trigger(AlertTrigger *t) { this->alert_triggers_.push_back(t); }
   void register_sync_trigger(SyncTrigger *t) { this->sync_triggers_.push_back(t); }
+  void register_eom_trigger(EomTrigger *t) { this->eom_triggers_.push_back(t); }
 
   void set_api_connected(bool connected);
   void feed_bytes(const std::vector<uint8_t> &data);
@@ -95,6 +108,13 @@ class SAMEDecoder : public Component {
   bool ab_preamble_ok_() const;
   void note_emit_();
 
+  // ---- T0 preamble lock helpers ----
+  void update_preamble_detector_(bool bit);
+  void enter_preamble_lock_();
+  void reset_preamble_detector_();
+  void fire_sync_once_();
+  void fire_eom_();
+
   bool parse_header_(const std::string &header, SameAlert &out);
   bool header_is_strictly_valid_(const std::string &header);
   bool header_passes_semantic_(const SameAlert &a) const;
@@ -117,6 +137,7 @@ class SAMEDecoder : public Component {
   text_sensor::TextSensor *last_raw_sensor_{nullptr};
   std::vector<AlertTrigger *> alert_triggers_;
   std::vector<SyncTrigger *> sync_triggers_;
+  std::vector<EomTrigger *> eom_triggers_;
 
   SameAlert last_{};
   uint32_t decode_count_{0};
@@ -127,6 +148,7 @@ class SAMEDecoder : public Component {
   std::atomic<uint32_t> q_head_{0};
   std::atomic<uint32_t> q_tail_{0};
   std::atomic<uint32_t> sync_pending_{0};
+  std::atomic<uint32_t> eom_pending_{0};
 
   // API offline buffering
   bool api_connected_{false};
@@ -188,6 +210,28 @@ class SAMEDecoder : public Component {
   float tr_woff_clamp_{0.002f * (1.0f / 92.16f)};
   float w_off_{0.0f};
   uint32_t samples_seen_{0};
+
+  // ---- T0 preamble lock (PRIMARY acquisition) ----
+  // Phase-independent detector: measures bit-transition density over a sliding
+  // window. A real 0xAB preamble is a near-alternating tone, so its transition
+  // density approaches 1.0. This is immune to byte misalignment and tolerates
+  // both dropped and mistimed 0xAB bytes.
+  bool preamble_lock_{true};
+  std::atomic<float>    preamble_min_density_{0.75f};
+  std::atomic<uint32_t> preamble_min_bits_{32};
+  std::atomic<float>    preamble_acq_gain_{4.0f};
+  static constexpr int PRE_WIN = 64;          // sliding window length in bits
+  uint8_t pre_hist_[PRE_WIN];                 // ring of recent transition flags
+  int pre_hist_pos_{0};
+  int pre_trans_count_{0};                    // live sum of transitions in window
+  int pre_fill_{0};                           // how many bits observed (<=PRE_WIN)
+  bool pre_last_bit_{false};
+  bool pre_have_last_{false};
+  bool preamble_locked_{false};               // currently riding a preamble
+  uint32_t pre_run_bits_{0};                  // consecutive qualifying bits
+  bool fast_acquire_{false};                  // PLL in fast-acquire mode
+  uint32_t fast_acquire_bits_left_{0};        // remaining fast-acquire bit budget
+  static constexpr uint32_t FAST_ACQUIRE_BITS = 48;  // ~fast lock, then normal
 
   // Timeouts + dead-time
   uint32_t last_burst_ms_{0};
