@@ -1,72 +1,91 @@
 # =============================================================================
-#  Drop-in Home Assistant package for the ESPHome SAME Decoder.
-#  Install: copy to <config>/packages/same_alerts_package.yaml
-#           ensure configuration.yaml has:
-#             homeassistant:
-#               packages: !include_dir_named packages
-#           then restart HA and fill in the helpers in the UI.
+#  SAME Alerts Package
+#  Easy drop-in for the ESPHome SAME Decoder.
+#
+#  Install:
+#    1. Copy this file to <config>/packages/same_alerts_package.yaml
+#    2. In configuration.yaml make sure you have:
+#         homeassistant:
+#           packages: !include_dir_named packages
+#    3. Restart Home Assistant
+#    4. Edit the helpers in Settings → Devices & Services → Helpers
+#       (or Developer Tools → States) to set your FIPS codes, etc.
 # =============================================================================
 
-# ---- User-editable filtering config (UI helpers; no reflash needed) ---------
 input_text:
   same_fips_list:
-    name: SAME FIPS Codes
+    name: "SAME FIPS Codes to Monitor"
     max: 255
-    # Comma-separated 6-digit SAME/FIPS codes, e.g. "020091,020173".
-    # Blank = accept all areas.
-  same_event_include:
-    name: SAME Event Codes To Include
+    initial: ""
+    icon: mdi:map-marker-radius
+    # Comma-separated 6-digit codes, e.g. 012057,012081
+    # Leave blank to accept all areas.
+
+  same_event_enabled:
+    name: "SAME Enabled Event Codes"
     max: 255
-    # Optional. If non-empty, ONLY these event codes pass (e.g. "TOR,SVR,FFW").
+    initial: "TOR,SVR,TOA,SVA,FFW,FFA,FLW,FLA,EWW,HUW,HUA,TRW,TRA,WSW,WSA,BZW,SQW,SMW,DSW,CFW,CFA,SSW,SSA,EQW,VOW,HMW,RHW,NUW,SPW,EVI,CDW,CEM,LEW,CAE,LAE"
+    icon: mdi:weather-lightning
+    # Comma-separated. Only these codes are kept (after FIPS filter).
+    # Blank = allow all non-excluded codes.
+
+  same_event_always_alert:
+    name: "SAME Always-Alert Event Codes"
+    max: 255
+    initial: "TOR,EAN,EAT,EVI,CDW"
+    icon: mdi:alert-decagram
+    # These codes always generate a notification even if the optional
+    # NWS Alerts location cross-check fails.
+
   same_event_exclude:
-    name: SAME Event Codes To Exclude
+    name: "SAME Event Codes to Exclude"
     max: 255
-    # Optional. These event codes are dropped (e.g. "RWT,RMT,NPT").
+    initial: "RWT,RMT,NPT,DMO,NAT,NST"
+    icon: mdi:cancel
+    # Always dropped (useful for tests).
 
 input_boolean:
   same_ignore_tests:
-    name: SAME Ignore Test Alerts
-    # When on, drops RWT/RMT/NPT/DMO test codes regardless of other settings.
+    name: "SAME Ignore Test Alerts"
+    initial: true
+    icon: mdi:test-tube
+    # When on, drops the classic test codes regardless of the lists above.
 
-# ---- The nws_alerts-style entity, rebuilt from device events ----------------
+# -----------------------------------------------------------------------------
+#  sensor.same_alerts  (nws_alerts-style entity)
+# -----------------------------------------------------------------------------
 template:
   - trigger:
       - platform: event
         event_type: esphome.same_alert
       - platform: time_pattern
-        minutes: "/1"                 # prune expired alerts every minute
+        minutes: "/1"
       - platform: homeassistant
-        event: start                  # re-render after restart
+        event: start
     action:
-      # Load existing list (persisted across restarts by trigger-template state).
       - variables:
-          existing: >
-            {{ state_attr('sensor.same_alerts', 'Alerts') | default([], true) }}
+          existing: "{{ state_attr('sensor.same_alerts', 'Alerts') | default([], true) }}"
           now_ts: "{{ now() }}"
-          # Parse helper config into normalized sets.
           fips_cfg: >
             {{ states('input_text.same_fips_list')
                | replace(' ', '') | upper
-               | split(',') | reject('equalto','') | list }}
-          inc_cfg: >
-            {{ states('input_text.same_event_include')
+               | split(',') | reject('equalto', '') | list }}
+          enabled_cfg: >
+            {{ states('input_text.same_event_enabled')
                | replace(' ', '') | upper
-               | split(',') | reject('equalto','') | list }}
-          exc_cfg: >
+               | split(',') | reject('equalto', '') | list }}
+          exclude_cfg: >
             {{ states('input_text.same_event_exclude')
                | replace(' ', '') | upper
-               | split(',') | reject('equalto','') | list }}
-          ignore_tests: "{{ is_state('input_boolean.same_ignore_tests','on') }}"
-          test_codes: "{{ ['RWT','RMT','NPT','DMO'] }}"
-          # Incoming event payload (empty on time/start triggers).
+               | split(',') | reject('equalto', '') | list }}
+          ignore_tests: "{{ is_state('input_boolean.same_ignore_tests', 'on') }}"
+          test_codes: "{{ ['RWT', 'RMT', 'NPT', 'DMO', 'NAT', 'NST'] }}"
           ev: "{{ trigger.event.data if trigger.platform == 'event' else none }}"
     sensor:
       - name: "SAME Alerts"
         unique_id: same_alerts_reconstructed
-        # State = number of currently active alerts (nws_alerts convention).
         state: >
           {% set kept = namespace(list=[]) %}
-          {# 1) Start from existing, dropping anything expired. #}
           {% for a in existing %}
             {% if a.Expires is not defined
                   or as_datetime(a.Expires) is none
@@ -74,18 +93,16 @@ template:
               {% set kept.list = kept.list + [a] %}
             {% endif %}
           {% endfor %}
-          {# 2) If this is an event trigger, decide whether to upsert it. #}
           {% if ev %}
             {% set code = (ev.event_code | default('')) | upper %}
-            {% set areas = (ev.areas | default('')) | replace(' ','')
-                            | upper | split(',') | reject('equalto','') | list %}
+            {% set areas = (ev.areas | default('')) | replace(' ', '')
+                            | upper | split(',') | reject('equalto', '') | list %}
             {% set fips_ok = (fips_cfg | length == 0)
                              or (areas | select('in', fips_cfg) | list | length > 0) %}
-            {% set inc_ok = (inc_cfg | length == 0) or (code in inc_cfg) %}
-            {% set exc_ok = code not in exc_cfg %}
+            {% set enabled_ok = (enabled_cfg | length == 0) or (code in enabled_cfg) %}
+            {% set exclude_ok = code not in exclude_cfg %}
             {% set test_ok = (not ignore_tests) or (code not in test_codes) %}
-            {% if fips_ok and inc_ok and exc_ok and test_ok %}
-              {# Build the alert dict in nws_alerts field shape. #}
+            {% if fips_ok and enabled_ok and exclude_ok and test_ok %}
               {% set item = {
                    'ID': ev.id | default(''),
                    'Event': ev.event | default(code),
@@ -100,7 +117,6 @@ template:
                    'Sender': ev.sender | default(''),
                    'Raw': ev.raw | default('')
                  } %}
-              {# Upsert by stable ID: replace if present, else append. #}
               {% set ns = namespace(list=[], found=false) %}
               {% for a in kept.list %}
                 {% if a.ID == item.ID and item.ID != '' %}
@@ -118,7 +134,6 @@ template:
           {% endif %}
           {{ kept.list | length }}
         attributes:
-          # Rebuild the list identically each render so state & attrs stay in sync.
           Alerts: >
             {% set kept = namespace(list=[]) %}
             {% for a in existing %}
@@ -130,14 +145,14 @@ template:
             {% endfor %}
             {% if ev %}
               {% set code = (ev.event_code | default('')) | upper %}
-              {% set areas = (ev.areas | default('')) | replace(' ','')
-                              | upper | split(',') | reject('equalto','') | list %}
+              {% set areas = (ev.areas | default('')) | replace(' ', '')
+                              | upper | split(',') | reject('equalto', '') | list %}
               {% set fips_ok = (fips_cfg | length == 0)
                                or (areas | select('in', fips_cfg) | list | length > 0) %}
-              {% set inc_ok = (inc_cfg | length == 0) or (code in inc_cfg) %}
-              {% set exc_ok = code not in exc_cfg %}
+              {% set enabled_ok = (enabled_cfg | length == 0) or (code in enabled_cfg) %}
+              {% set exclude_ok = code not in exclude_cfg %}
               {% set test_ok = (not ignore_tests) or (code not in test_codes) %}
-              {% if fips_ok and inc_ok and exc_ok and test_ok %}
+              {% if fips_ok and enabled_ok and exclude_ok and test_ok %}
                 {% set item = {
                      'ID': ev.id | default(''),
                      'Event': ev.event | default(code),
@@ -166,7 +181,6 @@ template:
               {% endif %}
             {% endif %}
             {{ kept.list }}
-          # Convenience flat fields mirroring nws_alerts usage.
           last_event: "{{ ev.event | default('') if ev else '' }}"
           last_severity: "{{ ev.severity | default('') if ev else '' }}"
           friendly_name: "SAME Alerts"
