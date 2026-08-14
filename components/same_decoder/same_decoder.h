@@ -59,15 +59,14 @@ class SAMEDecoder : public Component {
   uint32_t get_timeout_ms() const { return this->timeout_ms_.load(std::memory_order_relaxed); }
   void set_single_burst_min_ms(uint32_t v) { this->single_burst_min_ms_ = v; }
   void set_post_emit_dead_ms(uint32_t v) { this->post_emit_dead_ms_ = v; }
+  void set_ab_required(bool v) { this->ab_required_ = v; }
   void set_decode_count_sensor(sensor::Sensor *s) { this->decode_count_sensor_ = s; }
   void set_last_raw_sensor(text_sensor::TextSensor *s) { this->last_raw_sensor_ = s; }
   void register_alert_trigger(AlertTrigger *t) { this->alert_triggers_.push_back(t); }
   void register_sync_trigger(SyncTrigger *t) { this->sync_triggers_.push_back(t); }
 
   void set_api_connected(bool connected);
-
   void feed_bytes(const std::vector<uint8_t> &data);
-
   uint32_t ms_since_last_feed() const;
 
   std::string last_alert_id() const { return this->last_.id; }
@@ -122,99 +121,93 @@ class SAMEDecoder : public Component {
   SameAlert last_{};
   uint32_t decode_count_{0};
 
-  // ---- Cross-thread hand-off (mic_task -> main loop) ----
+  // Cross-thread hand-off
   static constexpr int ALERT_Q_LEN = 4;
   SameAlert alert_queue_[ALERT_Q_LEN];
   std::atomic<uint32_t> q_head_{0};
   std::atomic<uint32_t> q_tail_{0};
-
-  // ---- Sync-detected hand-off (mic_task -> main loop) ----
   std::atomic<uint32_t> sync_pending_{0};
 
-  // ---- Guaranteed alert delivery (survive brief API disconnects) ----
+  // API offline buffering
   bool api_connected_{false};
   std::atomic<bool> api_connected_changed_{false};
   static constexpr size_t PENDING_MAX = 16;
   std::vector<SameAlert> pending_;
 
-  // ---- Dedup: SESSION-based (not wall-clock window) ----
+  // Dedup
   std::string session_emitted_header_;
   std::string last_global_header_;
-  uint32_t    last_global_ms_{0};
+  uint32_t last_global_ms_{0};
   static constexpr uint32_t IMMEDIATE_DUP_MS = 3000;
 
-  // ---- Idle-recovery / detector re-priming ----
+  // Idle recovery
   std::atomic<uint32_t> last_feed_ms_{0};
   static constexpr uint32_t FEED_GAP_MS = 250;
-  float    env_slow_{0.0f};
-  static constexpr float ENV_ALPHA      = 0.0003f;
-  static constexpr float ENV_SILENCE    = 200.0f;
-  static constexpr float ENV_RISE_MULT  = 4.0f;
-  bool     was_idle_{true};
-
-  // Idle->active edge window: Tier-4 bare-"ZC" acquisition is allowed ONLY for
-  // a short span of samples right after a silence->signal transition.
+  float env_slow_{0.0f};
+  static constexpr float ENV_ALPHA = 0.0003f;
+  static constexpr float ENV_SILENCE = 200.0f;
+  static constexpr float ENV_RISE_MULT = 4.0f;
+  bool was_idle_{true};
   uint32_t idle_edge_samples_{0};
-  static constexpr uint32_t IDLE_EDGE_SAMPLES = 48000;   // ~1.0 s at 48 kHz
+  static constexpr uint32_t IDLE_EDGE_SAMPLES = 48000;
 
-  // ---- Timing / sampling (dynamic) ----
+  // Dynamic timing / Goertzel
   float samples_per_bit_{92.16f};
   float phase_inc_{1.0f / 92.16f};
   float coeff_mark_{1.926090f};
   float coeff_space_{1.958313f};
-  static constexpr int   GWIN            = 64;
-  static constexpr int   RINGLEN         = 256;
+  static constexpr int GWIN = 64;
+  static constexpr int RINGLEN = 256;
   int16_t ring_[RINGLEN];
-  int     ring_pos_{0};
-  float   phase_{0.0f};
+  int ring_pos_{0};
+  float phase_{0.0f};
 
-  // ---- Soft clipping (input headroom) ----
-  static constexpr float SAMPLE_MAX   = 32767.0f;
-  static constexpr float SOFT_KNEE    = 24576.0f;
+  // Soft clip
+  static constexpr float SAMPLE_MAX = 32767.0f;
+  static constexpr float SOFT_KNEE = 24576.0f;
   static float soft_clip_(float v);
 
-  // ---- Soft AGC ----
-  bool  agc_enable_{true};
+  // Soft AGC (default off)
+  bool agc_enable_{false};
   float agc_target_{8000.0f};
   float agc_min_gain_{0.25f};
-  float agc_max_gain_{64.0f};
+  float agc_max_gain_{32.0f};
   float agc_gain_{1.0f};
   float agc_peak_{0.0f};
   static constexpr float AGC_PEAK_ALPHA = 0.001f;
-  static constexpr float AGC_ATTACK     = 0.002f;
-  static constexpr float AGC_RELEASE    = 0.0002f;
+  static constexpr float AGC_ATTACK = 0.002f;
+  static constexpr float AGC_RELEASE = 0.0002f;
 
-  // ---- Timing recovery (early/late gate) ----
-  static constexpr int   CENTER_LAG      = GWIN / 2;
-  static constexpr int   TR_DELTA        = 12;
-  static constexpr float TR_KP           = 0.06f;
-  static constexpr float TR_KI           = 0.0015f;
-  static constexpr float TR_CONF_MIN     = 0.20f;
-  static constexpr float TR_DPHI_CLAMP   = 0.125f;
-  float   tr_woff_clamp_{0.002f * (1.0f / 92.16f)};
-  float   w_off_{0.0f};
+  // Timing recovery
+  static constexpr int CENTER_LAG = GWIN / 2;
+  static constexpr int TR_DELTA = 12;
+  static constexpr float TR_KP = 0.06f;
+  static constexpr float TR_KI = 0.0015f;
+  static constexpr float TR_CONF_MIN = 0.20f;
+  static constexpr float TR_DPHI_CLAMP = 0.125f;
+  float tr_woff_clamp_{0.002f * (1.0f / 92.16f)};
+  float w_off_{0.0f};
   uint32_t samples_seen_{0};
 
-  // ---- Burst-collection timeout + post-emit dead-time ----
+  // Timeouts + dead-time
   uint32_t last_burst_ms_{0};
   std::atomic<uint32_t> timeout_ms_{3000};
   uint32_t single_burst_min_ms_{7000};
-  uint32_t post_emit_dead_ms_{1500};
+  uint32_t post_emit_dead_ms_{800};
   uint32_t last_emit_ms_{0};
 
-  // ---- AB preamble correlator (16 x 0xAB = 128 bits of 10101011) ----
-  // Sliding 16-bit window looking for 0xAB pattern. Count consecutive
-  // matching bytes; arm ZCZC tiers only after AB_MIN_MATCH bytes.
-  uint16_t ab_shift_{0};
-  int      ab_match_count_{0};
-  static constexpr int AB_MIN_MATCH = 4;   // ~4 of the 16 preambles is enough to arm
+  // AB preamble correlator (optional)
+  bool ab_required_{false};
+  uint8_t ab_byte_{0};
+  int ab_nbits_{0};
+  int ab_match_count_{0};
+  static constexpr int AB_MIN_MATCH = 2;   // soft when enabled
 
-  // ---- Sync / framing ----
+  // Sync / framing
   enum Phase { HUNT_SYNC, CAPTURE };
-  Phase   phase_state_{HUNT_SYNC};
+  Phase phase_state_{HUNT_SYNC};
   uint32_t sync_shift_{0};
 
-  // Tier 1: full 'ZCZC' (32-bit), fuzzy Hamming <= 1.
   static constexpr uint32_t SYNC_ZCZC =
       (static_cast<uint32_t>('C') << 24) |
       (static_cast<uint32_t>('Z') << 16) |
@@ -222,13 +215,11 @@ class SAMEDecoder : public Component {
       (static_cast<uint32_t>('Z'));
   static constexpr int SYNC_MAX_HAMMING = 1;
 
-  // Tier 2: 'ZC-' (24-bit exact) - first 'ZC' assumed lost, dash survived.
   static constexpr uint32_t SYNC_ZC_DASH_24 =
       (static_cast<uint32_t>('-') << 16) |
       (static_cast<uint32_t>('C') << 8) |
       (static_cast<uint32_t>('Z'));
 
-  // Tier 3: boundary-clipped 24-bit variants of ZCZC.
   static constexpr uint32_t SYNC_CZC_24 =
       (static_cast<uint32_t>('C') << 16) |
       (static_cast<uint32_t>('Z') << 8) |
@@ -238,7 +229,6 @@ class SAMEDecoder : public Component {
       (static_cast<uint32_t>('C') << 8) |
       (static_cast<uint32_t>('Z'));
 
-  // Tier 4: bare 'ZC' (16-bit exact), GUARDED by idle-edge window only.
   static constexpr uint32_t SYNC_ZC_16 =
       (static_cast<uint32_t>('C') << 8) |
       (static_cast<uint32_t>('Z'));
@@ -247,31 +237,26 @@ class SAMEDecoder : public Component {
   static constexpr uint32_t MASK24 = 0x00FFFFFFu;
   bool fallback_sync_used_{false};
 
-  // ---- Byte / burst assembly ----
-  uint8_t     cur_byte_{0};
-  int         cur_nbits_{0};
+  // Byte / burst assembly
+  uint8_t cur_byte_{0};
+  int cur_nbits_{0};
   std::string cur_burst_;
   std::string bursts_[3];
-  int         burst_idx_{0};
+  int burst_idx_{0};
   static constexpr int MAX_HEADER_BYTES = 268;
 
-  // ---- Early-emit on agreeing bursts ----
   static constexpr int MIN_BURSTS_TO_EMIT = 2;
   static constexpr float BURST_MAX_MISMATCH = 0.10f;
   bool bursts_agree_(int count);
   bool early_emitted_{false};
-
   static constexpr float FIELD_FUZZ = 0.20f;
 
-  // ---- Header termination (structure-driven) ----
-  bool  plus_seen_{false};
-  int   tail_count_{0};
+  bool plus_seen_{false};
+  int tail_count_{0};
   static constexpr int TAIL_MIN = 14;
   static constexpr int TAIL_COMPLETE = 21;
 
-  // ---- EOM (NNNN) detection ----
-  // After a header session we also watch for the end-of-message marker.
-  // Four consecutive 'N' characters close the session cleanly.
+  // EOM
   int eom_n_count_{0};
 };
 
