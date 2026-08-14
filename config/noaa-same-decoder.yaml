@@ -188,6 +188,56 @@ number:
     set_action:
       - lambda: 'id(same_dec).set_timeout_ms((uint32_t) (x * 1000.0f));'
 
+  # ---- T0 preamble-lock tunables (disabled_by_default: hold defaults, enable to tune) ----
+  - platform: template
+    name: "SAME Preamble Min Density"
+    id: same_pre_density_number
+    icon: "mdi:sine-wave"
+    min_value: 0.50
+    max_value: 1.00
+    step: 0.01
+    mode: slider
+    optimistic: true
+    restore_value: true
+    initial_value: 0.75
+    entity_category: config
+    disabled_by_default: true
+    set_action:
+      - lambda: 'id(same_dec).set_preamble_min_density(x);'
+
+  - platform: template
+    name: "SAME Preamble Min Bits"
+    id: same_pre_bits_number
+    icon: "mdi:counter"
+    unit_of_measurement: "bits"
+    min_value: 8
+    max_value: 256
+    step: 1
+    mode: slider
+    optimistic: true
+    restore_value: true
+    initial_value: 32
+    entity_category: config
+    disabled_by_default: true
+    set_action:
+      - lambda: 'id(same_dec).set_preamble_min_bits((uint32_t) x);'
+
+  - platform: template
+    name: "SAME Preamble Acquire Gain"
+    id: same_pre_acqgain_number
+    icon: "mdi:lock-clock"
+    min_value: 1.0
+    max_value: 20.0
+    step: 0.5
+    mode: slider
+    optimistic: true
+    restore_value: true
+    initial_value: 4.0
+    entity_category: config
+    disabled_by_default: true
+    set_action:
+      - lambda: 'id(same_dec).set_preamble_acq_gain(x);'
+
 sensor:
   - platform: template
     id: same_decode_count
@@ -242,15 +292,20 @@ same_decoder:
   single_burst_min_ms: 7000    # lone-burst wait
   post_emit_dead_ms: 1500      # force re-acquisition after emit
   sample_rate: 48000
+  # ---- T0 preamble lock (PRIMARY acquisition; enabled by default) ----
+  preamble_lock: true          # detect 0xAB tone, lock clock before ZCZC
+  preamble_min_density: 0.75   # min bit-transition density to call it a preamble
+  preamble_min_bits: 32        # qualifying bits (~4 bytes) before lock fires
+  preamble_acq_gain: 4.0       # PLL fast-acquire multiplier during preamble
   decode_count_sensor: same_decode_count
   last_raw_sensor: same_last_raw
   on_sync:
     then:
+      # T0 (preamble) or a ZCZC tier fired: light the LED as soon as we know
+      # we are listening. No fixed timer here - the LED is cleared explicitly
+      # on alert (message decoded) or on EOM (message over).
       - output.turn_on: led_decode_output
       - lambda: 'id(decode_in_progress).publish_state(true);'
-      - delay: 8s
-      - output.turn_off: led_decode_output
-      - lambda: 'id(decode_in_progress).publish_state(false);'
   on_alert:
     then:
       - output.turn_off: led_decode_output
@@ -278,3 +333,9 @@ same_decoder:
             expires: !lambda 'return id(same_dec).last_expires_iso();'
             sender: !lambda 'return id(same_dec).last_sender();'
             raw: !lambda 'return id(same_dec).last_raw_header();'
+  on_eom:
+    then:
+      # Message is over (NNNN detected). Turn the LED off immediately.
+      - output.turn_off: led_decode_output
+      - lambda: 'id(decode_in_progress).publish_state(false);'
+      - lambda: 'ESP_LOGI("same", "EOM received; decode indicator cleared.");'
