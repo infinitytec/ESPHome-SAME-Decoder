@@ -6,10 +6,13 @@
 # Reliability extensions:
 #   - dynamic Goertzel coeffs from sample_rate + optional freq_offset_hz
 #   - soft AGC (optional, default off)
-#   - optional AB preamble correlator (default off – preserves original sensitivity)
+#   - T0 tone-based preamble lock (PRIMARY acquisition, enabled by default)
+#       * phase-independent bit-transition-density detector
+#       * PLL reset + fast-acquire during preamble, then normal tracking
+#   - optional AB preamble correlator (default off - preserves original sensitivity)
 #   - configurable burst timeouts + post-emit dead-time
 #   - stronger header validation (structural + light semantic)
-#   - NNNN EOM detection
+#   - NNNN EOM detection (never emitted as an alert; fires on_eom)
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
@@ -25,6 +28,7 @@ CONF_DECODE_COUNT_SENSOR = "decode_count_sensor"
 CONF_LAST_RAW_SENSOR = "last_raw_sensor"
 CONF_ON_ALERT = "on_alert"
 CONF_ON_SYNC = "on_sync"
+CONF_ON_EOM = "on_eom"
 CONF_GAIN = "gain"
 CONF_FREQ_OFFSET_HZ = "freq_offset_hz"
 CONF_AGC_ENABLE = "agc_enable"
@@ -36,11 +40,18 @@ CONF_SINGLE_BURST_MIN_MS = "single_burst_min_ms"
 CONF_POST_EMIT_DEAD_MS = "post_emit_dead_ms"
 CONF_AB_REQUIRED = "ab_required"
 
+# ---- T0 preamble-lock (PRIMARY acquisition, enabled by default) ----
+CONF_PREAMBLE_LOCK = "preamble_lock"
+CONF_PREAMBLE_MIN_DENSITY = "preamble_min_density"
+CONF_PREAMBLE_MIN_BITS = "preamble_min_bits"
+CONF_PREAMBLE_ACQ_GAIN = "preamble_acq_gain"
+
 same_decoder_ns = cg.esphome_ns.namespace("same_decoder")
 SAMEDecoder = same_decoder_ns.class_("SAMEDecoder", cg.Component)
 
 AlertTrigger = same_decoder_ns.class_("AlertTrigger", automation.Trigger.template())
 SyncTrigger = same_decoder_ns.class_("SyncTrigger", automation.Trigger.template())
+EomTrigger = same_decoder_ns.class_("EomTrigger", automation.Trigger.template())
 
 CONFIG_SCHEMA = cv.Schema(
     {
@@ -56,6 +67,11 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_SINGLE_BURST_MIN_MS, default=7000): cv.int_range(min=1000, max=60000),
         cv.Optional(CONF_POST_EMIT_DEAD_MS, default=800): cv.int_range(min=0, max=10000),
         cv.Optional(CONF_AB_REQUIRED, default=False): cv.boolean,
+        # ---- T0 preamble lock ----
+        cv.Optional(CONF_PREAMBLE_LOCK, default=True): cv.boolean,
+        cv.Optional(CONF_PREAMBLE_MIN_DENSITY, default=0.75): cv.float_range(min=0.5, max=1.0),
+        cv.Optional(CONF_PREAMBLE_MIN_BITS, default=32): cv.int_range(min=8, max=256),
+        cv.Optional(CONF_PREAMBLE_ACQ_GAIN, default=4.0): cv.float_range(min=1.0, max=20.0),
         cv.Optional(CONF_DECODE_COUNT_SENSOR): cv.use_id(sensor.Sensor),
         cv.Optional(CONF_LAST_RAW_SENSOR): cv.use_id(text_sensor.TextSensor),
         cv.Optional(CONF_ON_ALERT): automation.validate_automation(
@@ -66,6 +82,11 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_ON_SYNC): automation.validate_automation(
             {
                 cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(SyncTrigger),
+            }
+        ),
+        cv.Optional(CONF_ON_EOM): automation.validate_automation(
+            {
+                cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(EomTrigger),
             }
         ),
     }
@@ -88,6 +109,12 @@ async def to_code(config):
     cg.add(var.set_post_emit_dead_ms(config[CONF_POST_EMIT_DEAD_MS]))
     cg.add(var.set_ab_required(config[CONF_AB_REQUIRED]))
 
+    # ---- T0 preamble lock ----
+    cg.add(var.set_preamble_lock(config[CONF_PREAMBLE_LOCK]))
+    cg.add(var.set_preamble_min_density(config[CONF_PREAMBLE_MIN_DENSITY]))
+    cg.add(var.set_preamble_min_bits(config[CONF_PREAMBLE_MIN_BITS]))
+    cg.add(var.set_preamble_acq_gain(config[CONF_PREAMBLE_ACQ_GAIN]))
+
     if CONF_DECODE_COUNT_SENSOR in config:
         s = await cg.get_variable(config[CONF_DECODE_COUNT_SENSOR])
         cg.add(var.set_decode_count_sensor(s))
@@ -104,3 +131,8 @@ async def to_code(config):
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID])
         await automation.build_automation(trigger, [], conf)
         cg.add(var.register_sync_trigger(trigger))
+
+    for conf in config.get(CONF_ON_EOM, []):
+        trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID])
+        await automation.build_automation(trigger, [], conf)
+        cg.add(var.register_eom_trigger(trigger))
