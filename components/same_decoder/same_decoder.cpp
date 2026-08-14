@@ -539,7 +539,7 @@ bool SAMEDecoder::header_is_strictly_valid_(const std::string &header) {
 bool SAMEDecoder::header_passes_semantic_(const SameAlert &a) const {
   if (a.originator.size() != 3 || a.event_code.size() != 3)
     return false;
-  // Area / timing checks are advisory only (return true even if imperfect)
+  // Area / timing checks are advisory only
   return true;
 }
 
@@ -557,6 +557,18 @@ std::string SAMEDecoder::canonicalize_front_(const std::string &voted) {
 
 void SAMEDecoder::note_emit_() {
   this->last_emit_ms_ = millis();
+  // Light recovery after every successful emit (including single-burst timeout).
+  // Clears timing offset and AB state so the next header is acquired with a
+  // fresh bit clock.  Does NOT wipe the sample ring (that would discard useful
+  // residual audio).  Also re-opens a short idle-edge window so Tier-4 remains
+  // available for a weak follow-up message.
+  this->w_off_ = 0.0f;
+  this->phase_ = 0.0f;
+  this->ab_byte_ = 0;
+  this->ab_nbits_ = 0;
+  this->ab_match_count_ = 0;
+  this->eom_n_count_ = 0;
+  this->idle_edge_samples_ = IDLE_EDGE_SAMPLES / 4;   // ~0.25 s at 48 kHz
 }
 
 void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
