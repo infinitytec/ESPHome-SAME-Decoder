@@ -144,7 +144,7 @@ class SAMEDecoder : public Component {
   std::atomic<uint32_t> last_feed_ms_{0};
   static constexpr uint32_t FEED_GAP_MS = 250;
   float env_slow_{0.0f};
-  static constexpr float ENV_ALPHA = 0.0002f;
+  static constexpr float ENV_ALPHA = 0.0025f;
   static constexpr float ENV_SILENCE = 200.0f;
   static constexpr float ENV_RISE_MULT = 4.0f;
   bool was_idle_{true};
