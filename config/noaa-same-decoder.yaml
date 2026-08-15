@@ -13,14 +13,11 @@ esphome:
     priority: -100
     then:
       - lambda: 'ESP_LOGI("same", "Boot complete; SAME decoder starting.");'
-      # Ensure the decode LED is physically off at boot.
       - output.turn_off: led_decode_output
       - lambda: 'id(decode_in_progress).publish_state(false);'
       - select.set:
           id: same_adc_input
           option: "LINE1"
-      # ES8388 input PGA gain (ADCControl1 = reg 0x09):
-      #   0x88=+24dB | 0x77=+21dB (current) | 0x66=+18dB | 0x44=+12dB
       - delay: 200ms
       - lambda: |-
           std::vector<uint8_t> buf;
@@ -46,7 +43,7 @@ psram:
   speed: 80MHz
 
 logger:
-  level: DEBUG                          # DEBUG for testing; raise to INFO in production
+  level: DEBUG
 
 time:
   - platform: homeassistant
@@ -159,6 +156,35 @@ binary_sensor:
     name: "SAME Decode In Progress"
     icon: "mdi:access-point"
 
+# Minimum-on indicator (B1): once lit, the LED/sensor stay on for at least
+# ~2 s so an instantaneous decode still gives a visible indication instead of a
+# flash. on_sync starts it; on_alert/on_eom request off but the script enforces
+# the minimum visible time before clearing.
+globals:
+  - id: led_on_since
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+script:
+  - id: led_indicate_on
+    then:
+      - output.turn_on: led_decode_output
+      - lambda: 'id(decode_in_progress).publish_state(true); id(led_on_since) = millis();'
+
+  - id: led_indicate_off
+    mode: restart
+    then:
+      # Enforce a minimum on-time of 2000 ms from when it was lit.
+      - lambda: |-
+          uint32_t elapsed = millis() - id(led_on_since);
+          if (elapsed < 2000) {
+            // wait out the remainder
+          }
+      - delay: !lambda 'uint32_t e = millis() - id(led_on_since); return (e < 2000) ? (2000 - e) : 0;'
+      - output.turn_off: led_decode_output
+      - lambda: 'id(decode_in_progress).publish_state(false);'
+
 number:
   - platform: template
     name: "SAME Software Gain"
@@ -190,7 +216,6 @@ number:
     set_action:
       - lambda: 'id(same_dec).set_timeout_ms((uint32_t) (x * 1000.0f));'
 
-  # ---- Passive preamble gate tunable (diagnostic; disabled_by_default) ----
   - platform: template
     name: "SAME Preamble Energy Mult"
     id: same_pre_energy_number
@@ -261,22 +286,18 @@ same_decoder:
   single_burst_min_ms: 7000
   post_emit_dead_ms: 1500
   sample_rate: 48000
-  # ---- passive preamble gate (diagnostic only; never touches the clock) ----
   preamble_status: true
   preamble_energy_mult: 8.0
-  # ---- EOM context validation (prevents headers-as-EOM) ----
   eom_require_context: true
   eom_context_ms: 120000
   decode_count_sensor: same_decode_count
   last_raw_sensor: same_last_raw
   on_sync:
     then:
-      - output.turn_on: led_decode_output
-      - lambda: 'id(decode_in_progress).publish_state(true);'
+      - script.execute: led_indicate_on
   on_alert:
     then:
-      - output.turn_off: led_decode_output
-      - lambda: 'id(decode_in_progress).publish_state(false);'
+      - script.execute: led_indicate_off
       - lambda: |-
           auto t = id(ha_time).now();
           if (t.is_valid()) {
@@ -302,6 +323,5 @@ same_decoder:
             raw: !lambda 'return id(same_dec).last_raw_header();'
   on_eom:
     then:
-      - output.turn_off: led_decode_output
-      - lambda: 'id(decode_in_progress).publish_state(false);'
+      - script.execute: led_indicate_off
       - lambda: 'ESP_LOGI("same", "EOM/indicator cleared.");'
