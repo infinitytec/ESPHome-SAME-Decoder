@@ -71,6 +71,7 @@ class SAMEDecoder : public Component {
   void set_preamble_min_density(float v) { this->preamble_min_density_.store(v, std::memory_order_relaxed); }
   void set_preamble_min_bits(uint32_t v) { this->preamble_min_bits_.store(v, std::memory_order_relaxed); }
   void set_preamble_acq_gain(float v) { this->preamble_acq_gain_.store(v, std::memory_order_relaxed); }
+  void set_preamble_lock_timeout_ms(uint32_t v) { this->preamble_lock_timeout_ms_.store(v, std::memory_order_relaxed); }
 
   void set_decode_count_sensor(sensor::Sensor *s) { this->decode_count_sensor_ = s; }
   void set_last_raw_sensor(text_sensor::TextSensor *s) { this->last_raw_sensor_ = s; }
@@ -112,6 +113,7 @@ class SAMEDecoder : public Component {
   void update_preamble_detector_(bool bit);
   void enter_preamble_lock_();
   void reset_preamble_detector_();
+  void release_preamble_lock_(const char *reason);
   void fire_sync_once_();
   void fire_eom_();
 
@@ -220,6 +222,7 @@ class SAMEDecoder : public Component {
   std::atomic<float>    preamble_min_density_{0.75f};
   std::atomic<uint32_t> preamble_min_bits_{32};
   std::atomic<float>    preamble_acq_gain_{4.0f};
+  std::atomic<uint32_t> preamble_lock_timeout_ms_{1500};
   static constexpr int PRE_WIN = 64;          // sliding window length in bits
   uint8_t pre_hist_[PRE_WIN];                 // ring of recent transition flags
   int pre_hist_pos_{0};
@@ -229,6 +232,7 @@ class SAMEDecoder : public Component {
   bool pre_have_last_{false};
   bool preamble_locked_{false};               // currently riding a preamble
   uint32_t pre_run_bits_{0};                  // consecutive qualifying bits
+  uint32_t preamble_lock_ms_{0};              // millis() at T0 lock (watchdog base)
   bool fast_acquire_{false};                  // PLL in fast-acquire mode
   uint32_t fast_acquire_bits_left_{0};        // remaining fast-acquire bit budget
   static constexpr uint32_t FAST_ACQUIRE_BITS = 48;  // ~fast lock, then normal
