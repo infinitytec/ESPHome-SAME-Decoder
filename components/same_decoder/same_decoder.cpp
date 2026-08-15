@@ -137,6 +137,13 @@ void SAMEDecoder::loop() {
     eom--;
   }
 
+  uint32_t pre = this->preamble_pending_.exchange(0, std::memory_order_acq_rel);
+  while (pre > 0) {
+    for (auto *t : this->preamble_triggers_)
+      t->trigger();
+    pre--;
+  }
+
   uint32_t head = this->q_head_.load(std::memory_order_relaxed);
   while (head != this->q_tail_.load(std::memory_order_acquire)) {
     SameAlert a = this->alert_queue_[head];
@@ -172,9 +179,9 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "  Timeout (>=2 bursts): %" PRIu32 " ms", this->timeout_ms_.load(std::memory_order_relaxed));
   ESP_LOGCONFIG(TAG, "  Single-burst min: %" PRIu32 " ms", this->single_burst_min_ms_);
   ESP_LOGCONFIG(TAG, "  Post-emit dead-time: %" PRIu32 " ms", this->post_emit_dead_ms_);
-  ESP_LOGCONFIG(TAG, "  Alert triggers: %u  sync triggers: %u  eom triggers: %u",
+  ESP_LOGCONFIG(TAG, "  Alert triggers: %u  sync triggers: %u  eom triggers: %u  preamble triggers: %u",
                 (unsigned) this->alert_triggers_.size(), (unsigned) this->sync_triggers_.size(),
-                (unsigned) this->eom_triggers_.size());
+                (unsigned) this->eom_triggers_.size(), (unsigned) this->preamble_triggers_.size());
 }
 
 void SAMEDecoder::reprime_detector_() {
@@ -234,6 +241,15 @@ void SAMEDecoder::update_preamble_gate_(float mark_e, float space_e) {
       this->preamble_present_ = false;
     }
   }
+
+  // Rising-edge detection (false -> true): log once per preamble acquisition
+  // and fire the on_preamble trigger (drained on the main thread in loop()).
+  if (this->preamble_present_ && !this->was_preamble_present_) {
+    ESP_LOGI(TAG, "Preamble detected (td=%.2f abd5_ham=%d AB=%d).",
+             this->transition_ratio_, this->pre_min_hamming_, this->ab_match_count_);
+    this->fire_preamble_once_();
+  }
+  this->was_preamble_present_ = this->preamble_present_;
 }
 
 // Option 3: per-symbol preamble (T0) metrics. Computes a transition-density
@@ -318,6 +334,11 @@ void SAMEDecoder::fire_sync_once_() {
 void SAMEDecoder::fire_eom_() {
   uint32_t p = this->eom_pending_.load(std::memory_order_relaxed);
   if (p < 8) this->eom_pending_.store(p + 1, std::memory_order_release);
+}
+
+void SAMEDecoder::fire_preamble_once_() {
+  uint32_t p = this->preamble_pending_.load(std::memory_order_relaxed);
+  if (p < 8) this->preamble_pending_.store(p + 1, std::memory_order_release);
 }
 
 // Decode watchdog: if a decode session has been active (LED on) too long with
@@ -908,6 +929,10 @@ void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
   if (!this->session_emitted_header_.empty()) {
     if (this->session_emitted_header_ == header) {
       ESP_LOGD(TAG, "Session duplicate suppressed.");
+      // Duplicate: end the active session promptly so the indicator clears
+      // instead of waiting for the decode watchdog.
+      this->decode_active_ = false;
+      this->fire_eom_();
       return;
     }
     ESP_LOGI(TAG, "Session consensus changed; reissuing.");
@@ -920,6 +945,10 @@ void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
       this->session_emitted_header_ = header;
       this->last_global_header_ = header;
       this->last_global_ms_ = now;
+      // Duplicate: end the active session promptly so the indicator clears
+      // instead of waiting for the decode watchdog.
+      this->decode_active_ = false;
+      this->fire_eom_();
       return;
     }
   }
