@@ -1,5 +1,5 @@
 # components/same_decoder/__init__.py
-# Config schema + codegen for the SAME decoder (soft-decision + commercial-style TR).
+# Config schema + codegen for the SAME decoder.
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
@@ -35,6 +35,9 @@ CONF_EOM_CONTEXT_MS = "eom_context_ms"
 
 CONF_DECODE_WATCHDOG_MS = "decode_watchdog_ms"
 
+# ---- acquisition bandwidth boost ----
+CONF_ACQ_BOOST = "acq_boost"
+
 same_decoder_ns = cg.esphome_ns.namespace("same_decoder")
 SAMEDecoder = same_decoder_ns.class_("SAMEDecoder", cg.Component)
 
@@ -46,7 +49,7 @@ _REMOVED_KEYS = {
     "preamble_lock": "Preamble no longer resets the clock; acquisition is via ZCZC tiers.",
     "preamble_min_density": "The bit-density preamble detector was removed.",
     "preamble_min_bits": "The bit-density preamble detector was removed.",
-    "preamble_acq_gain": "PLL fast-acquire was removed (it corrupted decodes).",
+    "preamble_acq_gain": "PLL fast-acquire (phase reset) was removed; use 'acq_boost' instead.",
     "preamble_lock_timeout_ms": "The preamble-lock watchdog is no longer needed.",
 }
 
@@ -81,6 +84,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_EOM_REQUIRE_CONTEXT, default=True): cv.boolean,
             cv.Optional(CONF_EOM_CONTEXT_MS, default=120000): cv.int_range(min=1000, max=600000),
             cv.Optional(CONF_DECODE_WATCHDOG_MS, default=10000): cv.int_range(min=2000, max=60000),
+            cv.Optional(CONF_ACQ_BOOST, default=4.0): cv.float_range(min=1.0, max=8.0),
             cv.Optional(CONF_DECODE_COUNT_SENSOR): cv.use_id(sensor.Sensor),
             cv.Optional(CONF_LAST_RAW_SENSOR): cv.use_id(text_sensor.TextSensor),
             cv.Optional(CONF_ON_ALERT): automation.validate_automation(
@@ -118,6 +122,7 @@ async def to_code(config):
     cg.add(var.set_eom_require_context(config[CONF_EOM_REQUIRE_CONTEXT]))
     cg.add(var.set_eom_context_ms(config[CONF_EOM_CONTEXT_MS]))
     cg.add(var.set_decode_watchdog_ms(config[CONF_DECODE_WATCHDOG_MS]))
+    cg.add(var.set_acq_boost(config[CONF_ACQ_BOOST]))
 
     if CONF_DECODE_COUNT_SENSOR in config:
         s = await cg.get_variable(config[CONF_DECODE_COUNT_SENSOR])
