@@ -238,6 +238,23 @@ number:
     set_action:
       - lambda: 'id(same_dec).set_preamble_acq_gain(x);'
 
+  - platform: template
+    name: "SAME Preamble Lock Timeout"
+    id: same_pre_wd_number
+    icon: "mdi:timer-lock"
+    unit_of_measurement: "ms"
+    min_value: 200
+    max_value: 10000
+    step: 100
+    mode: slider
+    optimistic: true
+    restore_value: true
+    initial_value: 1500
+    entity_category: config
+    disabled_by_default: true
+    set_action:
+      - lambda: 'id(same_dec).set_preamble_lock_timeout_ms((uint32_t) x);'
+
 sensor:
   - platform: template
     id: same_decode_count
@@ -309,33 +326,63 @@ same_decoder:
   on_alert:
     then:
       - output.turn_off: led_decode_output
+
       - lambda: 'id(decode_in_progress).publish_state(false);'
+
       - lambda: |-
+
           auto t = id(ha_time).now();
+
           if (t.is_valid()) {
+
             char buf[40];
+
             t.strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z");
+
             id(same_last_alert_time).publish_state(buf);
+
           } else {
+
             ESP_LOGW("same", "Alert decoded but time not synced yet; timestamp not published.");
+
           }
+
       - homeassistant.event:
+
           event: esphome.same_alert
+
           data:
+
             id: !lambda 'return id(same_dec).last_alert_id();'
+
             event_code: !lambda 'return id(same_dec).last_event_code();'
+
             event: !lambda 'return id(same_dec).last_event_name();'
+
             severity: !lambda 'return id(same_dec).last_severity();'
+
             originator: !lambda 'return id(same_dec).last_originator();'
+
             status: !lambda 'return id(same_dec).last_status();'
+
             areas: !lambda 'return id(same_dec).last_areas_csv();'
+
             onset: !lambda 'return id(same_dec).last_onset_iso();'
+
             expires: !lambda 'return id(same_dec).last_expires_iso();'
+
             sender: !lambda 'return id(same_dec).last_sender();'
+
             raw: !lambda 'return id(same_dec).last_raw_header();'
+
   on_eom:
+
     then:
+
       # Message is over (NNNN detected). Turn the LED off immediately.
+
       - output.turn_off: led_decode_output
+
       - lambda: 'id(decode_in_progress).publish_state(false);'
+
       - lambda: 'ESP_LOGI("same", "EOM received; decode indicator cleared.");'
