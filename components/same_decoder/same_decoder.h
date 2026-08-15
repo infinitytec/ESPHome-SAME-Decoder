@@ -74,7 +74,6 @@ class SAMEDecoder : public Component {
   void set_eom_context_ms(uint32_t v) { this->eom_context_ms_ = v; }
 
   void set_decode_watchdog_ms(uint32_t v) { this->decode_watchdog_ms_.store(v, std::memory_order_relaxed); }
-  void set_acq_boost(float v) { this->acq_boost_.store(v, std::memory_order_relaxed); }
 
   void set_decode_count_sensor(sensor::Sensor *s) { this->decode_count_sensor_ = s; }
   void set_last_raw_sensor(text_sensor::TextSensor *s) { this->last_raw_sensor_ = s; }
@@ -100,7 +99,7 @@ class SAMEDecoder : public Component {
 
  protected:
   void feed_sample_(int16_t s);
-  void emit_bit_(bool bit, float bit_llr);
+  void emit_bit_(bool bit);
   void rearm_sync_();
   void reprime_detector_();
   void reset_capture_();
@@ -114,7 +113,6 @@ class SAMEDecoder : public Component {
   void check_decode_watchdog_();
 
   void update_preamble_gate_(float mark_e, float space_e);
-  bool soft_zczc_match_(float bit_llr, int &out_preamble_len, bool &out_fallback);
 
   void fire_sync_once_();
   void fire_eom_();
@@ -207,32 +205,11 @@ class SAMEDecoder : public Component {
   float w_off_{0.0f};
   uint32_t samples_seen_{0};
 
-  // ---- Acquisition bandwidth boost (fast-acquire without phase reset) ----
-  // On signal onset, temporarily multiply KP/KI by acq_boost_ so the loop
-  // settles within the preamble runway (~128 symbols) instead of ~600. NEVER
-  // resets phase or w_off; ramps back to nominal on convergence or timeout.
-  std::atomic<float> acq_boost_{4.0f};
-  bool acq_active_{false};
-  uint32_t acq_bits_left_{0};
-  static constexpr uint32_t ACQ_MAX_BITS = 160;   // ~300 ms budget
-  float acq_err_ewma_{1.0f};                       // |timing error| EWMA
-  static constexpr float ACQ_ERR_ALPHA = 0.05f;
-  static constexpr float ACQ_CONVERGED = 0.08f;    // |err| below -> converged
-  int acq_converged_run_{0};
-  static constexpr int ACQ_CONVERGED_NEED = 24;    // consecutive good symbols
-
   float last_bit_llr_{0.0f};
   SoftBurst soft_bursts_[3];
   SoftBurst soft_cur_;
   static constexpr float LLR_EPS = 1.0f;
   int bad_char_run_{0};
-
-  // ---- Soft ZCZC correlation (timing-tolerant sync) ----
-  static constexpr int ZCZC_BITS = 32;
-  float zczc_llr_hist_[ZCZC_BITS];   // ring of recent per-bit LLRs
-  int zczc_hist_pos_{0};
-  int zczc_hist_fill_{0};
-  static constexpr float SOFT_ZCZC_THRESH = 0.35f;  // mean matched |LLR| gate
 
   bool preamble_status_{true};
   std::atomic<float> preamble_energy_mult_{8.0f};
@@ -256,9 +233,12 @@ class SAMEDecoder : public Component {
   uint32_t eom_context_ms_{120000};
   uint32_t last_valid_header_ms_{0};
 
+  // Decode watchdog: if a decode session (LED on) persists this long without a
+  // successful emit or EOM, abandon it (emit valid partial, else discard) and
+  // clear the indicator so state never hangs.
   std::atomic<uint32_t> decode_watchdog_ms_{10000};
-  bool decode_active_{false};
-  uint32_t decode_active_since_{0};
+  bool decode_active_{false};        // true from sync until emit/EOM/watchdog
+  uint32_t decode_active_since_{0};  // millis() when decode_active_ went true
 
   bool ab_required_{false};
   uint8_t ab_byte_{0};
