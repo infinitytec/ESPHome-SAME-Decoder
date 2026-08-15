@@ -1,14 +1,5 @@
 // components/same_decoder/same_decoder.cpp
-// Commercial-style SAME decoder with soft-decision (2A+2B) burst combining:
-//   - Continuous Gardner-style timing recovery. ALWAYS tracks during CAPTURE
-//     (gated by decision confidence only); the tone-gate freeze applies only
-//     while HUNT_SYNC-idle, so the clock is never starved during real signal.
-//   - Strong "ZCZC" tiers (T1-T4) are the SOLE acquisition path.
-//   - Passive frequency-domain preamble gate (diagnostic ONLY; off the loop).
-//   - Tolerant capture: one bad char no longer shreds the burst.
-//   - Per-bit LLR (ln(Em)-ln(Es)) buffered per burst; SoftCombiner does
-//     quality-anchored, bit-level combining. Hard majority kept as fallback.
-//   - EOM (NNNN) requires recent-header context.
+// Soft-decision SAME decoder + continuous timing recovery + decode watchdog.
 #include "same_decoder.h"
 #include "same_soft.h"
 #include "same_event_codes.h"
@@ -39,9 +30,12 @@ static std::string sanitize_ascii(const std::string &in) {
   return out;
 }
 
+// SAME chars: digits, UPPER and lower letters, '-', '+', '/'. Lowercase is
+// accepted so non-standard sender/callsign fields (and test files) don't shred.
 static bool is_valid_same_char(char c) {
   return (c >= '0' && c <= '9') ||
          (c >= 'A' && c <= 'Z') ||
+         (c >= 'a' && c <= 'z') ||
          c == '-' || c == '+' || c == '/';
 }
 
@@ -105,7 +99,7 @@ void SAMEDecoder::update_agc_(float mag) {
 
 void SAMEDecoder::setup() {
   this->compute_coeffs_();
-  ESP_LOGCONFIG(TAG, "SAME decoder ready (soft-decision combine + continuous TR, gain=%.1f, agc=%s).",
+  ESP_LOGCONFIG(TAG, "SAME decoder ready (soft-decision combine + continuous TR + watchdog, gain=%.1f, agc=%s).",
                 this->gain_, this->agc_enable_ ? "on" : "off");
   this->reset_capture_();
   this->last_feed_ms_.store(millis(), std::memory_order_relaxed);
@@ -164,6 +158,8 @@ void SAMEDecoder::dump_config() {
                 this->preamble_energy_mult_.load(std::memory_order_relaxed));
   ESP_LOGCONFIG(TAG, "  EOM requires context: %s (%" PRIu32 " ms)",
                 this->eom_require_context_ ? "yes" : "no", this->eom_context_ms_);
+  ESP_LOGCONFIG(TAG, "  Decode watchdog: %" PRIu32 " ms",
+                this->decode_watchdog_ms_.load(std::memory_order_relaxed));
   ESP_LOGCONFIG(TAG, "  AB preamble required: %s (min match %d)", this->ab_required_ ? "yes" : "no", AB_MIN_MATCH);
   ESP_LOGCONFIG(TAG, "  Timeout (>=2 bursts): %" PRIu32 " ms", this->timeout_ms_.load(std::memory_order_relaxed));
   ESP_LOGCONFIG(TAG, "  Single-burst min: %" PRIu32 " ms", this->single_burst_min_ms_);
@@ -230,6 +226,26 @@ void SAMEDecoder::fire_eom_() {
   if (p < 8) this->eom_pending_.store(p + 1, std::memory_order_release);
 }
 
+// Decode watchdog: if a decode session has been active (LED on) too long with
+// no emit/EOM, abandon it. Emit a valid partial if we have one; then reset and
+// clear the indicator so device state never hangs.
+void SAMEDecoder::check_decode_watchdog_() {
+  if (!this->decode_active_)
+    return;
+  uint32_t wd = this->decode_watchdog_ms_.load(std::memory_order_relaxed);
+  if ((uint32_t) (millis() - this->decode_active_since_) < wd)
+    return;
+
+  ESP_LOGW(TAG, "Decode watchdog fired (%" PRIu32 " ms): abandoning stuck session.", wd);
+  // Attempt to salvage a valid partial header (vote_and_emit_ applies the
+  // structural/weak-evidence gate; garbage is rejected there).
+  if (this->burst_idx_ >= 1)
+    this->vote_and_emit_(true, this->fallback_sync_used_);
+  this->reset_capture_();
+  this->decode_active_ = false;
+  this->fire_eom_();   // clear the decode indicator (LED off)
+}
+
 void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
   uint32_t now = millis();
   uint32_t prev = this->last_feed_ms_.exchange(now, std::memory_order_relaxed);
@@ -252,6 +268,9 @@ void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
     if (v < -32768.0f) v = -32768.0f;
     this->feed_sample_((int16_t) v);
   }
+
+  // Watchdog checked once per audio block (cheap; block cadence ~tens of ms).
+  this->check_decode_watchdog_();
 }
 
 static inline uint32_t effective_timeout(int burst_idx, uint32_t slider_ms, uint32_t single_min_ms) {
@@ -315,7 +334,7 @@ void SAMEDecoder::feed_sample_(int16_t s) {
   float les = std::log(es_c > LLR_EPS ? es_c : LLR_EPS);
   this->last_bit_llr_ = lem - les;
 
-  this->update_preamble_gate_(em_c, es_c);   // diagnostic only now
+  this->update_preamble_gate_(em_c, es_c);
 
   bool primed = this->samples_seen_ >= (uint32_t) (CENTER_LAG + TR_DELTA + GWIN + 2);
   if (primed) {
@@ -332,11 +351,6 @@ void SAMEDecoder::feed_sample_(int16_t s) {
     float e_raw = (d_late - d_early) / (d_late + d_early + eps);
     float conf  = d_center / (e_center + eps);
 
-    // FIX 1: ALWAYS track during CAPTURE (we synced on ZCZC, so signal is
-    // present by definition). During HUNT_SYNC-idle, the confidence gate alone
-    // suppresses winding on noise (low signal -> low conf -> e=0). The passive
-    // tone-gate no longer gates the loop -- that mechanism was starving the
-    // clock during real data and causing progressive drift.
     bool track = (this->phase_state_ == CAPTURE) || (conf >= TR_CONF_MIN);
     if (track && conf >= TR_CONF_MIN) {
       float e = e_raw;
@@ -349,13 +363,10 @@ void SAMEDecoder::feed_sample_(int16_t s) {
       if (this->w_off_ >  this->tr_woff_clamp_) this->w_off_ =  this->tr_woff_clamp_;
       if (this->w_off_ < -this->tr_woff_clamp_) this->w_off_ = -this->tr_woff_clamp_;
     } else if (this->phase_state_ != CAPTURE) {
-      // Idle no-signal leak toward zero (prevents long-term drift while hunting).
       this->w_off_ *= 0.999f;
       if (std::fabs(this->w_off_) < 1e-8f)
         this->w_off_ = 0.0f;
     }
-    // NOTE: during CAPTURE with momentarily low confidence we simply skip the
-    // update this symbol (no leak), preserving the established lock.
   }
 
   this->emit_bit_(bit);
@@ -400,6 +411,8 @@ void SAMEDecoder::reset_capture_() {
   this->ab_nbits_ = 0;
   this->ab_match_count_ = 0;
   this->eom_n_count_ = 0;
+  // NOTE: decode_active_ is cleared explicitly by emit/EOM/watchdog, not here,
+  // so a mid-session reset (differing burst) doesn't drop the indicator early.
 }
 
 bool SAMEDecoder::ab_preamble_ok_() const {
@@ -575,6 +588,11 @@ void SAMEDecoder::emit_bit_(bool bit) {
       ESP_LOGD(TAG, "Sync via %s (AB=%d, preamble=%s). Capture start.",
                tier, this->ab_match_count_, this->preamble_present_ ? "present" : "no");
 
+      // Mark decode session active (drives the watchdog + LED-on).
+      if (!this->decode_active_) {
+        this->decode_active_ = true;
+        this->decode_active_since_ = millis();
+      }
       this->fire_sync_once_();
 
       this->begin_new_capture_(preamble_len, fb);
@@ -606,8 +624,9 @@ void SAMEDecoder::emit_bit_(bool bit) {
         ESP_LOGD(TAG, "EOM (NNNN) - closing session.");
         if (this->burst_idx_ >= 1)
           this->vote_and_emit_(true, this->fallback_sync_used_);
-        this->fire_eom_();
         this->reset_capture_();
+        this->decode_active_ = false;   // session ended
+        this->fire_eom_();
       } else {
         ESP_LOGD(TAG, "NNNN seen but no recent header context; ignoring.");
         this->eom_n_count_ = 0;
@@ -706,6 +725,9 @@ void SAMEDecoder::note_emit_() {
   this->ab_match_count_ = 0;
   this->eom_n_count_ = 0;
   this->idle_edge_samples_ = 48000 / 2;
+  // A successful emit ends the active decode session for watchdog purposes.
+  // (The LED is cleared by on_alert; EOM may still arrive to double-confirm.)
+  this->decode_active_ = false;
 }
 
 void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
