@@ -1,11 +1,5 @@
 // components/same_decoder/same_decoder.cpp
-// Soft-decision SAME decoder + continuous timing recovery with:
-//   - Acquisition bandwidth boost (fast-acquire WITHOUT phase reset): on signal
-//     onset, KP/KI are boosted so the loop converges within the preamble runway,
-//     fixing the probabilistic first-burst miss. Ramps back on convergence.
-//   - Soft/multi timing-tolerant ZCZC correlation (catches burst 0 even when the
-//     clock is nearly-but-not-fully locked).
-//   - Decode watchdog, EOM context validation, lowercase-tolerant capture.
+// Soft-decision SAME decoder + continuous timing recovery + decode watchdog.
 #include "same_decoder.h"
 #include "same_soft.h"
 #include "same_event_codes.h"
@@ -36,6 +30,8 @@ static std::string sanitize_ascii(const std::string &in) {
   return out;
 }
 
+// SAME chars: digits, UPPER and lower letters, '-', '+', '/'. Lowercase is
+// accepted so non-standard sender/callsign fields (and test files) don't shred.
 static bool is_valid_same_char(char c) {
   return (c >= '0' && c <= '9') ||
          (c >= 'A' && c <= 'Z') ||
@@ -103,9 +99,8 @@ void SAMEDecoder::update_agc_(float mag) {
 
 void SAMEDecoder::setup() {
   this->compute_coeffs_();
-  ESP_LOGCONFIG(TAG, "SAME decoder ready (soft combine + acq-boost + soft ZCZC, gain=%.1f, agc=%s).",
+  ESP_LOGCONFIG(TAG, "SAME decoder ready (soft-decision combine + continuous TR + watchdog, gain=%.1f, agc=%s).",
                 this->gain_, this->agc_enable_ ? "on" : "off");
-  for (int i = 0; i < ZCZC_BITS; i++) this->zczc_llr_hist_[i] = 0.0f;
   this->reset_capture_();
   this->last_feed_ms_.store(millis(), std::memory_order_relaxed);
   this->fire_eom_();
@@ -152,14 +147,12 @@ void SAMEDecoder::loop() {
 }
 
 void SAMEDecoder::dump_config() {
-  ESP_LOGCONFIG(TAG, "SAME Decoder (soft combine + acq-boost + soft ZCZC):");
+  ESP_LOGCONFIG(TAG, "SAME Decoder (soft-decision combine + ZCZC tiers):");
   ESP_LOGCONFIG(TAG, "  Sample rate: %" PRIu32 " Hz", this->sample_rate_);
   ESP_LOGCONFIG(TAG, "  Base gain: %.1f  AGC: %s", this->gain_, this->agc_enable_ ? "on" : "off");
   ESP_LOGCONFIG(TAG, "  Freq offset: %.1f Hz", this->freq_offset_hz_);
   ESP_LOGCONFIG(TAG, "  Samples/bit: %.2f  Goertzel window: %d", this->samples_per_bit_, GWIN);
   ESP_LOGCONFIG(TAG, "  Coeffs mark=%.6f space=%.6f", this->coeff_mark_, this->coeff_space_);
-  ESP_LOGCONFIG(TAG, "  Acquisition boost: %.1fx (max %" PRIu32 " bits)",
-                this->acq_boost_.load(std::memory_order_relaxed), (uint32_t) ACQ_MAX_BITS);
   ESP_LOGCONFIG(TAG, "  Passive preamble gate: %s (energy mult %.1f, DIAGNOSTIC only)",
                 this->preamble_status_ ? "on" : "off",
                 this->preamble_energy_mult_.load(std::memory_order_relaxed));
@@ -167,6 +160,7 @@ void SAMEDecoder::dump_config() {
                 this->eom_require_context_ ? "yes" : "no", this->eom_context_ms_);
   ESP_LOGCONFIG(TAG, "  Decode watchdog: %" PRIu32 " ms",
                 this->decode_watchdog_ms_.load(std::memory_order_relaxed));
+  ESP_LOGCONFIG(TAG, "  AB preamble required: %s (min match %d)", this->ab_required_ ? "yes" : "no", AB_MIN_MATCH);
   ESP_LOGCONFIG(TAG, "  Timeout (>=2 bursts): %" PRIu32 " ms", this->timeout_ms_.load(std::memory_order_relaxed));
   ESP_LOGCONFIG(TAG, "  Single-burst min: %" PRIu32 " ms", this->single_burst_min_ms_);
   ESP_LOGCONFIG(TAG, "  Post-emit dead-time: %" PRIu32 " ms", this->post_emit_dead_ms_);
@@ -232,6 +226,9 @@ void SAMEDecoder::fire_eom_() {
   if (p < 8) this->eom_pending_.store(p + 1, std::memory_order_release);
 }
 
+// Decode watchdog: if a decode session has been active (LED on) too long with
+// no emit/EOM, abandon it. Emit a valid partial if we have one; then reset and
+// clear the indicator so device state never hangs.
 void SAMEDecoder::check_decode_watchdog_() {
   if (!this->decode_active_)
     return;
@@ -240,11 +237,13 @@ void SAMEDecoder::check_decode_watchdog_() {
     return;
 
   ESP_LOGW(TAG, "Decode watchdog fired (%" PRIu32 " ms): abandoning stuck session.", wd);
+  // Attempt to salvage a valid partial header (vote_and_emit_ applies the
+  // structural/weak-evidence gate; garbage is rejected there).
   if (this->burst_idx_ >= 1)
     this->vote_and_emit_(true, this->fallback_sync_used_);
   this->reset_capture_();
   this->decode_active_ = false;
-  this->fire_eom_();
+  this->fire_eom_();   // clear the decode indicator (LED off)
 }
 
 void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
@@ -270,6 +269,7 @@ void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
     this->feed_sample_((int16_t) v);
   }
 
+  // Watchdog checked once per audio block (cheap; block cadence ~tens of ms).
   this->check_decode_watchdog_();
 }
 
@@ -332,21 +332,9 @@ void SAMEDecoder::feed_sample_(int16_t s) {
 
   float lem = std::log(em_c > LLR_EPS ? em_c : LLR_EPS);
   float les = std::log(es_c > LLR_EPS ? es_c : LLR_EPS);
-  float bit_llr = lem - les;
-  this->last_bit_llr_ = bit_llr;
+  this->last_bit_llr_ = lem - les;
 
   this->update_preamble_gate_(em_c, es_c);
-
-  // ---- Acquisition boost trigger: on signal onset (tone present) while not yet
-  // capturing, engage the boost. Uses the same energy the gate computes; unlike
-  // the old fast-acquire, this ONLY changes gains -- no phase/w_off reset. ----
-  if (this->phase_state_ == HUNT_SYNC && this->tone_gate_ && !this->acq_active_) {
-    this->acq_active_ = true;
-    this->acq_bits_left_ = ACQ_MAX_BITS;
-    this->acq_err_ewma_ = 1.0f;
-    this->acq_converged_run_ = 0;
-    ESP_LOGD(TAG, "Acq-boost engaged (%.1fx).", this->acq_boost_.load(std::memory_order_relaxed));
-  }
 
   bool primed = this->samples_seen_ >= (uint32_t) (CENTER_LAG + TR_DELTA + GWIN + 2);
   if (primed) {
@@ -363,51 +351,25 @@ void SAMEDecoder::feed_sample_(int16_t s) {
     float e_raw = (d_late - d_early) / (d_late + d_early + eps);
     float conf  = d_center / (e_center + eps);
 
-    // Effective loop gains (boosted during acquisition; ratio preserved).
-    float kp = TR_KP, ki = TR_KI;
-    if (this->acq_active_) {
-      float b = this->acq_boost_.load(std::memory_order_relaxed);
-      kp *= b;
-      ki *= b;
-    }
-
     bool track = (this->phase_state_ == CAPTURE) || (conf >= TR_CONF_MIN);
     if (track && conf >= TR_CONF_MIN) {
       float e = e_raw;
-      float dphi = kp * e;
+      float dphi = TR_KP * e;
       if (dphi >  TR_DPHI_CLAMP) dphi =  TR_DPHI_CLAMP;
       if (dphi < -TR_DPHI_CLAMP) dphi = -TR_DPHI_CLAMP;
       this->phase_ += dphi;
 
-      this->w_off_ += ki * e;
+      this->w_off_ += TR_KI * e;
       if (this->w_off_ >  this->tr_woff_clamp_) this->w_off_ =  this->tr_woff_clamp_;
       if (this->w_off_ < -this->tr_woff_clamp_) this->w_off_ = -this->tr_woff_clamp_;
-
-      // Convergence tracking (drives boost ramp-down).
-      this->acq_err_ewma_ += ACQ_ERR_ALPHA * (std::fabs(e) - this->acq_err_ewma_);
-      if (this->acq_err_ewma_ < ACQ_CONVERGED) {
-        if (this->acq_converged_run_ < 1000) this->acq_converged_run_++;
-      } else {
-        this->acq_converged_run_ = 0;
-      }
     } else if (this->phase_state_ != CAPTURE) {
       this->w_off_ *= 0.999f;
       if (std::fabs(this->w_off_) < 1e-8f)
         this->w_off_ = 0.0f;
     }
-
-    // Ramp the boost back to nominal on convergence or bit-budget expiry.
-    if (this->acq_active_) {
-      if (this->acq_bits_left_ > 0) this->acq_bits_left_--;
-      if (this->acq_converged_run_ >= ACQ_CONVERGED_NEED || this->acq_bits_left_ == 0) {
-        ESP_LOGD(TAG, "Acq-boost done (err_ewma=%.3f, converged_run=%d, bits_left=%" PRIu32 ").",
-                 this->acq_err_ewma_, this->acq_converged_run_, this->acq_bits_left_);
-        this->acq_active_ = false;
-      }
-    }
   }
 
-  this->emit_bit_(bit, bit_llr);
+  this->emit_bit_(bit);
 
   if (this->burst_idx_ >= 1 && this->burst_idx_ < 3 && this->last_burst_ms_ != 0) {
     uint32_t to = effective_timeout(this->burst_idx_,
@@ -449,6 +411,8 @@ void SAMEDecoder::reset_capture_() {
   this->ab_nbits_ = 0;
   this->ab_match_count_ = 0;
   this->eom_n_count_ = 0;
+  // NOTE: decode_active_ is cleared explicitly by emit/EOM/watchdog, not here,
+  // so a mid-session reset (differing burst) doesn't drop the indicator early.
 }
 
 bool SAMEDecoder::ab_preamble_ok_() const {
@@ -572,54 +536,7 @@ void SAMEDecoder::finish_burst_() {
   this->rearm_sync_();
 }
 
-// Soft, timing-tolerant ZCZC detector. Correlates the recent per-bit LLR history
-// against the expected ZCZC bit pattern (LSB-first). Because it uses the signed
-// LLR margin rather than hard bits, it tolerates small timing error during
-// acquisition -> catches burst 0 when the clock is nearly (not fully) locked.
-bool SAMEDecoder::soft_zczc_match_(float bit_llr, int &out_preamble_len, bool &out_fallback) {
-  // Push newest LLR into the ring.
-  this->zczc_llr_hist_[this->zczc_hist_pos_] = bit_llr;
-  this->zczc_hist_pos_ = (this->zczc_hist_pos_ + 1) % ZCZC_BITS;
-  if (this->zczc_hist_fill_ < ZCZC_BITS) this->zczc_hist_fill_++;
-  if (this->zczc_hist_fill_ < ZCZC_BITS)
-    return false;
-
-  // Expected ZCZC as 32 bits, LSB-first per byte, byte order Z,C,Z,C (matches
-  // the hard SYNC_ZCZC layout). Build once (static).
-  static bool init = false;
-  static int8_t expect[ZCZC_BITS];   // +1 for '1', -1 for '0'
-  if (!init) {
-    const char zczc[4] = {'Z', 'C', 'Z', 'C'};
-    int idx = 0;
-    for (int b = 0; b < 4; b++) {
-      uint8_t ch = (uint8_t) zczc[b];
-      for (int k = 0; k < 8; k++)
-        expect[idx++] = (ch & (1u << k)) ? 1 : -1;
-    }
-    init = true;
-  }
-
-  // The ring holds the last 32 bits in arrival order; oldest is at hist_pos_.
-  float score = 0.0f, absacc = 0.0f;
-  for (int i = 0; i < ZCZC_BITS; i++) {
-    int ri = (this->zczc_hist_pos_ + i) % ZCZC_BITS;
-    float l = this->zczc_llr_hist_[ri];
-    score += expect[i] * l;
-    absacc += std::fabs(l);
-  }
-  if (absacc < 1e-6f)
-    return false;
-  float norm = score / absacc;   // in [-1, +1]; +1 = perfect ZCZC
-
-  if (norm >= SOFT_ZCZC_THRESH) {
-    out_preamble_len = 4;
-    out_fallback = false;
-    return true;
-  }
-  return false;
-}
-
-void SAMEDecoder::emit_bit_(bool bit, float bit_llr) {
+void SAMEDecoder::emit_bit_(bool bit) {
   if (this->phase_state_ == HUNT_SYNC) {
     this->sync_shift_ = (this->sync_shift_ >> 1) | ((uint32_t) (bit ? 1u : 0u) << 31);
 
@@ -656,29 +573,22 @@ void SAMEDecoder::emit_bit_(bool bit, float bit_llr) {
     bool t4 = (this->idle_edge_samples_ > 0) &&
               ((this->sync_shift_ & MASK16) == SYNC_ZC_16);
 
-    // Soft ZCZC (timing-tolerant). Guarded to preamble_len=4 like the hard ZCZC.
-    int soft_plen = 4;
-    bool soft_fb = false;
-    bool tsoft = this->soft_zczc_match_(bit_llr, soft_plen, soft_fb);
-
-    if (t1 || t1b || t2 || t3 || t4 || tsoft) {
+    if (t1 || t1b || t2 || t3 || t4) {
       int preamble_len;
       bool fb = false;
       const char *tier;
-      if (t1 || t1b)      { preamble_len = 4; tier = t1 ? "ZCZC" : "ZCZC(misread)"; }
-      else if (tsoft)     { preamble_len = 4; tier = "ZCZC(soft)"; }
-      else if (t2)        { preamble_len = 2; fb = true; tier = "ZC- fallback"; }
-      else if (t3)        { preamble_len = 3; tier = "CZC/ZCZ clip"; }
-      else                { preamble_len = 2; tier = "ZC idle-edge"; }
+      if (t1 || t1b) { preamble_len = 4; tier = t1 ? "ZCZC" : "ZCZC(misread)"; }
+      else if (t2)   { preamble_len = 2; fb = true; tier = "ZC- fallback"; }
+      else if (t3)   { preamble_len = 3; tier = "CZC/ZCZ clip"; }
+      else           { preamble_len = 2; tier = "ZC idle-edge"; }
 
       if (this->burst_idx_ == 0)
         this->fallback_sync_used_ = fb || t3 || t4;
 
-      ESP_LOGD(TAG, "Sync via %s (AB=%d, preamble=%s, acq=%s). Capture start.",
-               tier, this->ab_match_count_,
-               this->preamble_present_ ? "present" : "no",
-               this->acq_active_ ? "boosting" : "nominal");
+      ESP_LOGD(TAG, "Sync via %s (AB=%d, preamble=%s). Capture start.",
+               tier, this->ab_match_count_, this->preamble_present_ ? "present" : "no");
 
+      // Mark decode session active (drives the watchdog + LED-on).
       if (!this->decode_active_) {
         this->decode_active_ = true;
         this->decode_active_since_ = millis();
@@ -691,7 +601,7 @@ void SAMEDecoder::emit_bit_(bool bit, float bit_llr) {
   }
 
   // CAPTURE
-  this->soft_cur_.llr.push_back(bit_llr);
+  this->soft_cur_.llr.push_back(this->last_bit_llr_);
 
   this->cur_byte_ >>= 1;
   if (bit) this->cur_byte_ |= 0x80;
@@ -715,7 +625,7 @@ void SAMEDecoder::emit_bit_(bool bit, float bit_llr) {
         if (this->burst_idx_ >= 1)
           this->vote_and_emit_(true, this->fallback_sync_used_);
         this->reset_capture_();
-        this->decode_active_ = false;
+        this->decode_active_ = false;   // session ended
         this->fire_eom_();
       } else {
         ESP_LOGD(TAG, "NNNN seen but no recent header context; ignoring.");
@@ -815,6 +725,8 @@ void SAMEDecoder::note_emit_() {
   this->ab_match_count_ = 0;
   this->eom_n_count_ = 0;
   this->idle_edge_samples_ = 48000 / 2;
+  // A successful emit ends the active decode session for watchdog purposes.
+  // (The LED is cleared by on_alert; EOM may still arrive to double-confirm.)
   this->decode_active_ = false;
 }
 
