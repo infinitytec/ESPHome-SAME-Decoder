@@ -6,6 +6,8 @@
 //   - Passive frequency-domain preamble gate (diagnostic only; no DSP effect).
 //   - LED/indicator on ZCZC only; off at boot/EOM/alert.
 //   - EOM (NNNN) requires recent-header context to be accepted.
+//   - Immediate emit ONLY on a COMPLETE single burst; damaged/partial bursts
+//     fall through to triple-burst voting.
 #include "same_decoder.h"
 #include "same_event_codes.h"
 #include "esphome/core/log.h"
@@ -185,16 +187,9 @@ void SAMEDecoder::reprime_detector_() {
 }
 
 // ---- passive preamble gate (diagnostic only) ----------------------------
-// Frequency-domain presence detector. Uses the mark/space Goertzel energies that
-// feed_sample_ already computes. It NEVER resets or biases the clock; it only:
-//   (a) publishes a diagnostic "preamble present" state (with hysteresis), and
-//   (b) sets tone_gate_ so the timing loop can freeze its error integrator when
-//       no tone is present (prevents winding on silence/voice/noise).
 void SAMEDecoder::update_preamble_gate_(float mark_e, float space_e) {
   float tone_energy = mark_e + space_e;
 
-  // Clipped-EMA noise floor: only let the floor rise on low-energy samples so a
-  // sustained tone cannot ratchet the floor upward.
   float f = this->pre_noise_floor_;
   float target = std::min(tone_energy, f);
   f += PRE_FLOOR_ALPHA * (target - f);
@@ -207,7 +202,6 @@ void SAMEDecoder::update_preamble_gate_(float mark_e, float space_e) {
   bool inst = (tone_energy > mult * f) && (balance < PRE_BALANCE_MAX);
   this->tone_gate_ = inst;
 
-  // Hysteresis for the published state.
   uint32_t now = millis();
   if (inst) {
     this->pre_off_ms_ = 0;
@@ -242,7 +236,6 @@ void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
   uint32_t now = millis();
   uint32_t prev = this->last_feed_ms_.exchange(now, std::memory_order_relaxed);
   if (prev != 0 && (uint32_t) (now - prev) >= FEED_GAP_MS) {
-    // A real feed gap (stream restart) is the ONLY place we re-center the clock.
     this->w_off_ = 0.0f;
     this->phase_ = 0.0f;
     this->ab_byte_ = 0;
@@ -320,7 +313,6 @@ void SAMEDecoder::feed_sample_(int16_t s) {
   float es_c = goertzel_ring_end(this->ring_, RINGLEN, t_center, GWIN, this->coeff_space_);
   bool bit = em_c > es_c;
 
-  // Passive preamble gate + tone presence (diagnostic + loop-freeze gate only).
   this->update_preamble_gate_(em_c, es_c);
 
   bool primed = this->samples_seen_ >= (uint32_t) (CENTER_LAG + TR_DELTA + GWIN + 2);
@@ -338,10 +330,6 @@ void SAMEDecoder::feed_sample_(int16_t s) {
     float e_raw = (d_late - d_early) / (d_late + d_early + eps);
     float conf  = d_center / (e_center + eps);
 
-    // Commercial-style continuous loop:
-    //  - When a tone is present AND confidence is adequate, track normally.
-    //  - When NO tone is present, FREEZE the error (don't wind on noise/voice)
-    //    and gently leak w_off_ toward zero to prevent long-term drift.
     if (this->tone_gate_ && conf >= TR_CONF_MIN) {
       float e = e_raw;
       float dphi = TR_KP * e;
@@ -353,7 +341,6 @@ void SAMEDecoder::feed_sample_(int16_t s) {
       if (this->w_off_ >  this->tr_woff_clamp_) this->w_off_ =  this->tr_woff_clamp_;
       if (this->w_off_ < -this->tr_woff_clamp_) this->w_off_ = -this->tr_woff_clamp_;
     } else {
-      // No-tone leak toward zero (very slow).
       this->w_off_ *= 0.999f;
       if (std::fabs(this->w_off_) < 1e-8f)
         this->w_off_ = 0.0f;
@@ -383,7 +370,6 @@ void SAMEDecoder::rearm_sync_() {
   this->plus_seen_ = false;
   this->tail_count_ = 0;
   this->eom_n_count_ = 0;
-  // NOTE: the continuous clock (phase_/w_off_) is intentionally NOT reset here.
 }
 
 void SAMEDecoder::reset_capture_() {
@@ -472,7 +458,6 @@ void SAMEDecoder::finish_burst_() {
 
   std::string this_burst = this->cur_burst_;
 
-  // Record recent valid-header context (used to gate EOM acceptance).
   if (this->header_is_strictly_valid_(this_burst))
     this->last_valid_header_ms_ = millis();
 
@@ -497,10 +482,12 @@ void SAMEDecoder::finish_burst_() {
     return;
   }
 
-  // Immediate emit on a single structurally-valid burst.
+  // Immediate emit ONLY on a COMPLETE single burst (full timing block present).
+  // A damaged/truncated burst does NOT short-circuit voting; we wait for
+  // consensus from bursts 2/3 instead.
   if (this->burst_idx_ == 1 && !this->early_emitted_ &&
-      this->header_is_strictly_valid_(this_burst)) {
-    ESP_LOGD(TAG, "Immediate emit on single structurally-valid burst.");
+      this->header_is_complete_(this_burst)) {
+    ESP_LOGD(TAG, "Immediate emit on single COMPLETE burst.");
     this->vote_and_emit_(false, this->fallback_sync_used_);
     this->early_emitted_ = true;
     this->rearm_sync_();
@@ -568,7 +555,6 @@ void SAMEDecoder::emit_bit_(bool bit) {
       ESP_LOGD(TAG, "Sync via %s (AB=%d, preamble=%s). Capture start.",
                tier, this->ab_match_count_, this->preamble_present_ ? "present" : "no");
 
-      // LED/indicator ON only at real sync (ZCZC tiers).
       this->fire_sync_once_();
 
       this->begin_new_capture_(preamble_len, fb);
@@ -591,9 +577,6 @@ void SAMEDecoder::emit_bit_(bool bit) {
   if (c == 'N') {
     this->eom_n_count_++;
     if (this->eom_n_count_ >= 4) {
-      // EOM context validation: only accept NNNN if we recently saw a valid
-      // header. This prevents mis-clocked header data (or random audio) from
-      // being mistaken for an End-Of-Message.
       bool has_context = (!this->eom_require_context_) ||
                          (this->last_valid_header_ms_ != 0 &&
                           (uint32_t) (millis() - this->last_valid_header_ms_) <= this->eom_context_ms_);
@@ -601,7 +584,7 @@ void SAMEDecoder::emit_bit_(bool bit) {
         ESP_LOGD(TAG, "EOM (NNNN) - closing session.");
         if (this->burst_idx_ >= 1)
           this->vote_and_emit_(true, this->fallback_sync_used_);
-        this->fire_eom_();          // indicator off: message is over
+        this->fire_eom_();
         this->reset_capture_();
       } else {
         ESP_LOGD(TAG, "NNNN seen but no recent header context; ignoring (not a real EOM).");
@@ -654,6 +637,34 @@ bool SAMEDecoder::header_is_strictly_valid_(const std::string &header) {
   return true;
 }
 
+// A COMPLETE header requires the full structure through the timing block:
+// ZCZC-ORG-EEE-...+TTTT-JJJHHMM  -- i.e. strictly valid, AND a non-empty purge
+// field right after '+', AND at least one '-' after the '+' with a non-empty
+// issue-time field. This prevents emitting on a header truncated at the '+'.
+bool SAMEDecoder::header_is_complete_(const std::string &header) {
+  if (!this->header_is_strictly_valid_(header))
+    return false;
+  size_t plus = header.find('+');
+  if (plus == std::string::npos)
+    return false;
+  // Purge field: at least one char between '+' and the next '-'.
+  size_t dash_after = header.find('-', plus + 1);
+  if (dash_after == std::string::npos)
+    return false;                       // nothing after '+TTTT' -> truncated
+  if (dash_after <= plus + 1)
+    return false;                       // empty purge field '+-...'
+  // Issue-time field: at least one char after that dash.
+  if (dash_after + 1 >= header.size())
+    return false;                       // ends right at the dash -> truncated
+  // Require the issue-time field to have some length (JJJHHMM ~ 7 chars); accept
+  // >=4 to tolerate a slightly clipped tail while still rejecting bare fragments.
+  size_t issue_end = header.find('-', dash_after + 1);
+  size_t issue_len = (issue_end == std::string::npos)
+                         ? (header.size() - (dash_after + 1))
+                         : (issue_end - (dash_after + 1));
+  return issue_len >= 4;
+}
+
 bool SAMEDecoder::header_passes_semantic_(const SameAlert &a) const {
   if (a.originator.size() != 3 || a.event_code.size() != 3)
     return false;
@@ -674,16 +685,10 @@ std::string SAMEDecoder::canonicalize_front_(const std::string &voted) {
 
 void SAMEDecoder::note_emit_() {
   this->last_emit_ms_ = millis();
-
-  // Clear correlator/EOM state. The continuous clock is intentionally preserved
-  // (not reset) so the following bursts/preamble keep their convergence.
   this->ab_byte_ = 0;
   this->ab_nbits_ = 0;
   this->ab_match_count_ = 0;
   this->eom_n_count_ = 0;
-
-  // Re-open a short Tier-4 window so a slightly weak follow-up header still has
-  // the extra acquisition path available.
   this->idle_edge_samples_ = 48000 / 2;
 }
 
@@ -759,7 +764,7 @@ void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
   this->session_emitted_header_ = header;
   this->last_global_header_ = header;
   this->last_global_ms_ = now;
-  this->last_valid_header_ms_ = now;   // record header context for EOM validation
+  this->last_valid_header_ms_ = now;
   this->note_emit_();
   this->publish_alert_(alert);
 }
