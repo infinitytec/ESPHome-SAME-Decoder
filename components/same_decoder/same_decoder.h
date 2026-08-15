@@ -1,17 +1,4 @@
 // components/same_decoder/same_decoder.h
-// Soft-decision SAME decoder with continuous timing recovery, AB preamble
-// lock + phase re-center, multi-burst voting, and decode watchdog.
-//
-// SAME digital format (NWS / FCC):
-//   - Preamble: 16 × 0xAB (binary 10101011, LSB first) before every header
-//     and every EOM. Used for bit sync, byte framing, and AGC.
-//   - Data: 520 + 5/6 baud AFSK, mark 2083⅓ Hz, space 1562.5 Hz,
-//     continuous phase, 8-bit bytes, no start/stop bits.
-//   - Header begins with ASCII "ZCZC" and is repeated three times.
-//
-// Primary arming path is a robust AB correlator that, once locked, forces a
-// phase re-center so the continuous early/late TR loop starts from a known
-// mid-bit sampling point. Short ZC/ZCZC tiers remain as secondary fallbacks.
 #pragma once
 
 #include "esphome/core/component.h"
@@ -83,6 +70,16 @@ class SAMEDecoder : public Component {
   void set_preamble_status(bool v) { this->preamble_status_ = v; }
   void set_preamble_energy_mult(float v) { this->preamble_energy_mult_.store(v, std::memory_order_relaxed); }
 
+  // --- Option 3: continuous preamble-assisted acquisition setters ---
+  void set_pre_td_thresh(float v) { this->pre_td_thresh_ = v; }
+  void set_pre_abd5_ham_thresh(int v) { this->pre_abd5_ham_thresh_ = v; }
+  void set_tr_kp_acq_mult(float v) { this->tr_kp_acq_mult_ = v; }
+  void set_tr_ki_acq_mult(float v) { this->tr_ki_acq_mult_ = v; }
+  void set_kpki_slew_symbols(int v) { this->kpki_slew_symbols_ = v; }
+  void set_tr_woff_clamp_acq_factor(float v) { this->tr_woff_clamp_acq_factor_ = v; }
+  void set_zczc_ham_relaxed(int v) { this->zczc_ham_relaxed_ = v; }
+  void set_preamble_recent_ms(uint32_t v) { this->preamble_recent_ms_ = v; }
+
   void set_eom_require_context(bool v) { this->eom_require_context_ = v; }
   void set_eom_context_ms(uint32_t v) { this->eom_context_ms_ = v; }
 
@@ -124,9 +121,13 @@ class SAMEDecoder : public Component {
   bool ab_preamble_ok_() const;
   void note_emit_();
   void check_decode_watchdog_();
-  void lock_from_ab_preamble_();
 
   void update_preamble_gate_(float mark_e, float space_e);
+
+  // --- Option 3 helpers ---
+  void update_preamble_metrics_(bool bit, float llr);
+  void update_timing_gains_();
+  void copy_llrs_from_ring_(int n_bits);
 
   void fire_sync_once_();
   void fire_eom_();
@@ -237,6 +238,41 @@ class SAMEDecoder : public Component {
   static constexpr uint32_t PRE_ON_DWELL_MS = 25;
   static constexpr uint32_t PRE_OFF_DWELL_MS = 150;
 
+  // --- Option 3: continuous preamble-assisted acquisition state ---
+  // Per-bit LLR ring so a ZCZC (T1/T1b) hit can backfill the 32 header bits
+  // (aligned to the first 'Z') into soft_cur_ for the soft combiner.
+  static constexpr int LLR_RING_BITS = 4096;  // power of two; ~16 KB of float
+  float llr_ring_[LLR_RING_BITS];
+  uint32_t llr_head_{0};
+
+  // Preamble (T0) correlator: transition-density + AB/D5 min-hamming.
+  uint64_t trans_shift_{0};
+  uint16_t pre_shift_{0};
+  static constexpr int PRE_TD_WINDOW_BITS = 64;
+  float pre_td_thresh_{0.70f};
+  int pre_abd5_ham_thresh_{2};
+  float transition_ratio_{0.0f};
+  int pre_min_hamming_{16};
+  uint32_t last_preamble_seen_ms_{0};
+  uint32_t preamble_recent_ms_{200};
+
+  // Timing gearshift (bumpless): runtime Kp/Ki that slew between track and acq.
+  float tr_kp_cur_{TR_KP};
+  float tr_ki_cur_{TR_KI};
+  float tr_kp_acq_mult_{2.0f};
+  float tr_ki_acq_mult_{1.5f};
+  int kpki_slew_symbols_{16};
+  int kpki_slew_countdown_{0};
+  bool in_acq_gains_{false};
+  float tr_woff_clamp_acq_factor_{0.6f};
+
+  // Relaxed ZCZC hamming when preamble present/recent.
+  int zczc_ham_relaxed_{2};
+
+  // Diagnostics.
+  uint32_t zczc_relaxed_hits_{0};
+  uint32_t preamble_on_events_{0};
+
   uint32_t last_burst_ms_{0};
   std::atomic<uint32_t> timeout_ms_{3000};
   uint32_t single_burst_min_ms_{7000};
@@ -254,29 +290,11 @@ class SAMEDecoder : public Component {
   bool decode_active_{false};        // true from sync until emit/EOM/watchdog
   uint32_t decode_active_since_{0};  // millis() when decode_active_ went true
 
-  // AB preamble (0xAB = 10101011 LSB-first). Spec requires 16 consecutive
-  // bytes before every header/EOM. We track a running match quality that
-  // tolerates single-bit errors and, once locked, force a phase re-center.
-  // The lock is latched for AB_LOCK_HOLD_MS after acquisition so that the
-  // subsequent non-AB header bits do not immediately clear it (the preamble
-  // is only ~246 ms long at 520.83 baud; ZCZC follows immediately after).
   bool ab_required_{false};
   uint8_t ab_byte_{0};
   int ab_nbits_{0};
   int ab_match_count_{0};
-  bool ab_locked_{false};
-  uint32_t ab_lock_ms_{0};   // millis() when lock was acquired
-  // Minimum consecutive good AB bytes to declare lock and re-center phase.
-  // Spec is 16; 6 is a practical compromise for noisy streams while limiting
-  // false locks on random audio.
-  static constexpr int AB_MIN_MATCH = 2;       // legacy soft gate
-  static constexpr int AB_LOCK_THRESH = 6;     // strong lock → phase re-center
-  static constexpr int AB_MAX_COUNT = 32;
-  // Hold the lock this long after acquisition so ZCZC hunt still sees it.
-  // 16 AB bytes ≈ 246 ms; hold a bit longer to cover the start of the header.
-  static constexpr uint32_t AB_LOCK_HOLD_MS = 500;
-
-  bool ab_lock_active_() const;
+  static constexpr int AB_MIN_MATCH = 2;
 
   enum Phase { HUNT_SYNC, CAPTURE };
   Phase phase_state_{HUNT_SYNC};
