@@ -301,8 +301,8 @@ same_decoder:
   preamble_status: true
   preamble_energy_mult: 8.0
   # --- Option 3: continuous preamble-assisted acquisition (T0 preamble priming) ---
-  pre_td_thresh: 0.70            # preamble transition-density gate (0.5-1.0)
-  pre_abd5_ham_thresh: 2         # AB/D5 min-hamming over 16 bits to call preamble
+  pre_td_thresh: 0.52            # preamble transition-density gate (0.5-1.0)
+  pre_abd5_ham_thresh: 4         # AB/D5 min-hamming over 16 bits to call preamble
   tr_kp_acq_mult: 2.0            # timing-loop Kp multiplier during preamble
   tr_ki_acq_mult: 1.5            # timing-loop Ki multiplier during preamble
   kpki_slew_symbols: 16          # bumpless gain slew length (symbols)
