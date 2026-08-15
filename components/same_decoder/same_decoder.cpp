@@ -1,12 +1,13 @@
 // components/same_decoder/same_decoder.cpp
 // Commercial-style SAME decoder with soft-decision (2A+2B) burst combining:
-//   - Continuous Gardner-style timing recovery (never reset); error freezes on
-//     no-tone; w_off_ leaks toward zero.
+//   - Continuous Gardner-style timing recovery. ALWAYS tracks during CAPTURE
+//     (gated by decision confidence only); the tone-gate freeze applies only
+//     while HUNT_SYNC-idle, so the clock is never starved during real signal.
 //   - Strong "ZCZC" tiers (T1-T4) are the SOLE acquisition path.
-//   - Passive frequency-domain preamble gate (diagnostic only).
+//   - Passive frequency-domain preamble gate (diagnostic ONLY; off the loop).
 //   - Tolerant capture: one bad char no longer shreds the burst.
 //   - Per-bit LLR (ln(Em)-ln(Es)) buffered per burst; SoftCombiner does
-//     dash-anchored, bit-level combining. Hard majority kept as fallback.
+//     quality-anchored, bit-level combining. Hard majority kept as fallback.
 //   - EOM (NNNN) requires recent-header context.
 #include "same_decoder.h"
 #include "same_soft.h"
@@ -108,7 +109,7 @@ void SAMEDecoder::setup() {
                 this->gain_, this->agc_enable_ ? "on" : "off");
   this->reset_capture_();
   this->last_feed_ms_.store(millis(), std::memory_order_relaxed);
-  this->fire_eom_();   // ensure decode indicator OFF at boot
+  this->fire_eom_();
 }
 
 void SAMEDecoder::set_api_connected(bool connected) {
@@ -158,7 +159,7 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "  Freq offset: %.1f Hz", this->freq_offset_hz_);
   ESP_LOGCONFIG(TAG, "  Samples/bit: %.2f  Goertzel window: %d", this->samples_per_bit_, GWIN);
   ESP_LOGCONFIG(TAG, "  Coeffs mark=%.6f space=%.6f", this->coeff_mark_, this->coeff_space_);
-  ESP_LOGCONFIG(TAG, "  Passive preamble gate: %s (energy mult %.1f)",
+  ESP_LOGCONFIG(TAG, "  Passive preamble gate: %s (energy mult %.1f, DIAGNOSTIC only)",
                 this->preamble_status_ ? "on" : "off",
                 this->preamble_energy_mult_.load(std::memory_order_relaxed));
   ESP_LOGCONFIG(TAG, "  EOM requires context: %s (%" PRIu32 " ms)",
@@ -310,12 +311,11 @@ void SAMEDecoder::feed_sample_(int16_t s) {
   float es_c = goertzel_ring_end(this->ring_, RINGLEN, t_center, GWIN, this->coeff_space_);
   bool bit = em_c > es_c;
 
-  // Pseudo-LLR (additive, gain-invariant). Energy floor keeps ln stable.
   float lem = std::log(em_c > LLR_EPS ? em_c : LLR_EPS);
   float les = std::log(es_c > LLR_EPS ? es_c : LLR_EPS);
   this->last_bit_llr_ = lem - les;
 
-  this->update_preamble_gate_(em_c, es_c);
+  this->update_preamble_gate_(em_c, es_c);   // diagnostic only now
 
   bool primed = this->samples_seen_ >= (uint32_t) (CENTER_LAG + TR_DELTA + GWIN + 2);
   if (primed) {
@@ -332,7 +332,13 @@ void SAMEDecoder::feed_sample_(int16_t s) {
     float e_raw = (d_late - d_early) / (d_late + d_early + eps);
     float conf  = d_center / (e_center + eps);
 
-    if (this->tone_gate_ && conf >= TR_CONF_MIN) {
+    // FIX 1: ALWAYS track during CAPTURE (we synced on ZCZC, so signal is
+    // present by definition). During HUNT_SYNC-idle, the confidence gate alone
+    // suppresses winding on noise (low signal -> low conf -> e=0). The passive
+    // tone-gate no longer gates the loop -- that mechanism was starving the
+    // clock during real data and causing progressive drift.
+    bool track = (this->phase_state_ == CAPTURE) || (conf >= TR_CONF_MIN);
+    if (track && conf >= TR_CONF_MIN) {
       float e = e_raw;
       float dphi = TR_KP * e;
       if (dphi >  TR_DPHI_CLAMP) dphi =  TR_DPHI_CLAMP;
@@ -342,11 +348,14 @@ void SAMEDecoder::feed_sample_(int16_t s) {
       this->w_off_ += TR_KI * e;
       if (this->w_off_ >  this->tr_woff_clamp_) this->w_off_ =  this->tr_woff_clamp_;
       if (this->w_off_ < -this->tr_woff_clamp_) this->w_off_ = -this->tr_woff_clamp_;
-    } else {
+    } else if (this->phase_state_ != CAPTURE) {
+      // Idle no-signal leak toward zero (prevents long-term drift while hunting).
       this->w_off_ *= 0.999f;
       if (std::fabs(this->w_off_) < 1e-8f)
         this->w_off_ = 0.0f;
     }
+    // NOTE: during CAPTURE with momentarily low confidence we simply skip the
+    // update this symbol (no leak), preserving the established lock.
   }
 
   this->emit_bit_(bit);
@@ -466,7 +475,7 @@ void SAMEDecoder::finish_burst_() {
   ESP_LOGD(TAG, "Burst %d ascii: '%s'", this->burst_idx_, sanitize_ascii(this->cur_burst_).c_str());
 
   std::string this_burst = this->cur_burst_;
-  SoftBurst this_soft = this->soft_cur_;   // snapshot soft LLRs
+  SoftBurst this_soft = this->soft_cur_;
   this->soft_cur_.clear();
 
   if (this->header_is_strictly_valid_(this_burst))
@@ -574,7 +583,7 @@ void SAMEDecoder::emit_bit_(bool bit) {
   }
 
   // CAPTURE
-  this->soft_cur_.llr.push_back(this->last_bit_llr_);   // buffer soft LLR
+  this->soft_cur_.llr.push_back(this->last_bit_llr_);
 
   this->cur_byte_ >>= 1;
   if (bit) this->cur_byte_ |= 0x80;
@@ -610,7 +619,6 @@ void SAMEDecoder::emit_bit_(bool bit) {
     this->eom_n_count_ = 0;
   }
 
-  // TOLERANT CAPTURE: one invalid char no longer shreds the burst.
   if (!is_valid_same_char(c)) {
     this->cur_burst_ += '?';
     this->bad_char_run_++;
@@ -701,7 +709,6 @@ void SAMEDecoder::note_emit_() {
 }
 
 void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
-  // Hard majority (kept as fallback so we never regress below prior behavior).
   size_t maxlen = 0;
   for (int i = 0; i < 3; i++) maxlen = std::max(maxlen, this->bursts_[i].size());
   std::string hard;
@@ -719,7 +726,6 @@ void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
   }
   std::string hard_header = this->canonicalize_front_(hard);
 
-  // Soft-decision combine (bit-level LLR, dash-anchored). Falls back to hard.
   SoftResult sr = SoftCombiner::combine(this->soft_bursts_, 3, hard_header);
   std::string header = this->canonicalize_front_(sr.header);
 
