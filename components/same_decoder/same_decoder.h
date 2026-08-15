@@ -1,4 +1,17 @@
 // components/same_decoder/same_decoder.h
+// Soft-decision SAME decoder with continuous timing recovery, AB preamble
+// lock + phase re-center, multi-burst voting, and decode watchdog.
+//
+// SAME digital format (NWS / FCC):
+//   - Preamble: 16 × 0xAB (binary 10101011, LSB first) before every header
+//     and every EOM. Used for bit sync, byte framing, and AGC.
+//   - Data: 520 + 5/6 baud AFSK, mark 2083⅓ Hz, space 1562.5 Hz,
+//     continuous phase, 8-bit bytes, no start/stop bits.
+//   - Header begins with ASCII "ZCZC" and is repeated three times.
+//
+// Primary arming path is a robust AB correlator that, once locked, forces a
+// phase re-center so the continuous early/late TR loop starts from a known
+// mid-bit sampling point. Short ZC/ZCZC tiers remain as secondary fallbacks.
 #pragma once
 
 #include "esphome/core/component.h"
@@ -111,6 +124,7 @@ class SAMEDecoder : public Component {
   bool ab_preamble_ok_() const;
   void note_emit_();
   void check_decode_watchdog_();
+  void lock_from_ab_preamble_();
 
   void update_preamble_gate_(float mark_e, float space_e);
 
@@ -240,11 +254,20 @@ class SAMEDecoder : public Component {
   bool decode_active_{false};        // true from sync until emit/EOM/watchdog
   uint32_t decode_active_since_{0};  // millis() when decode_active_ went true
 
+  // AB preamble (0xAB = 10101011 LSB-first). Spec requires 16 consecutive
+  // bytes before every header/EOM. We track a running match quality that
+  // tolerates single-bit errors and, once locked, force a phase re-center.
   bool ab_required_{false};
   uint8_t ab_byte_{0};
   int ab_nbits_{0};
   int ab_match_count_{0};
-  static constexpr int AB_MIN_MATCH = 2;
+  bool ab_locked_{false};
+  // Minimum consecutive good AB bytes to declare lock and re-center phase.
+  // Spec is 16; 4–6 is enough for a reliable mid-bit sample point while still
+  // catching partial or noisy preambles.
+  static constexpr int AB_MIN_MATCH = 2;       // legacy soft gate
+  static constexpr int AB_LOCK_THRESH = 5;     // strong lock → phase re-center
+  static constexpr int AB_MAX_COUNT = 32;
 
   enum Phase { HUNT_SYNC, CAPTURE };
   Phase phase_state_{HUNT_SYNC};
