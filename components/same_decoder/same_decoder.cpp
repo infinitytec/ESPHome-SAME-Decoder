@@ -1,14 +1,15 @@
 // components/same_decoder/same_decoder.cpp
-// Commercial-style SAME decoder:
-//   - Continuous Gardner-style timing recovery (never reset). Loop error updates
-//     freeze when no tone is present; w_off_ leaks toward zero on no-tone.
+// Commercial-style SAME decoder with soft-decision (2A+2B) burst combining:
+//   - Continuous Gardner-style timing recovery (never reset); error freezes on
+//     no-tone; w_off_ leaks toward zero.
 //   - Strong "ZCZC" tiers (T1-T4) are the SOLE acquisition path.
-//   - Passive frequency-domain preamble gate (diagnostic only; no DSP effect).
-//   - LED/indicator on ZCZC only; off at boot/EOM/alert.
-//   - EOM (NNNN) requires recent-header context to be accepted.
-//   - Immediate emit ONLY on a COMPLETE single burst; damaged/partial bursts
-//     fall through to triple-burst voting.
+//   - Passive frequency-domain preamble gate (diagnostic only).
+//   - Tolerant capture: one bad char no longer shreds the burst.
+//   - Per-bit LLR (ln(Em)-ln(Es)) buffered per burst; SoftCombiner does
+//     dash-anchored, bit-level combining. Hard majority kept as fallback.
+//   - EOM (NNNN) requires recent-header context.
 #include "same_decoder.h"
+#include "same_soft.h"
 #include "same_event_codes.h"
 #include "esphome/core/log.h"
 #include "esphome/core/hal.h"
@@ -103,12 +104,11 @@ void SAMEDecoder::update_agc_(float mag) {
 
 void SAMEDecoder::setup() {
   this->compute_coeffs_();
-  ESP_LOGCONFIG(TAG, "SAME decoder ready (commercial-style: continuous TR, ZCZC tiers, gain=%.1f, agc=%s).",
+  ESP_LOGCONFIG(TAG, "SAME decoder ready (soft-decision combine + continuous TR, gain=%.1f, agc=%s).",
                 this->gain_, this->agc_enable_ ? "on" : "off");
   this->reset_capture_();
   this->last_feed_ms_.store(millis(), std::memory_order_relaxed);
-  // Ensure the decode indicator starts OFF at boot (fire the clear path once).
-  this->fire_eom_();
+  this->fire_eom_();   // ensure decode indicator OFF at boot
 }
 
 void SAMEDecoder::set_api_connected(bool connected) {
@@ -152,7 +152,7 @@ void SAMEDecoder::loop() {
 }
 
 void SAMEDecoder::dump_config() {
-  ESP_LOGCONFIG(TAG, "SAME Decoder (commercial-style: continuous TR + ZCZC tiers):");
+  ESP_LOGCONFIG(TAG, "SAME Decoder (soft-decision combine + ZCZC tiers):");
   ESP_LOGCONFIG(TAG, "  Sample rate: %" PRIu32 " Hz", this->sample_rate_);
   ESP_LOGCONFIG(TAG, "  Base gain: %.1f  AGC: %s", this->gain_, this->agc_enable_ ? "on" : "off");
   ESP_LOGCONFIG(TAG, "  Freq offset: %.1f Hz", this->freq_offset_hz_);
@@ -186,7 +186,6 @@ void SAMEDecoder::reprime_detector_() {
   this->eom_n_count_ = 0;
 }
 
-// ---- passive preamble gate (diagnostic only) ----------------------------
 void SAMEDecoder::update_preamble_gate_(float mark_e, float space_e) {
   float tone_energy = mark_e + space_e;
 
@@ -229,8 +228,6 @@ void SAMEDecoder::fire_eom_() {
   uint32_t p = this->eom_pending_.load(std::memory_order_relaxed);
   if (p < 8) this->eom_pending_.store(p + 1, std::memory_order_release);
 }
-
-// -------------------------------------------------------------------------
 
 void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
   uint32_t now = millis();
@@ -313,6 +310,11 @@ void SAMEDecoder::feed_sample_(int16_t s) {
   float es_c = goertzel_ring_end(this->ring_, RINGLEN, t_center, GWIN, this->coeff_space_);
   bool bit = em_c > es_c;
 
+  // Pseudo-LLR (additive, gain-invariant). Energy floor keeps ln stable.
+  float lem = std::log(em_c > LLR_EPS ? em_c : LLR_EPS);
+  float les = std::log(es_c > LLR_EPS ? es_c : LLR_EPS);
+  this->last_bit_llr_ = lem - les;
+
   this->update_preamble_gate_(em_c, es_c);
 
   bool primed = this->samples_seen_ >= (uint32_t) (CENTER_LAG + TR_DELTA + GWIN + 2);
@@ -370,6 +372,8 @@ void SAMEDecoder::rearm_sync_() {
   this->plus_seen_ = false;
   this->tail_count_ = 0;
   this->eom_n_count_ = 0;
+  this->bad_char_run_ = 0;
+  this->soft_cur_.clear();
 }
 
 void SAMEDecoder::reset_capture_() {
@@ -380,6 +384,9 @@ void SAMEDecoder::reset_capture_() {
   this->fallback_sync_used_ = false;
   this->session_emitted_header_.clear();
   for (int i = 0; i < 3; i++) this->bursts_[i].clear();
+  for (int i = 0; i < 3; i++) this->soft_bursts_[i].clear();
+  this->soft_cur_.clear();
+  this->bad_char_run_ = 0;
   this->ab_byte_ = 0;
   this->ab_nbits_ = 0;
   this->ab_match_count_ = 0;
@@ -392,6 +399,8 @@ bool SAMEDecoder::ab_preamble_ok_() const {
 
 void SAMEDecoder::begin_new_capture_(int preamble_len, bool fallback) {
   this->phase_state_ = CAPTURE;
+  this->soft_cur_.clear();
+  this->bad_char_run_ = 0;
   if (preamble_len >= 4)
     this->cur_burst_ = "ZCZC";
   else if (preamble_len == 3)
@@ -457,6 +466,8 @@ void SAMEDecoder::finish_burst_() {
   ESP_LOGD(TAG, "Burst %d ascii: '%s'", this->burst_idx_, sanitize_ascii(this->cur_burst_).c_str());
 
   std::string this_burst = this->cur_burst_;
+  SoftBurst this_soft = this->soft_cur_;   // snapshot soft LLRs
+  this->soft_cur_.clear();
 
   if (this->header_is_strictly_valid_(this_burst))
     this->last_valid_header_ms_ = millis();
@@ -465,14 +476,17 @@ void SAMEDecoder::finish_burst_() {
     ESP_LOGD(TAG, "Differing burst mid-collection: finalising old, starting new.");
     this->reset_capture_();
     this->bursts_[0] = this_burst;
+    this->soft_bursts_[0] = this_soft;
     this->burst_idx_ = 1;
     this->last_burst_ms_ = millis();
     this->rearm_sync_();
     return;
   }
 
-  if (this->burst_idx_ < 3)
+  if (this->burst_idx_ < 3) {
     this->bursts_[this->burst_idx_] = this_burst;
+    this->soft_bursts_[this->burst_idx_] = this_soft;
+  }
   this->burst_idx_++;
   this->last_burst_ms_ = millis();
 
@@ -482,9 +496,6 @@ void SAMEDecoder::finish_burst_() {
     return;
   }
 
-  // Immediate emit ONLY on a COMPLETE single burst (full timing block present).
-  // A damaged/truncated burst does NOT short-circuit voting; we wait for
-  // consensus from bursts 2/3 instead.
   if (this->burst_idx_ == 1 && !this->early_emitted_ &&
       this->header_is_complete_(this_burst)) {
     ESP_LOGD(TAG, "Immediate emit on single COMPLETE burst.");
@@ -563,6 +574,8 @@ void SAMEDecoder::emit_bit_(bool bit) {
   }
 
   // CAPTURE
+  this->soft_cur_.llr.push_back(this->last_bit_llr_);   // buffer soft LLR
+
   this->cur_byte_ >>= 1;
   if (bit) this->cur_byte_ |= 0x80;
   this->cur_nbits_++;
@@ -587,7 +600,7 @@ void SAMEDecoder::emit_bit_(bool bit) {
         this->fire_eom_();
         this->reset_capture_();
       } else {
-        ESP_LOGD(TAG, "NNNN seen but no recent header context; ignoring (not a real EOM).");
+        ESP_LOGD(TAG, "NNNN seen but no recent header context; ignoring.");
         this->eom_n_count_ = 0;
         this->rearm_sync_();
       }
@@ -597,13 +610,16 @@ void SAMEDecoder::emit_bit_(bool bit) {
     this->eom_n_count_ = 0;
   }
 
+  // TOLERANT CAPTURE: one invalid char no longer shreds the burst.
   if (!is_valid_same_char(c)) {
-    if (this->cur_burst_.size() >= 4)
+    this->cur_burst_ += '?';
+    this->bad_char_run_++;
+    if (this->bad_char_run_ >= 4 || this->cur_burst_.size() >= (size_t) MAX_HEADER_BYTES) {
       this->finish_burst_();
-    else
-      this->rearm_sync_();
+    }
     return;
   }
+  this->bad_char_run_ = 0;
 
   this->cur_burst_ += c;
 
@@ -637,27 +653,19 @@ bool SAMEDecoder::header_is_strictly_valid_(const std::string &header) {
   return true;
 }
 
-// A COMPLETE header requires the full structure through the timing block:
-// ZCZC-ORG-EEE-...+TTTT-JJJHHMM  -- i.e. strictly valid, AND a non-empty purge
-// field right after '+', AND at least one '-' after the '+' with a non-empty
-// issue-time field. This prevents emitting on a header truncated at the '+'.
 bool SAMEDecoder::header_is_complete_(const std::string &header) {
   if (!this->header_is_strictly_valid_(header))
     return false;
   size_t plus = header.find('+');
   if (plus == std::string::npos)
     return false;
-  // Purge field: at least one char between '+' and the next '-'.
   size_t dash_after = header.find('-', plus + 1);
   if (dash_after == std::string::npos)
-    return false;                       // nothing after '+TTTT' -> truncated
+    return false;
   if (dash_after <= plus + 1)
-    return false;                       // empty purge field '+-...'
-  // Issue-time field: at least one char after that dash.
+    return false;
   if (dash_after + 1 >= header.size())
-    return false;                       // ends right at the dash -> truncated
-  // Require the issue-time field to have some length (JJJHHMM ~ 7 chars); accept
-  // >=4 to tolerate a slightly clipped tail while still rejecting bare fragments.
+    return false;
   size_t issue_end = header.find('-', dash_after + 1);
   size_t issue_len = (issue_end == std::string::npos)
                          ? (header.size() - (dash_after + 1))
@@ -693,10 +701,11 @@ void SAMEDecoder::note_emit_() {
 }
 
 void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
+  // Hard majority (kept as fallback so we never regress below prior behavior).
   size_t maxlen = 0;
   for (int i = 0; i < 3; i++) maxlen = std::max(maxlen, this->bursts_[i].size());
-  std::string voted;
-  voted.reserve(maxlen);
+  std::string hard;
+  hard.reserve(maxlen);
   for (size_t i = 0; i < maxlen; i++) {
     char best = 0; int bestcount = 0;
     for (int a = 0; a < 3; a++) {
@@ -706,11 +715,16 @@ void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
         if (i < this->bursts_[c].size() && this->bursts_[c][i] == ca) cnt++;
       if (cnt > bestcount) { bestcount = cnt; best = ca; }
     }
-    if (best) voted += best;
+    if (best) hard += best;
   }
+  std::string hard_header = this->canonicalize_front_(hard);
 
-  std::string header = this->canonicalize_front_(voted);
-  ESP_LOGD(TAG, "Voted -> '%s'", sanitize_ascii(header).c_str());
+  // Soft-decision combine (bit-level LLR, dash-anchored). Falls back to hard.
+  SoftResult sr = SoftCombiner::combine(this->soft_bursts_, 3, hard_header);
+  std::string header = this->canonicalize_front_(sr.header);
+
+  ESP_LOGD(TAG, "Voted (soft=%s, margin=%.2f) -> '%s'",
+           sr.ok ? "ok" : "fallback", sr.mean_margin, sanitize_ascii(header).c_str());
 
   if (header.rfind("ZCZC", 0) != 0) {
     ESP_LOGW(TAG, "Missing ZCZC; discard.");
