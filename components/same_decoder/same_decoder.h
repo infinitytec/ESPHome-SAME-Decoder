@@ -73,6 +73,8 @@ class SAMEDecoder : public Component {
   void set_eom_require_context(bool v) { this->eom_require_context_ = v; }
   void set_eom_context_ms(uint32_t v) { this->eom_context_ms_ = v; }
 
+  void set_decode_watchdog_ms(uint32_t v) { this->decode_watchdog_ms_.store(v, std::memory_order_relaxed); }
+
   void set_decode_count_sensor(sensor::Sensor *s) { this->decode_count_sensor_ = s; }
   void set_last_raw_sensor(text_sensor::TextSensor *s) { this->last_raw_sensor_ = s; }
   void register_alert_trigger(AlertTrigger *t) { this->alert_triggers_.push_back(t); }
@@ -108,6 +110,7 @@ class SAMEDecoder : public Component {
   void update_agc_(float mag);
   bool ab_preamble_ok_() const;
   void note_emit_();
+  void check_decode_watchdog_();
 
   void update_preamble_gate_(float mark_e, float space_e);
 
@@ -202,7 +205,6 @@ class SAMEDecoder : public Component {
   float w_off_{0.0f};
   uint32_t samples_seen_{0};
 
-  // Soft-decision capture: buffer per-bit LLR (ln(Em)-ln(Es)) for each burst.
   float last_bit_llr_{0.0f};
   SoftBurst soft_bursts_[3];
   SoftBurst soft_cur_;
@@ -230,6 +232,13 @@ class SAMEDecoder : public Component {
   bool eom_require_context_{true};
   uint32_t eom_context_ms_{120000};
   uint32_t last_valid_header_ms_{0};
+
+  // Decode watchdog: if a decode session (LED on) persists this long without a
+  // successful emit or EOM, abandon it (emit valid partial, else discard) and
+  // clear the indicator so state never hangs.
+  std::atomic<uint32_t> decode_watchdog_ms_{10000};
+  bool decode_active_{false};        // true from sync until emit/EOM/watchdog
+  uint32_t decode_active_since_{0};  // millis() when decode_active_ went true
 
   bool ab_required_{false};
   uint8_t ab_byte_{0};
