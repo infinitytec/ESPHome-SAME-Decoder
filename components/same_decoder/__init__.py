@@ -16,6 +16,7 @@ CONF_LAST_RAW_SENSOR = "last_raw_sensor"
 CONF_ON_ALERT = "on_alert"
 CONF_ON_SYNC = "on_sync"
 CONF_ON_EOM = "on_eom"
+CONF_ON_PREAMBLE = "on_preamble"
 CONF_GAIN = "gain"
 CONF_FREQ_OFFSET_HZ = "freq_offset_hz"
 CONF_AGC_ENABLE = "agc_enable"
@@ -51,6 +52,7 @@ SAMEDecoder = same_decoder_ns.class_("SAMEDecoder", cg.Component)
 AlertTrigger = same_decoder_ns.class_("AlertTrigger", automation.Trigger.template())
 SyncTrigger = same_decoder_ns.class_("SyncTrigger", automation.Trigger.template())
 EomTrigger = same_decoder_ns.class_("EomTrigger", automation.Trigger.template())
+PreambleTrigger = same_decoder_ns.class_("PreambleTrigger", automation.Trigger.template())
 
 _REMOVED_KEYS = {
     "preamble_lock": "Preamble no longer resets the clock; acquisition is via ZCZC tiers.",
@@ -110,6 +112,9 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_ON_EOM): automation.validate_automation(
                 {cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(EomTrigger)}
             ),
+            cv.Optional(CONF_ON_PREAMBLE): automation.validate_automation(
+                {cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(PreambleTrigger)}
+            ),
         }
     ).extend(cv.COMPONENT_SCHEMA),
     _reject_removed_keys,
@@ -166,3 +171,8 @@ async def to_code(config):
         trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID])
         await automation.build_automation(trigger, [], conf)
         cg.add(var.register_eom_trigger(trigger))
+
+    for conf in config.get(CONF_ON_PREAMBLE, []):
+        trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID])
+        await automation.build_automation(trigger, [], conf)
+        cg.add(var.register_preamble_trigger(trigger))
