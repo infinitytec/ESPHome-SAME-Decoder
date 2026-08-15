@@ -1,17 +1,5 @@
 # components/same_decoder/__init__.py
-# Config schema + codegen for the SAME decoder.
-# Audio is delivered from YAML via microphone: on_data -> feed_bytes(), so this
-# schema does NOT own the microphone/I2S.
-#
-# Commercial-style acquisition:
-#   - Continuous Gardner-style timing recovery (never reset) that the preamble
-#     naturally drives to convergence. Loop error updates freeze when no tone is
-#     present so silence/voice/noise cannot wind the loop.
-#   - Strong "ZCZC" sync tiers (T1-T4) are the SOLE acquisition path.
-#   - Passive frequency-domain preamble gate (diagnostic only; never touches DSP).
-#   - LED/indicator driven by real sync: on at ZCZC, off at boot/EOM/alert.
-#   - EOM (NNNN) requires context (recent header) to be accepted.
-#   - Triple-burst voting + immediate emit on single structurally-valid burst.
+# Config schema + codegen for the SAME decoder (soft-decision + commercial-style TR).
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
@@ -39,13 +27,13 @@ CONF_SINGLE_BURST_MIN_MS = "single_burst_min_ms"
 CONF_POST_EMIT_DEAD_MS = "post_emit_dead_ms"
 CONF_AB_REQUIRED = "ab_required"
 
-# ---- Passive preamble gate (diagnostic only) ----
 CONF_PREAMBLE_STATUS = "preamble_status"
 CONF_PREAMBLE_ENERGY_MULT = "preamble_energy_mult"
 
-# ---- EOM context validation ----
 CONF_EOM_REQUIRE_CONTEXT = "eom_require_context"
 CONF_EOM_CONTEXT_MS = "eom_context_ms"
+
+CONF_DECODE_WATCHDOG_MS = "decode_watchdog_ms"
 
 same_decoder_ns = cg.esphome_ns.namespace("same_decoder")
 SAMEDecoder = same_decoder_ns.class_("SAMEDecoder", cg.Component)
@@ -54,9 +42,6 @@ AlertTrigger = same_decoder_ns.class_("AlertTrigger", automation.Trigger.templat
 SyncTrigger = same_decoder_ns.class_("SyncTrigger", automation.Trigger.template())
 EomTrigger = same_decoder_ns.class_("EomTrigger", automation.Trigger.template())
 
-# Keys removed in the commercial-style redesign. If any are present we raise a
-# clear config error so the user knows to delete them (they no longer do
-# anything, and silently ignoring them would be confusing).
 _REMOVED_KEYS = {
     "preamble_lock": "Preamble no longer resets the clock; acquisition is via ZCZC tiers.",
     "preamble_min_density": "The bit-density preamble detector was removed.",
@@ -70,8 +55,8 @@ def _reject_removed_keys(config):
     for key, why in _REMOVED_KEYS.items():
         if key in config:
             raise cv.Invalid(
-                f"'{key}' has been removed in the commercial-style redesign. "
-                f"{why} Please delete it from your 'same_decoder:' block."
+                f"'{key}' has been removed in the redesign. {why} "
+                f"Please delete it from your 'same_decoder:' block."
             )
     return config
 
@@ -91,28 +76,21 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_SINGLE_BURST_MIN_MS, default=7000): cv.int_range(min=1000, max=60000),
             cv.Optional(CONF_POST_EMIT_DEAD_MS, default=800): cv.int_range(min=0, max=10000),
             cv.Optional(CONF_AB_REQUIRED, default=False): cv.boolean,
-            # ---- passive preamble gate (diagnostic only) ----
             cv.Optional(CONF_PREAMBLE_STATUS, default=True): cv.boolean,
             cv.Optional(CONF_PREAMBLE_ENERGY_MULT, default=8.0): cv.float_range(min=2.0, max=50.0),
-            # ---- EOM context validation ----
             cv.Optional(CONF_EOM_REQUIRE_CONTEXT, default=True): cv.boolean,
             cv.Optional(CONF_EOM_CONTEXT_MS, default=120000): cv.int_range(min=1000, max=600000),
+            cv.Optional(CONF_DECODE_WATCHDOG_MS, default=10000): cv.int_range(min=2000, max=60000),
             cv.Optional(CONF_DECODE_COUNT_SENSOR): cv.use_id(sensor.Sensor),
             cv.Optional(CONF_LAST_RAW_SENSOR): cv.use_id(text_sensor.TextSensor),
             cv.Optional(CONF_ON_ALERT): automation.validate_automation(
-                {
-                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(AlertTrigger),
-                }
+                {cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(AlertTrigger)}
             ),
             cv.Optional(CONF_ON_SYNC): automation.validate_automation(
-                {
-                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(SyncTrigger),
-                }
+                {cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(SyncTrigger)}
             ),
             cv.Optional(CONF_ON_EOM): automation.validate_automation(
-                {
-                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(EomTrigger),
-                }
+                {cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(EomTrigger)}
             ),
         }
     ).extend(cv.COMPONENT_SCHEMA),
@@ -135,11 +113,11 @@ async def to_code(config):
     cg.add(var.set_single_burst_min_ms(config[CONF_SINGLE_BURST_MIN_MS]))
     cg.add(var.set_post_emit_dead_ms(config[CONF_POST_EMIT_DEAD_MS]))
     cg.add(var.set_ab_required(config[CONF_AB_REQUIRED]))
-
     cg.add(var.set_preamble_status(config[CONF_PREAMBLE_STATUS]))
     cg.add(var.set_preamble_energy_mult(config[CONF_PREAMBLE_ENERGY_MULT]))
     cg.add(var.set_eom_require_context(config[CONF_EOM_REQUIRE_CONTEXT]))
     cg.add(var.set_eom_context_ms(config[CONF_EOM_CONTEXT_MS]))
+    cg.add(var.set_decode_watchdog_ms(config[CONF_DECODE_WATCHDOG_MS]))
 
     if CONF_DECODE_COUNT_SENSOR in config:
         s = await cg.get_variable(config[CONF_DECODE_COUNT_SENSOR])
