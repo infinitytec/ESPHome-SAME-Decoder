@@ -9,6 +9,8 @@
 #   - T0 tone-based preamble lock (PRIMARY acquisition, enabled by default)
 #       * phase-independent bit-transition-density detector
 #       * PLL reset + fast-acquire during preamble, then normal tracking
+#       * watchdog releases a stuck lock (tunable preamble_lock_timeout_ms)
+#   - immediate emit on a single structurally-valid burst
 #   - optional AB preamble correlator (default off - preserves original sensitivity)
 #   - configurable burst timeouts + post-emit dead-time
 #   - stronger header validation (structural + light semantic)
@@ -45,6 +47,7 @@ CONF_PREAMBLE_LOCK = "preamble_lock"
 CONF_PREAMBLE_MIN_DENSITY = "preamble_min_density"
 CONF_PREAMBLE_MIN_BITS = "preamble_min_bits"
 CONF_PREAMBLE_ACQ_GAIN = "preamble_acq_gain"
+CONF_PREAMBLE_LOCK_TIMEOUT_MS = "preamble_lock_timeout_ms"
 
 same_decoder_ns = cg.esphome_ns.namespace("same_decoder")
 SAMEDecoder = same_decoder_ns.class_("SAMEDecoder", cg.Component)
@@ -72,6 +75,7 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_PREAMBLE_MIN_DENSITY, default=0.75): cv.float_range(min=0.5, max=1.0),
         cv.Optional(CONF_PREAMBLE_MIN_BITS, default=32): cv.int_range(min=8, max=256),
         cv.Optional(CONF_PREAMBLE_ACQ_GAIN, default=4.0): cv.float_range(min=1.0, max=20.0),
+        cv.Optional(CONF_PREAMBLE_LOCK_TIMEOUT_MS, default=1500): cv.int_range(min=200, max=10000),
         cv.Optional(CONF_DECODE_COUNT_SENSOR): cv.use_id(sensor.Sensor),
         cv.Optional(CONF_LAST_RAW_SENSOR): cv.use_id(text_sensor.TextSensor),
         cv.Optional(CONF_ON_ALERT): automation.validate_automation(
@@ -114,6 +118,7 @@ async def to_code(config):
     cg.add(var.set_preamble_min_density(config[CONF_PREAMBLE_MIN_DENSITY]))
     cg.add(var.set_preamble_min_bits(config[CONF_PREAMBLE_MIN_BITS]))
     cg.add(var.set_preamble_acq_gain(config[CONF_PREAMBLE_ACQ_GAIN]))
+    cg.add(var.set_preamble_lock_timeout_ms(config[CONF_PREAMBLE_LOCK_TIMEOUT_MS]))
 
     if CONF_DECODE_COUNT_SENSOR in config:
         s = await cg.get_variable(config[CONF_DECODE_COUNT_SENSOR])
