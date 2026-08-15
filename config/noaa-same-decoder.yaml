@@ -280,6 +280,12 @@ text_sensor:
     device_class: timestamp
     entity_category: diagnostic
 
+  - platform: template
+    id: same_last_preamble_time
+    name: "SAME Last Preamble Time"
+    device_class: timestamp
+    entity_category: diagnostic
+
 same_decoder:
   id: same_dec
   gain: 8.0
@@ -311,6 +317,17 @@ same_decoder:
   on_sync:
     then:
       - script.execute: led_indicate_on
+  on_preamble:
+    then:
+      - lambda: |-
+          auto t = id(ha_time).now();
+          if (t.is_valid()) {
+            char buf[40];
+            t.strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z");
+            id(same_last_preamble_time).publish_state(buf);
+          } else {
+            ESP_LOGW("same", "Preamble heard but time not synced yet; timestamp not published.");
+          }
   on_alert:
     then:
       - script.execute: led_indicate_off
