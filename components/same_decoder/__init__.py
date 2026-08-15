@@ -35,6 +35,16 @@ CONF_EOM_CONTEXT_MS = "eom_context_ms"
 
 CONF_DECODE_WATCHDOG_MS = "decode_watchdog_ms"
 
+# --- Option 3: continuous preamble-assisted acquisition ---
+CONF_PRE_TD_THRESH = "pre_td_thresh"
+CONF_PRE_ABD5_HAM_THRESH = "pre_abd5_ham_thresh"
+CONF_TR_KP_ACQ_MULT = "tr_kp_acq_mult"
+CONF_TR_KI_ACQ_MULT = "tr_ki_acq_mult"
+CONF_KPKI_SLEW_SYMBOLS = "kpki_slew_symbols"
+CONF_TR_WOFF_CLAMP_ACQ_FACTOR = "tr_woff_clamp_acq_factor"
+CONF_ZCZC_HAM_RELAXED = "zczc_ham_relaxed"
+CONF_PREAMBLE_RECENT_MS = "preamble_recent_ms"
+
 same_decoder_ns = cg.esphome_ns.namespace("same_decoder")
 SAMEDecoder = same_decoder_ns.class_("SAMEDecoder", cg.Component)
 
@@ -78,6 +88,14 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_AB_REQUIRED, default=False): cv.boolean,
             cv.Optional(CONF_PREAMBLE_STATUS, default=True): cv.boolean,
             cv.Optional(CONF_PREAMBLE_ENERGY_MULT, default=8.0): cv.float_range(min=2.0, max=50.0),
+            cv.Optional(CONF_PRE_TD_THRESH, default=0.70): cv.float_range(min=0.5, max=1.0),
+            cv.Optional(CONF_PRE_ABD5_HAM_THRESH, default=2): cv.int_range(min=0, max=6),
+            cv.Optional(CONF_TR_KP_ACQ_MULT, default=2.0): cv.float_range(min=1.0, max=8.0),
+            cv.Optional(CONF_TR_KI_ACQ_MULT, default=1.5): cv.float_range(min=1.0, max=8.0),
+            cv.Optional(CONF_KPKI_SLEW_SYMBOLS, default=16): cv.int_range(min=1, max=128),
+            cv.Optional(CONF_TR_WOFF_CLAMP_ACQ_FACTOR, default=0.6): cv.float_range(min=0.1, max=1.0),
+            cv.Optional(CONF_ZCZC_HAM_RELAXED, default=2): cv.int_range(min=1, max=4),
+            cv.Optional(CONF_PREAMBLE_RECENT_MS, default=200): cv.int_range(min=0, max=5000),
             cv.Optional(CONF_EOM_REQUIRE_CONTEXT, default=True): cv.boolean,
             cv.Optional(CONF_EOM_CONTEXT_MS, default=120000): cv.int_range(min=1000, max=600000),
             cv.Optional(CONF_DECODE_WATCHDOG_MS, default=10000): cv.int_range(min=2000, max=60000),
@@ -115,6 +133,14 @@ async def to_code(config):
     cg.add(var.set_ab_required(config[CONF_AB_REQUIRED]))
     cg.add(var.set_preamble_status(config[CONF_PREAMBLE_STATUS]))
     cg.add(var.set_preamble_energy_mult(config[CONF_PREAMBLE_ENERGY_MULT]))
+    cg.add(var.set_pre_td_thresh(config[CONF_PRE_TD_THRESH]))
+    cg.add(var.set_pre_abd5_ham_thresh(config[CONF_PRE_ABD5_HAM_THRESH]))
+    cg.add(var.set_tr_kp_acq_mult(config[CONF_TR_KP_ACQ_MULT]))
+    cg.add(var.set_tr_ki_acq_mult(config[CONF_TR_KI_ACQ_MULT]))
+    cg.add(var.set_kpki_slew_symbols(config[CONF_KPKI_SLEW_SYMBOLS]))
+    cg.add(var.set_tr_woff_clamp_acq_factor(config[CONF_TR_WOFF_CLAMP_ACQ_FACTOR]))
+    cg.add(var.set_zczc_ham_relaxed(config[CONF_ZCZC_HAM_RELAXED]))
+    cg.add(var.set_preamble_recent_ms(config[CONF_PREAMBLE_RECENT_MS]))
     cg.add(var.set_eom_require_context(config[CONF_EOM_REQUIRE_CONTEXT]))
     cg.add(var.set_eom_context_ms(config[CONF_EOM_CONTEXT_MS]))
     cg.add(var.set_decode_watchdog_ms(config[CONF_DECODE_WATCHDOG_MS]))
