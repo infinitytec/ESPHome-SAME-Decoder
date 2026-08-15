@@ -1,6 +1,5 @@
 # =============================================================================
 #  NOAA Weather Radio SAME Decoder - AI-Thinker ESP32-Audio-Kit (ESP32-A1S / ES8388)
-#  Repo location: config/noaa-same-decoder.yaml
 # =============================================================================
 
 substitutions:
@@ -22,7 +21,7 @@ esphome:
       - lambda: |-
           std::vector<uint8_t> buf;
           buf.push_back(0x09);
-          buf.push_back(0x77);                       // +21 dB L & R
+          buf.push_back(0x77);
           id(bus_a).write(0x10, buf.data(), buf.size());
           uint8_t reg = 0x09;
           uint8_t readback = 0;
@@ -156,10 +155,6 @@ binary_sensor:
     name: "SAME Decode In Progress"
     icon: "mdi:access-point"
 
-# Minimum-on indicator (B1): once lit, the LED/sensor stay on for at least
-# ~2 s so an instantaneous decode still gives a visible indication instead of a
-# flash. on_sync starts it; on_alert/on_eom request off but the script enforces
-# the minimum visible time before clearing.
 globals:
   - id: led_on_since
     type: uint32_t
@@ -175,12 +170,6 @@ script:
   - id: led_indicate_off
     mode: restart
     then:
-      # Enforce a minimum on-time of 2000 ms from when it was lit.
-      - lambda: |-
-          uint32_t elapsed = millis() - id(led_on_since);
-          if (elapsed < 2000) {
-            // wait out the remainder
-          }
       - delay: !lambda 'uint32_t e = millis() - id(led_on_since); return (e < 2000) ? (2000 - e) : 0;'
       - output.turn_off: led_decode_output
       - lambda: 'id(decode_in_progress).publish_state(false);'
@@ -215,6 +204,23 @@ number:
     entity_category: config
     set_action:
       - lambda: 'id(same_dec).set_timeout_ms((uint32_t) (x * 1000.0f));'
+
+  - platform: template
+    name: "SAME Decode Watchdog"
+    id: same_watchdog_number
+    icon: "mdi:timer-lock"
+    unit_of_measurement: "s"
+    min_value: 2
+    max_value: 60
+    step: 1
+    mode: slider
+    optimistic: true
+    restore_value: true
+    initial_value: 10
+    entity_category: config
+    disabled_by_default: true
+    set_action:
+      - lambda: 'id(same_dec).set_decode_watchdog_ms((uint32_t) (x * 1000.0f));'
 
   - platform: template
     name: "SAME Preamble Energy Mult"
@@ -290,6 +296,7 @@ same_decoder:
   preamble_energy_mult: 8.0
   eom_require_context: true
   eom_context_ms: 120000
+  decode_watchdog_ms: 10000
   decode_count_sensor: same_decode_count
   last_raw_sensor: same_last_raw
   on_sync:
