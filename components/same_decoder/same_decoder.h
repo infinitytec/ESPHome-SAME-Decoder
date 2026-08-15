@@ -5,6 +5,7 @@
 #include "esphome/core/automation.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
+#include "same_soft.h"
 
 #include <string>
 #include <vector>
@@ -66,11 +67,9 @@ class SAMEDecoder : public Component {
   void set_post_emit_dead_ms(uint32_t v) { this->post_emit_dead_ms_ = v; }
   void set_ab_required(bool v) { this->ab_required_ = v; }
 
-  // ---- passive preamble gate (diagnostic only) ----
   void set_preamble_status(bool v) { this->preamble_status_ = v; }
   void set_preamble_energy_mult(float v) { this->preamble_energy_mult_.store(v, std::memory_order_relaxed); }
 
-  // ---- EOM context validation ----
   void set_eom_require_context(bool v) { this->eom_require_context_ = v; }
   void set_eom_context_ms(uint32_t v) { this->eom_context_ms_ = v; }
 
@@ -110,7 +109,6 @@ class SAMEDecoder : public Component {
   bool ab_preamble_ok_() const;
   void note_emit_();
 
-  // ---- passive preamble gate helpers ----
   void update_preamble_gate_(float mark_e, float space_e);
 
   void fire_sync_once_();
@@ -144,7 +142,6 @@ class SAMEDecoder : public Component {
   SameAlert last_{};
   uint32_t decode_count_{0};
 
-  // Cross-thread hand-off
   static constexpr int ALERT_Q_LEN = 4;
   SameAlert alert_queue_[ALERT_Q_LEN];
   std::atomic<uint32_t> q_head_{0};
@@ -152,19 +149,16 @@ class SAMEDecoder : public Component {
   std::atomic<uint32_t> sync_pending_{0};
   std::atomic<uint32_t> eom_pending_{0};
 
-  // API offline buffering
   bool api_connected_{false};
   std::atomic<bool> api_connected_changed_{false};
   static constexpr size_t PENDING_MAX = 16;
   std::vector<SameAlert> pending_;
 
-  // Dedup
   std::string session_emitted_header_;
   std::string last_global_header_;
   uint32_t last_global_ms_{0};
   static constexpr uint32_t IMMEDIATE_DUP_MS = 3000;
 
-  // Idle recovery
   std::atomic<uint32_t> last_feed_ms_{0};
   static constexpr uint32_t FEED_GAP_MS = 250;
   float env_slow_{0.0f};
@@ -174,7 +168,6 @@ class SAMEDecoder : public Component {
   bool was_idle_{true};
   uint32_t idle_edge_samples_{0};
 
-  // Dynamic timing / Goertzel
   float samples_per_bit_{92.16f};
   float phase_inc_{1.0f / 92.16f};
   float coeff_mark_{1.926090f};
@@ -185,12 +178,10 @@ class SAMEDecoder : public Component {
   int ring_pos_{0};
   float phase_{0.0f};
 
-  // Soft clip
   static constexpr float SAMPLE_MAX = 32767.0f;
   static constexpr float SOFT_KNEE = 24576.0f;
   static float soft_clip_(float v);
 
-  // Soft AGC (default off)
   bool agc_enable_{false};
   float agc_target_{8000.0f};
   float agc_min_gain_{0.25f};
@@ -201,9 +192,6 @@ class SAMEDecoder : public Component {
   static constexpr float AGC_ATTACK = 0.002f;
   static constexpr float AGC_RELEASE = 0.0002f;
 
-  // Timing recovery (continuous; commercial-style). Error updates FREEZE when no
-  // tone is present so silence/voice/noise cannot wind the loop; w_off_ then
-  // gently leaks toward zero. The clock is never reset by preamble detection.
   static constexpr int CENTER_LAG = GWIN / 2;
   static constexpr int TR_DELTA = 12;
   static constexpr float TR_KP = 0.06f;
@@ -214,7 +202,13 @@ class SAMEDecoder : public Component {
   float w_off_{0.0f};
   uint32_t samples_seen_{0};
 
-  // ---- passive preamble gate (diagnostic only; NEVER touches the DSP/clock) ----
+  // Soft-decision capture: buffer per-bit LLR (ln(Em)-ln(Es)) for each burst.
+  float last_bit_llr_{0.0f};
+  SoftBurst soft_bursts_[3];
+  SoftBurst soft_cur_;
+  static constexpr float LLR_EPS = 1.0f;
+  int bad_char_run_{0};
+
   bool preamble_status_{true};
   std::atomic<float> preamble_energy_mult_{8.0f};
   float pre_noise_floor_{1.0f};
@@ -227,26 +221,22 @@ class SAMEDecoder : public Component {
   static constexpr uint32_t PRE_ON_DWELL_MS = 25;
   static constexpr uint32_t PRE_OFF_DWELL_MS = 150;
 
-  // Timeouts + dead-time
   uint32_t last_burst_ms_{0};
   std::atomic<uint32_t> timeout_ms_{3000};
   uint32_t single_burst_min_ms_{7000};
   uint32_t post_emit_dead_ms_{800};
   uint32_t last_emit_ms_{0};
 
-  // EOM context validation
   bool eom_require_context_{true};
   uint32_t eom_context_ms_{120000};
   uint32_t last_valid_header_ms_{0};
 
-  // AB preamble correlator (optional)
   bool ab_required_{false};
   uint8_t ab_byte_{0};
   int ab_nbits_{0};
   int ab_match_count_{0};
   static constexpr int AB_MIN_MATCH = 2;
 
-  // Sync / framing
   enum Phase { HUNT_SYNC, CAPTURE };
   Phase phase_state_{HUNT_SYNC};
   uint32_t sync_shift_{0};
@@ -280,7 +270,6 @@ class SAMEDecoder : public Component {
   static constexpr uint32_t MASK24 = 0x00FFFFFFu;
   bool fallback_sync_used_{false};
 
-  // Byte / burst assembly
   uint8_t cur_byte_{0};
   int cur_nbits_{0};
   std::string cur_burst_;
@@ -299,7 +288,6 @@ class SAMEDecoder : public Component {
   static constexpr int TAIL_MIN = 14;
   static constexpr int TAIL_COMPLETE = 21;
 
-  // EOM
   int eom_n_count_{0};
 };
 
