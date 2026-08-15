@@ -66,12 +66,13 @@ class SAMEDecoder : public Component {
   void set_post_emit_dead_ms(uint32_t v) { this->post_emit_dead_ms_ = v; }
   void set_ab_required(bool v) { this->ab_required_ = v; }
 
-  // ---- T0 preamble lock ----
-  void set_preamble_lock(bool v) { this->preamble_lock_ = v; }
-  void set_preamble_min_density(float v) { this->preamble_min_density_.store(v, std::memory_order_relaxed); }
-  void set_preamble_min_bits(uint32_t v) { this->preamble_min_bits_.store(v, std::memory_order_relaxed); }
-  void set_preamble_acq_gain(float v) { this->preamble_acq_gain_.store(v, std::memory_order_relaxed); }
-  void set_preamble_lock_timeout_ms(uint32_t v) { this->preamble_lock_timeout_ms_.store(v, std::memory_order_relaxed); }
+  // ---- passive preamble gate (diagnostic only) ----
+  void set_preamble_status(bool v) { this->preamble_status_ = v; }
+  void set_preamble_energy_mult(float v) { this->preamble_energy_mult_.store(v, std::memory_order_relaxed); }
+
+  // ---- EOM context validation ----
+  void set_eom_require_context(bool v) { this->eom_require_context_ = v; }
+  void set_eom_context_ms(uint32_t v) { this->eom_context_ms_ = v; }
 
   void set_decode_count_sensor(sensor::Sensor *s) { this->decode_count_sensor_ = s; }
   void set_last_raw_sensor(text_sensor::TextSensor *s) { this->last_raw_sensor_ = s; }
@@ -109,11 +110,9 @@ class SAMEDecoder : public Component {
   bool ab_preamble_ok_() const;
   void note_emit_();
 
-  // ---- T0 preamble lock helpers ----
-  void update_preamble_detector_(bool bit);
-  void enter_preamble_lock_();
-  void reset_preamble_detector_();
-  void release_preamble_lock_(const char *reason);
+  // ---- passive preamble gate helpers ----
+  void update_preamble_gate_(float mark_e, float space_e);
+
   void fire_sync_once_();
   void fire_eom_();
 
@@ -173,7 +172,6 @@ class SAMEDecoder : public Component {
   static constexpr float ENV_RISE_MULT = 4.0f;
   bool was_idle_{true};
   uint32_t idle_edge_samples_{0};
-  static constexpr uint32_t IDLE_EDGE_SAMPLES = 0x7fffffff;  // always armed
 
   // Dynamic timing / Goertzel
   float samples_per_bit_{92.16f};
@@ -202,7 +200,9 @@ class SAMEDecoder : public Component {
   static constexpr float AGC_ATTACK = 0.002f;
   static constexpr float AGC_RELEASE = 0.0002f;
 
-  // Timing recovery
+  // Timing recovery (continuous; commercial-style). Error updates FREEZE when no
+  // tone is present so silence/voice/noise cannot wind the loop; w_off_ then
+  // gently leaks toward zero. The clock is never reset by preamble detection.
   static constexpr int CENTER_LAG = GWIN / 2;
   static constexpr int TR_DELTA = 12;
   static constexpr float TR_KP = 0.06f;
@@ -213,35 +213,18 @@ class SAMEDecoder : public Component {
   float w_off_{0.0f};
   uint32_t samples_seen_{0};
 
-  // ---- T0 preamble lock (PRIMARY acquisition) ----
-  // Phase-independent detector: measures bit-transition density over a sliding
-  // window. A real 0xAB preamble is a near-alternating tone, so its transition
-  // density approaches 1.0. This is immune to byte misalignment and tolerates
-  // both dropped and mistimed 0xAB bytes.
-  bool preamble_lock_{true};
-  std::atomic<float>    preamble_min_density_{0.75f};
-  std::atomic<uint32_t> preamble_min_bits_{32};
-  std::atomic<float>    preamble_acq_gain_{4.0f};
-  std::atomic<uint32_t> preamble_lock_timeout_ms_{1500};
-  static constexpr int PRE_WIN = 64;          // sliding window length in bits
-  uint8_t pre_hist_[PRE_WIN];                 // ring of recent transition flags
-  int pre_hist_pos_{0};
-  int pre_trans_count_{0};                    // live sum of transitions in window
-  int pre_fill_{0};                           // how many bits observed (<=PRE_WIN)
-  bool pre_last_bit_{false};
-  bool pre_have_last_{false};
-  bool preamble_locked_{false};               // currently riding a preamble
-  uint32_t pre_run_bits_{0};                  // consecutive qualifying bits
-  uint32_t preamble_lock_ms_{0};              // millis() at T0 lock (watchdog base)
-  bool fast_acquire_{false};                  // PLL in fast-acquire mode
-  uint32_t fast_acquire_bits_left_{0};        // remaining fast-acquire bit budget
-  static constexpr uint32_t FAST_ACQUIRE_BITS = 48;  // ~fast lock, then normal
-
-  // ---- T0 diagnostics (instrumentation only; no behavioral effect) ----
-  uint32_t pre_dbg_last_ms_{0};          // throttle for density ramp logging
-  uint32_t t0_lock_bit_marker_{0};       // hunt-bit count at T0 lock
-  bool     t0_lock_pending_{false};      // waiting to report lock->sync latency
-  uint32_t hunt_bit_counter_{0};         // monotonic hunt-bit counter
+  // ---- passive preamble gate (diagnostic only; NEVER touches the DSP/clock) ----
+  bool preamble_status_{true};
+  std::atomic<float> preamble_energy_mult_{8.0f};
+  float pre_noise_floor_{1.0f};             // clipped-EMA noise floor of tone energy
+  static constexpr float PRE_FLOOR_ALPHA = 0.01f;
+  static constexpr float PRE_BALANCE_MAX = 0.40f;  // |Em-Es|/(Em+Es) must be below
+  bool preamble_present_{false};            // published diagnostic state
+  uint32_t pre_on_ms_{0};                   // gate-on dwell start
+  uint32_t pre_off_ms_{0};                  // gate-off dwell start
+  bool tone_gate_{false};                   // instantaneous tone presence (drives loop freeze)
+  static constexpr uint32_t PRE_ON_DWELL_MS = 25;
+  static constexpr uint32_t PRE_OFF_DWELL_MS = 150;
 
   // Timeouts + dead-time
   uint32_t last_burst_ms_{0};
@@ -250,12 +233,17 @@ class SAMEDecoder : public Component {
   uint32_t post_emit_dead_ms_{800};
   uint32_t last_emit_ms_{0};
 
+  // EOM context validation
+  bool eom_require_context_{true};
+  uint32_t eom_context_ms_{120000};
+  uint32_t last_valid_header_ms_{0};        // when we last saw a valid ZCZC header
+
   // AB preamble correlator (optional)
   bool ab_required_{false};
   uint8_t ab_byte_{0};
   int ab_nbits_{0};
   int ab_match_count_{0};
-  static constexpr int AB_MIN_MATCH = 2;   // soft when enabled
+  static constexpr int AB_MIN_MATCH = 2;
 
   // Sync / framing
   enum Phase { HUNT_SYNC, CAPTURE };
