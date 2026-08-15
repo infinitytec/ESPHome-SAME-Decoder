@@ -46,6 +46,11 @@ class EomTrigger : public Trigger<> {
   EomTrigger() = default;
 };
 
+class PreambleTrigger : public Trigger<> {
+ public:
+  PreambleTrigger() = default;
+};
+
 class SAMEDecoder : public Component {
  public:
   void setup() override;
@@ -90,6 +95,7 @@ class SAMEDecoder : public Component {
   void register_alert_trigger(AlertTrigger *t) { this->alert_triggers_.push_back(t); }
   void register_sync_trigger(SyncTrigger *t) { this->sync_triggers_.push_back(t); }
   void register_eom_trigger(EomTrigger *t) { this->eom_triggers_.push_back(t); }
+  void register_preamble_trigger(PreambleTrigger *t) { this->preamble_triggers_.push_back(t); }
 
   void set_api_connected(bool connected);
   void feed_bytes(const std::vector<uint8_t> &data);
@@ -131,6 +137,7 @@ class SAMEDecoder : public Component {
 
   void fire_sync_once_();
   void fire_eom_();
+  void fire_preamble_once_();
 
   bool parse_header_(const std::string &header, SameAlert &out);
   bool header_is_strictly_valid_(const std::string &header);
@@ -156,6 +163,7 @@ class SAMEDecoder : public Component {
   std::vector<AlertTrigger *> alert_triggers_;
   std::vector<SyncTrigger *> sync_triggers_;
   std::vector<EomTrigger *> eom_triggers_;
+  std::vector<PreambleTrigger *> preamble_triggers_;
 
   SameAlert last_{};
   uint32_t decode_count_{0};
@@ -166,6 +174,7 @@ class SAMEDecoder : public Component {
   std::atomic<uint32_t> q_tail_{0};
   std::atomic<uint32_t> sync_pending_{0};
   std::atomic<uint32_t> eom_pending_{0};
+  std::atomic<uint32_t> preamble_pending_{0};
 
   bool api_connected_{false};
   std::atomic<bool> api_connected_changed_{false};
@@ -232,6 +241,7 @@ class SAMEDecoder : public Component {
   static constexpr float PRE_FLOOR_ALPHA = 0.01f;
   static constexpr float PRE_BALANCE_MAX = 0.40f;
   bool preamble_present_{false};
+  bool was_preamble_present_{false};  // rising-edge latch (audio task only)
   uint32_t pre_on_ms_{0};
   uint32_t pre_off_ms_{0};
   bool tone_gate_{false};
