@@ -1,5 +1,6 @@
 // components/same_decoder/same_decoder.cpp
 // T0 preamble-lock (PRIMARY) + ALWAYS-WARM tiers + strong post-emit recovery
+// + T0 acquisition instrumentation (DEBUG diagnostics only)
 #include "same_decoder.h"
 #include "same_event_codes.h"
 #include "esphome/core/log.h"
@@ -223,6 +224,14 @@ void SAMEDecoder::update_preamble_detector_(bool bit) {
   float min_density = this->preamble_min_density_.load(std::memory_order_relaxed);
   uint32_t min_bits = this->preamble_min_bits_.load(std::memory_order_relaxed);
 
+  // --- INSTRUMENTATION: throttled density ramp (max ~5/sec) ---
+  uint32_t now_dbg = millis();
+  if (density >= 0.5f && (now_dbg - this->pre_dbg_last_ms_) >= 200) {
+    this->pre_dbg_last_ms_ = now_dbg;
+    ESP_LOGD(TAG, "T0-ramp density=%.2f run_bits=%" PRIu32 " fill=%d (need dens>=%.2f bits>=%" PRIu32 ")",
+             density, this->pre_run_bits_, this->pre_fill_, min_density, min_bits);
+  }
+
   if (density >= min_density) {
     if (this->pre_run_bits_ < 0x7fffffff) this->pre_run_bits_++;
     if (!this->preamble_locked_ && this->pre_run_bits_ >= min_bits) {
@@ -254,6 +263,10 @@ void SAMEDecoder::enter_preamble_lock_() {
   // budget, then fall back to normal tracking gains.
   this->fast_acquire_ = true;
   this->fast_acquire_bits_left_ = FAST_ACQUIRE_BITS;
+
+  // --- INSTRUMENTATION: start lock->sync latency measurement ---
+  this->t0_lock_bit_marker_ = this->hunt_bit_counter_;
+  this->t0_lock_pending_ = true;
 
   // Earliest possible user feedback: light the decode LED at the preamble.
   this->fire_sync_once_();
@@ -321,6 +334,16 @@ void SAMEDecoder::feed_sample_(int16_t s) {
 
   if (this->last_emit_ms_ != 0 &&
       (uint32_t) (millis() - this->last_emit_ms_) < this->post_emit_dead_ms_) {
+    // --- INSTRUMENTATION: flag when real audio is being swallowed by dead-time ---
+    if (mag > ENV_SILENCE * ENV_RISE_MULT) {
+      uint32_t now_dbg = millis();
+      if ((now_dbg - this->pre_dbg_last_ms_) >= 200) {
+        this->pre_dbg_last_ms_ = now_dbg;
+        uint32_t remain = this->post_emit_dead_ms_ - (uint32_t)(now_dbg - this->last_emit_ms_);
+        ESP_LOGD(TAG, "Post-emit dead-time DROPPING active audio (mag=%.0f, %" PRIu32 " ms left).",
+                 mag, remain);
+      }
+    }
     return;
   }
 
@@ -549,6 +572,7 @@ void SAMEDecoder::emit_bit_(bool bit) {
   if (this->phase_state_ == HUNT_SYNC) {
     // ---- T0: feed the phase-independent preamble detector every hunt bit ----
     this->update_preamble_detector_(bit);
+    this->hunt_bit_counter_++;   // INSTRUMENTATION: monotonic hunt-bit count
 
     this->sync_shift_ = (this->sync_shift_ >> 1) | ((uint32_t) (bit ? 1u : 0u) << 31);
 
@@ -601,6 +625,14 @@ void SAMEDecoder::emit_bit_(bool bit) {
 
       ESP_LOGD(TAG, "Sync via %s (AB=%d, T0=%s). Capture start.",
                tier, this->ab_match_count_, this->preamble_locked_ ? "locked" : "no");
+
+      // --- INSTRUMENTATION: how many bits from T0 lock to this sync? ---
+      if (this->t0_lock_pending_) {
+        uint32_t elapsed = this->hunt_bit_counter_ - this->t0_lock_bit_marker_;
+        ESP_LOGD(TAG, "T0->sync latency = %" PRIu32 " bits (~%.1f preamble-bytes).",
+                 elapsed, elapsed / 8.0f);
+        this->t0_lock_pending_ = false;
+      }
 
       // If T0 already lit the LED for this acquisition, don't double-fire on_sync.
       if (!this->preamble_locked_)
