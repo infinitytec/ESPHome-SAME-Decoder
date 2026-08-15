@@ -118,6 +118,7 @@ class SAMEDecoder : public Component {
 
   bool parse_header_(const std::string &header, SameAlert &out);
   bool header_is_strictly_valid_(const std::string &header);
+  bool header_is_complete_(const std::string &header);
   bool header_passes_semantic_(const SameAlert &a) const;
   bool same_message_as_current_(const std::string &new_burst);
   bool fuzzy_equal_(const std::string &a, const std::string &b);
@@ -216,13 +217,13 @@ class SAMEDecoder : public Component {
   // ---- passive preamble gate (diagnostic only; NEVER touches the DSP/clock) ----
   bool preamble_status_{true};
   std::atomic<float> preamble_energy_mult_{8.0f};
-  float pre_noise_floor_{1.0f};             // clipped-EMA noise floor of tone energy
+  float pre_noise_floor_{1.0f};
   static constexpr float PRE_FLOOR_ALPHA = 0.01f;
-  static constexpr float PRE_BALANCE_MAX = 0.40f;  // |Em-Es|/(Em+Es) must be below
-  bool preamble_present_{false};            // published diagnostic state
-  uint32_t pre_on_ms_{0};                   // gate-on dwell start
-  uint32_t pre_off_ms_{0};                  // gate-off dwell start
-  bool tone_gate_{false};                   // instantaneous tone presence (drives loop freeze)
+  static constexpr float PRE_BALANCE_MAX = 0.40f;
+  bool preamble_present_{false};
+  uint32_t pre_on_ms_{0};
+  uint32_t pre_off_ms_{0};
+  bool tone_gate_{false};
   static constexpr uint32_t PRE_ON_DWELL_MS = 25;
   static constexpr uint32_t PRE_OFF_DWELL_MS = 150;
 
@@ -236,7 +237,7 @@ class SAMEDecoder : public Component {
   // EOM context validation
   bool eom_require_context_{true};
   uint32_t eom_context_ms_{120000};
-  uint32_t last_valid_header_ms_{0};        // when we last saw a valid ZCZC header
+  uint32_t last_valid_header_ms_{0};
 
   // AB preamble correlator (optional)
   bool ab_required_{false};
