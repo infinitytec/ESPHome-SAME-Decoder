@@ -257,17 +257,26 @@ class SAMEDecoder : public Component {
   // AB preamble (0xAB = 10101011 LSB-first). Spec requires 16 consecutive
   // bytes before every header/EOM. We track a running match quality that
   // tolerates single-bit errors and, once locked, force a phase re-center.
+  // The lock is latched for AB_LOCK_HOLD_MS after acquisition so that the
+  // subsequent non-AB header bits do not immediately clear it (the preamble
+  // is only ~246 ms long at 520.83 baud; ZCZC follows immediately after).
   bool ab_required_{false};
   uint8_t ab_byte_{0};
   int ab_nbits_{0};
   int ab_match_count_{0};
   bool ab_locked_{false};
+  uint32_t ab_lock_ms_{0};   // millis() when lock was acquired
   // Minimum consecutive good AB bytes to declare lock and re-center phase.
-  // Spec is 16; 4–6 is enough for a reliable mid-bit sample point while still
-  // catching partial or noisy preambles.
+  // Spec is 16; 6 is a practical compromise for noisy streams while limiting
+  // false locks on random audio.
   static constexpr int AB_MIN_MATCH = 2;       // legacy soft gate
-  static constexpr int AB_LOCK_THRESH = 5;     // strong lock → phase re-center
+  static constexpr int AB_LOCK_THRESH = 6;     // strong lock → phase re-center
   static constexpr int AB_MAX_COUNT = 32;
+  // Hold the lock this long after acquisition so ZCZC hunt still sees it.
+  // 16 AB bytes ≈ 246 ms; hold a bit longer to cover the start of the header.
+  static constexpr uint32_t AB_LOCK_HOLD_MS = 500;
+
+  bool ab_lock_active_() const;
 
   enum Phase { HUNT_SYNC, CAPTURE };
   Phase phase_state_{HUNT_SYNC};
