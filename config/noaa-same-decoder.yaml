@@ -294,6 +294,15 @@ same_decoder:
   sample_rate: 48000
   preamble_status: true
   preamble_energy_mult: 8.0
+  # --- Option 3: continuous preamble-assisted acquisition (T0 preamble priming) ---
+  pre_td_thresh: 0.70            # preamble transition-density gate (0.5-1.0)
+  pre_abd5_ham_thresh: 2         # AB/D5 min-hamming over 16 bits to call preamble
+  tr_kp_acq_mult: 2.0            # timing-loop Kp multiplier during preamble
+  tr_ki_acq_mult: 1.5            # timing-loop Ki multiplier during preamble
+  kpki_slew_symbols: 16          # bumpless gain slew length (symbols)
+  tr_woff_clamp_acq_factor: 0.6  # tighter integrator clamp during acquisition
+  zczc_ham_relaxed: 2            # ZCZC hamming tolerance when preamble present/recent
+  preamble_recent_ms: 200        # how long a preamble stays "recent" for relaxing ZCZC
   eom_require_context: true
   eom_context_ms: 120000
   decode_watchdog_ms: 10000
