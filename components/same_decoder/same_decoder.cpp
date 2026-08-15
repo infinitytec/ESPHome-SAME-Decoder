@@ -1,11 +1,5 @@
 // components/same_decoder/same_decoder.cpp
-// Soft-decision SAME decoder + continuous timing recovery + AB preamble
-// lock with phase re-center + decode watchdog.
-//
-// References:
-//   NWS / FCC SAME protocol – 16 × 0xAB preamble (LSB first) before every
-//   header and EOM for bit/byte sync; 520 + 5/6 baud AFSK mark 2083⅓ Hz /
-//   space 1562.5 Hz; header starts with ASCII "ZCZC" and is sent three times.
+// Soft-decision SAME decoder + continuous preamble-assisted TR + decode watchdog.
 #include "same_decoder.h"
 #include "same_soft.h"
 #include "same_event_codes.h"
@@ -105,7 +99,7 @@ void SAMEDecoder::update_agc_(float mag) {
 
 void SAMEDecoder::setup() {
   this->compute_coeffs_();
-  ESP_LOGCONFIG(TAG, "SAME decoder ready (soft-decision combine + continuous TR + AB lock + watchdog, gain=%.1f, agc=%s).",
+  ESP_LOGCONFIG(TAG, "SAME decoder ready (soft-decision combine + continuous TR + watchdog, gain=%.1f, agc=%s).",
                 this->gain_, this->agc_enable_ ? "on" : "off");
   this->reset_capture_();
   this->last_feed_ms_.store(millis(), std::memory_order_relaxed);
@@ -153,7 +147,7 @@ void SAMEDecoder::loop() {
 }
 
 void SAMEDecoder::dump_config() {
-  ESP_LOGCONFIG(TAG, "SAME Decoder (soft-decision combine + ZCZC tiers + AB preamble lock):");
+  ESP_LOGCONFIG(TAG, "SAME Decoder (soft-decision combine + preamble-assisted acquisition):");
   ESP_LOGCONFIG(TAG, "  Sample rate: %" PRIu32 " Hz", this->sample_rate_);
   ESP_LOGCONFIG(TAG, "  Base gain: %.1f  AGC: %s", this->gain_, this->agc_enable_ ? "on" : "off");
   ESP_LOGCONFIG(TAG, "  Freq offset: %.1f Hz", this->freq_offset_hz_);
@@ -162,13 +156,19 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "  Passive preamble gate: %s (energy mult %.1f, DIAGNOSTIC only)",
                 this->preamble_status_ ? "on" : "off",
                 this->preamble_energy_mult_.load(std::memory_order_relaxed));
+  ESP_LOGCONFIG(TAG, "  Option 3 (continuous preamble-assisted acquisition): ON");
+  ESP_LOGCONFIG(TAG, "    Preamble T0: td_thresh=%.2f abd5_ham<=%d, recent=%" PRIu32 " ms",
+                this->pre_td_thresh_, this->pre_abd5_ham_thresh_, this->preamble_recent_ms_);
+  ESP_LOGCONFIG(TAG, "    Gearshift: kp_acq=%.3fx ki_acq=%.3fx slew=%d sym, woff_acq=%.2fx",
+                this->tr_kp_acq_mult_, this->tr_ki_acq_mult_, this->kpki_slew_symbols_,
+                this->tr_woff_clamp_acq_factor_);
+  ESP_LOGCONFIG(TAG, "    ZCZC hamming: strict<=%d relaxed<=%d (T4 idle-edge = diagnostic only)",
+                SYNC_MAX_HAMMING, this->zczc_ham_relaxed_);
   ESP_LOGCONFIG(TAG, "  EOM requires context: %s (%" PRIu32 " ms)",
                 this->eom_require_context_ ? "yes" : "no", this->eom_context_ms_);
   ESP_LOGCONFIG(TAG, "  Decode watchdog: %" PRIu32 " ms",
                 this->decode_watchdog_ms_.load(std::memory_order_relaxed));
-  ESP_LOGCONFIG(TAG, "  AB preamble required: %s (min match %d, lock thresh %d, hold %u ms)",
-                this->ab_required_ ? "yes" : "no", AB_MIN_MATCH, AB_LOCK_THRESH,
-                (unsigned) AB_LOCK_HOLD_MS);
+  ESP_LOGCONFIG(TAG, "  AB preamble required: %s (min match %d)", this->ab_required_ ? "yes" : "no", AB_MIN_MATCH);
   ESP_LOGCONFIG(TAG, "  Timeout (>=2 bursts): %" PRIu32 " ms", this->timeout_ms_.load(std::memory_order_relaxed));
   ESP_LOGCONFIG(TAG, "  Single-burst min: %" PRIu32 " ms", this->single_burst_min_ms_);
   ESP_LOGCONFIG(TAG, "  Post-emit dead-time: %" PRIu32 " ms", this->post_emit_dead_ms_);
@@ -188,9 +188,19 @@ void SAMEDecoder::reprime_detector_() {
   this->ab_byte_ = 0;
   this->ab_nbits_ = 0;
   this->ab_match_count_ = 0;
-  this->ab_locked_ = false;
-  this->ab_lock_ms_ = 0;
   this->eom_n_count_ = 0;
+  // Option 3: clear the LLR ring, preamble metrics, and gearshift transients.
+  for (int i = 0; i < LLR_RING_BITS; i++) this->llr_ring_[i] = 0.0f;
+  this->llr_head_ = 0;
+  this->trans_shift_ = 0;
+  this->pre_shift_ = 0;
+  this->transition_ratio_ = 0.0f;
+  this->pre_min_hamming_ = 16;
+  this->last_preamble_seen_ms_ = 0;
+  this->tr_kp_cur_ = TR_KP;
+  this->tr_ki_cur_ = TR_KI;
+  this->in_acq_gains_ = false;
+  this->kpki_slew_countdown_ = 0;
 }
 
 void SAMEDecoder::update_preamble_gate_(float mark_e, float space_e) {
@@ -223,6 +233,80 @@ void SAMEDecoder::update_preamble_gate_(float mark_e, float space_e) {
         (uint32_t) (now - this->pre_off_ms_) >= PRE_OFF_DWELL_MS) {
       this->preamble_present_ = false;
     }
+  }
+}
+
+// Option 3: per-symbol preamble (T0) metrics. Computes a transition-density
+// ratio and the AB/D5 min-hamming over the last 16 bits across all 8 byte
+// rotations, then refreshes last_preamble_seen_ms_ when either indicates a
+// preamble is present.
+void SAMEDecoder::update_preamble_metrics_(bool bit, float llr) {
+  (void) llr;
+  // Shift the new hard bit into both history registers.
+  this->trans_shift_ = (this->trans_shift_ << 1) | (bit ? 1ULL : 0ULL);
+  this->pre_shift_ = (uint16_t) ((this->pre_shift_ << 1) | (bit ? 1u : 0u));
+
+  // Transition density over the last PRE_TD_WINDOW_BITS bits.
+  uint64_t mask = (PRE_TD_WINDOW_BITS >= 64)
+                      ? ~0ULL
+                      : ((1ULL << PRE_TD_WINDOW_BITS) - 1ULL);
+  uint64_t trans = (this->trans_shift_ ^ (this->trans_shift_ >> 1)) & (mask >> 1);
+  int trans_count = __builtin_popcountll(trans);
+  this->transition_ratio_ = (float) trans_count / (float) (PRE_TD_WINDOW_BITS - 1);
+
+  // AB/D5 min-hamming over the last 16 bits across all 8 byte rotations.
+  int best = 16;
+  uint16_t w = this->pre_shift_;
+  for (int r = 0; r < 8; r++) {
+    uint16_t rot = (uint16_t) ((w >> r) | (w << (16 - r)));
+    int h_ab = __builtin_popcount((unsigned) (uint16_t) (rot ^ 0xABAB));
+    int h_d5 = __builtin_popcount((unsigned) (uint16_t) (rot ^ 0xD5D5));
+    if (h_ab < best) best = h_ab;
+    if (h_d5 < best) best = h_d5;
+  }
+  this->pre_min_hamming_ = best;
+
+  bool metric_ok = (this->transition_ratio_ >= this->pre_td_thresh_) ||
+                   (this->pre_min_hamming_ <= this->pre_abd5_ham_thresh_);
+  if (metric_ok) {
+    this->last_preamble_seen_ms_ = millis();
+  }
+}
+
+// Option 3: bumpless timing gearshift. While the energy preamble gate is
+// present we slew Kp/Ki up toward the acquisition targets; when it drops we
+// slew back. Only the gains change - phase_ and w_off_ are never touched.
+void SAMEDecoder::update_timing_gains_() {
+  bool want_acq = this->preamble_present_;
+  if (want_acq != this->in_acq_gains_) {
+    this->in_acq_gains_ = want_acq;
+    this->kpki_slew_countdown_ = this->kpki_slew_symbols_;
+    if (want_acq) this->preamble_on_events_++;
+  }
+
+  float kp_target = this->in_acq_gains_ ? (TR_KP * this->tr_kp_acq_mult_) : TR_KP;
+  float ki_target = this->in_acq_gains_ ? (TR_KI * this->tr_ki_acq_mult_) : TR_KI;
+
+  if (this->kpki_slew_countdown_ > 0) {
+    float a = 1.0f / (float) this->kpki_slew_countdown_;
+    this->tr_kp_cur_ += a * (kp_target - this->tr_kp_cur_);
+    this->tr_ki_cur_ += a * (ki_target - this->tr_ki_cur_);
+    this->kpki_slew_countdown_--;
+  } else {
+    this->tr_kp_cur_ = kp_target;
+    this->tr_ki_cur_ = ki_target;
+  }
+}
+
+// Option 3: copy the last n_bits per-bit LLRs from the ring into soft_cur_ in
+// chronological order, so index 0 corresponds to the first bit of ZCZC.
+void SAMEDecoder::copy_llrs_from_ring_(int n_bits) {
+  if (n_bits <= 0) return;
+  if (n_bits > LLR_RING_BITS) n_bits = LLR_RING_BITS;
+  this->soft_cur_.llr.reserve(this->soft_cur_.llr.size() + (size_t) n_bits);
+  for (int i = n_bits; i >= 1; i--) {
+    uint32_t idx = (this->llr_head_ - (uint32_t) i) & (LLR_RING_BITS - 1);
+    this->soft_cur_.llr.push_back(this->llr_ring_[idx]);
   }
 }
 
@@ -265,8 +349,6 @@ void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
     this->ab_byte_ = 0;
     this->ab_nbits_ = 0;
     this->ab_match_count_ = 0;
-    this->ab_locked_ = false;
-    this->ab_lock_ms_ = 0;
   }
 
   const size_t n = data.size() / 2;
@@ -348,6 +430,13 @@ void SAMEDecoder::feed_sample_(int16_t s) {
 
   this->update_preamble_gate_(em_c, es_c);
 
+  // Option 3: keep a rolling per-bit LLR history so a ZCZC hit can backfill,
+  // then update the T0 preamble metrics and slew the timing gains (bumpless).
+  this->llr_ring_[this->llr_head_ & (LLR_RING_BITS - 1)] = this->last_bit_llr_;
+  this->llr_head_++;
+  this->update_preamble_metrics_(bit, this->last_bit_llr_);
+  this->update_timing_gains_();
+
   bool primed = this->samples_seen_ >= (uint32_t) (CENTER_LAG + TR_DELTA + GWIN + 2);
   if (primed) {
     float em_e = goertzel_ring_end(this->ring_, RINGLEN, t_early, GWIN, this->coeff_mark_);
@@ -363,22 +452,21 @@ void SAMEDecoder::feed_sample_(int16_t s) {
     float e_raw = (d_late - d_early) / (d_late + d_early + eps);
     float conf  = d_center / (e_center + eps);
 
-    // While AB-locked (or hold window) or already in CAPTURE, keep TR engaged
-    // even at modest confidence so the mid-bit sample point stays locked
-    // through the header that follows the preamble.
-    const bool ab_active = this->ab_lock_active_();
-    bool track = (this->phase_state_ == CAPTURE) || ab_active || (conf >= TR_CONF_MIN);
+    bool track = (this->phase_state_ == CAPTURE) || (conf >= TR_CONF_MIN);
     if (track && conf >= TR_CONF_MIN) {
       float e = e_raw;
-      float dphi = TR_KP * e;
+      float dphi = this->tr_kp_cur_ * e;
       if (dphi >  TR_DPHI_CLAMP) dphi =  TR_DPHI_CLAMP;
       if (dphi < -TR_DPHI_CLAMP) dphi = -TR_DPHI_CLAMP;
       this->phase_ += dphi;
 
-      this->w_off_ += TR_KI * e;
-      if (this->w_off_ >  this->tr_woff_clamp_) this->w_off_ =  this->tr_woff_clamp_;
-      if (this->w_off_ < -this->tr_woff_clamp_) this->w_off_ = -this->tr_woff_clamp_;
-    } else if (this->phase_state_ != CAPTURE && !ab_active) {
+      this->w_off_ += this->tr_ki_cur_ * e;
+      float woff_clamp = this->in_acq_gains_
+                             ? (this->tr_woff_clamp_ * this->tr_woff_clamp_acq_factor_)
+                             : this->tr_woff_clamp_;
+      if (this->w_off_ >  woff_clamp) this->w_off_ =  woff_clamp;
+      if (this->w_off_ < -woff_clamp) this->w_off_ = -woff_clamp;
+    } else if (this->phase_state_ != CAPTURE) {
       this->w_off_ *= 0.999f;
       if (std::fabs(this->w_off_) < 1e-8f)
         this->w_off_ = 0.0f;
@@ -410,8 +498,6 @@ void SAMEDecoder::rearm_sync_() {
   this->eom_n_count_ = 0;
   this->bad_char_run_ = 0;
   this->soft_cur_.clear();
-  // Intentionally keep ab_match_count_ / ab_locked_ across rearm so a strong
-  // preamble continues to benefit subsequent bursts in the same session.
 }
 
 void SAMEDecoder::reset_capture_() {
@@ -428,96 +514,34 @@ void SAMEDecoder::reset_capture_() {
   this->ab_byte_ = 0;
   this->ab_nbits_ = 0;
   this->ab_match_count_ = 0;
-  this->ab_locked_ = false;
-  this->ab_lock_ms_ = 0;
   this->eom_n_count_ = 0;
   // NOTE: decode_active_ is cleared explicitly by emit/EOM/watchdog, not here,
   // so a mid-session reset (differing burst) doesn't drop the indicator early.
+  // NOTE: the LLR ring / preamble metrics / gearshift persist across bursts
+  // (continuity is intentional); they are cleared in reprime_detector_().
 }
 
 bool SAMEDecoder::ab_preamble_ok_() const {
   return this->ab_match_count_ >= AB_MIN_MATCH;
 }
 
-// True while the AB lock is latched (including the hold window after the
-// last acquisition). Used by TR and by the sync decision so that the short
-// non-AB header that follows the 16 × 0xAB preamble does not immediately
-// clear the benefit of the phase re-center.
-bool SAMEDecoder::ab_lock_active_() const {
-  if (!this->ab_locked_)
-    return false;
-  if (this->ab_lock_ms_ == 0)
-    return true;
-  return (uint32_t) (millis() - this->ab_lock_ms_) <= AB_LOCK_HOLD_MS;
-}
-
-// Called when the AB correlator reaches AB_LOCK_THRESH consecutive good bytes.
-// Forces the bit-sampling phase to mid-bit and clears frequency offset so the
-// continuous early/late TR loop starts from a known-good point. This is the
-// primary purpose of the 16 × 0xAB preamble in the NWS/FCC specification.
-// The lock is latched for AB_LOCK_HOLD_MS so subsequent header bits (which
-// are not 0xAB) do not erase it before ZCZC is detected.
-void SAMEDecoder::lock_from_ab_preamble_() {
-  // Prefer locking when the passive tone gate also sees balanced mark/space
-  // energy. Pure correlator hits on random audio are the main source of the
-  // "AB lock seconds before a real header" pattern in the logs.
-  if (!this->tone_gate_ && !this->preamble_present_) {
-    // Still allow a strong correlator-only lock (count well above threshold)
-    // so a clean but low-energy recording is not ignored.
-    if (this->ab_match_count_ < (AB_LOCK_THRESH + 4))
-      return;
-  }
-
-  const bool already = this->ab_locked_;
-  this->ab_locked_ = true;
-  this->ab_lock_ms_ = millis();
-  // phase_ is the fractional bit position; 0.5 places the Goertzel window
-  // near the center of the current bit, which maximises discrimination and
-  // gives the TR loop a clean starting point.
-  this->phase_ = 0.5f;
-  this->w_off_ = 0.0f;
-  if (!already) {
-    ESP_LOGD(TAG, "AB preamble lock (count=%d, tone=%s). Phase re-centered (hold %u ms).",
-             this->ab_match_count_,
-             (this->tone_gate_ || this->preamble_present_) ? "yes" : "no",
-             (unsigned) AB_LOCK_HOLD_MS);
-  }
-}
-
 void SAMEDecoder::begin_new_capture_(int preamble_len, bool fallback) {
   this->phase_state_ = CAPTURE;
   this->soft_cur_.clear();
   this->bad_char_run_ = 0;
-
-  // Pre-seed the hard string from the sync tier that fired.
   if (preamble_len >= 4)
     this->cur_burst_ = "ZCZC";
   else if (preamble_len == 3)
     this->cur_burst_ = "ZCZ";
   else
     this->cur_burst_ = "ZC";
-  if (fallback)
-    this->cur_burst_ += '-';
-
-  // Also seed matching soft LLRs so SoftCombiner sees a clean ZCZC front.
-  // Without this, soft combine always reports "no burst with clean ZCZC front"
-  // even when the hard path is perfect (LLRs only accumulate after sync).
-  // LSB-first ASCII: strong positive LLR => bit 1, strong negative => bit 0.
-  static constexpr float SEED_LLR = 8.0f;
-  auto seed_char = [&](char ch) {
-    for (int k = 0; k < 8; k++) {
-      bool bit1 = ((ch >> k) & 1) != 0;
-      this->soft_cur_.llr.push_back(bit1 ? SEED_LLR : -SEED_LLR);
-    }
-  };
-  for (char ch : this->cur_burst_)
-    seed_char(ch);
-
   this->cur_byte_ = 0;
   this->cur_nbits_ = 0;
   this->plus_seen_ = false;
   this->tail_count_ = 0;
   this->eom_n_count_ = 0;
+  if (fallback)
+    this->cur_burst_ += '-';
 }
 
 bool SAMEDecoder::bursts_agree_(int count) {
@@ -622,50 +646,31 @@ void SAMEDecoder::emit_bit_(bool bit) {
   if (this->phase_state_ == HUNT_SYNC) {
     this->sync_shift_ = (this->sync_shift_ >> 1) | ((uint32_t) (bit ? 1u : 0u) << 31);
 
-    // ---- AB preamble correlator (primary arming path) --------------------
-    // Spec: 16 × 0xAB (10101011 LSB-first). We tolerate a single-bit error
-    // per byte so noisy or slightly mistimed streams still build lock.
-    // Once locked, the lock is latched for AB_LOCK_HOLD_MS; match-count
-    // decay must not clear it while the hold is active, because the header
-    // that follows the preamble is not 0xAB.
     this->ab_byte_ = (this->ab_byte_ >> 1) | (bit ? 0x80 : 0);
     this->ab_nbits_++;
     if (this->ab_nbits_ >= 8) {
       this->ab_nbits_ = 0;
-      uint8_t x = this->ab_byte_ ^ 0xAB;
-      int errors = __builtin_popcount((unsigned) x);
-      if (errors <= 1) {
-        if (this->ab_match_count_ < AB_MAX_COUNT)
-          this->ab_match_count_++;
-      } else {
-        // Gentle decay on mismatch. Do not clear ab_locked_ here while the
-        // hold window is still open — that is the whole point of the latch.
-        if (this->ab_match_count_ > 0)
-          this->ab_match_count_--;
-        if (this->ab_match_count_ < AB_LOCK_THRESH && !this->ab_lock_active_())
-          this->ab_locked_ = false;
+      if (this->ab_byte_ == 0xAB) {
+        if (this->ab_match_count_ < 32) this->ab_match_count_++;
+      } else if (this->ab_match_count_ > 0) {
+        this->ab_match_count_--;
       }
-
-      // Strong lock → force mid-bit phase so the subsequent ZCZC hunt and
-      // continuous TR start from a known-good sampling point.
-      if (this->ab_match_count_ >= AB_LOCK_THRESH)
-        this->lock_from_ab_preamble_();
-    }
-
-    // Expire the latch when the hold window ends and the correlator has
-    // already fallen below threshold (header/data region).
-    if (this->ab_locked_ && !this->ab_lock_active_() &&
-        this->ab_match_count_ < AB_LOCK_THRESH) {
-      this->ab_locked_ = false;
     }
 
     if (this->ab_required_ && !this->ab_preamble_ok_())
       return;
 
-    // ---- ZCZC / short-tier sync (secondary / fallback paths) -------------
+    // T0-assisted ZCZC (T1): relax the hamming threshold when a preamble is
+    // present or was seen recently; otherwise keep the strict threshold.
+    uint32_t now_ms = millis();
+    bool pre_recent = this->preamble_present_ ||
+                      ((uint32_t) (now_ms - this->last_preamble_seen_ms_) <= this->preamble_recent_ms_);
+    int zczc_ham_thresh = pre_recent ? this->zczc_ham_relaxed_ : SYNC_MAX_HAMMING;
+
     uint32_t diffbits = this->sync_shift_ ^ SYNC_ZCZC;
     int hamming = __builtin_popcount(diffbits);
-    bool t1 = (hamming <= SYNC_MAX_HAMMING);
+    bool t1 = (hamming <= zczc_ham_thresh);
+    if (t1 && hamming > SYNC_MAX_HAMMING) this->zczc_relaxed_hits_++;
 
     bool t1b = false;
     if (!t1) {
@@ -679,30 +684,24 @@ void SAMEDecoder::emit_bit_(bool bit) {
     bool t3 = ((this->sync_shift_ & MASK24) == SYNC_CZC_24) ||
               ((this->sync_shift_ & MASK24) == SYNC_ZCZ_24);
 
-    bool t4 = (this->idle_edge_samples_ > 0) &&
-              ((this->sync_shift_ & MASK16) == SYNC_ZC_16);
+    // T4 (16-bit ZC idle-edge) is DIAGNOSTIC ONLY under Option 3: it never
+    // starts a capture.
+    bool t4_diag = (this->idle_edge_samples_ > 0) &&
+                   ((this->sync_shift_ & MASK16) == SYNC_ZC_16);
 
-    if (t1 || t1b || t2 || t3 || t4) {
+    if (t1 || t1b || t2 || t3) {
       int preamble_len;
       bool fb = false;
       const char *tier;
       if (t1 || t1b) { preamble_len = 4; tier = t1 ? "ZCZC" : "ZCZC(misread)"; }
       else if (t2)   { preamble_len = 2; fb = true; tier = "ZC- fallback"; }
-      else if (t3)   { preamble_len = 3; tier = "CZC/ZCZ clip"; }
-      else           { preamble_len = 2; tier = "ZC idle-edge"; }
+      else           { preamble_len = 3; tier = "CZC/ZCZ clip"; }  // t3
 
-      // When AB lock is active (including hold window) the short tiers are
-      // no longer treated as weak evidence; the preamble has already given
-      // us bit timing.
-      const bool ab_active = this->ab_lock_active_();
-      bool strong = ab_active || (t1 || t1b);
       if (this->burst_idx_ == 0)
-        this->fallback_sync_used_ = !strong && (fb || t3 || t4);
+        this->fallback_sync_used_ = fb || t3;
 
-      ESP_LOGD(TAG, "Sync via %s (AB=%d locked=%s, preamble=%s). Capture start.",
-               tier, this->ab_match_count_,
-               ab_active ? "yes" : "no",
-               this->preamble_present_ ? "present" : "no");
+      ESP_LOGD(TAG, "Sync via %s (AB=%d, preamble=%s). Capture start.",
+               tier, this->ab_match_count_, this->preamble_present_ ? "present" : "no");
 
       // Mark decode session active (drives the watchdog + LED-on).
       if (!this->decode_active_) {
@@ -712,6 +711,12 @@ void SAMEDecoder::emit_bit_(bool bit) {
       this->fire_sync_once_();
 
       this->begin_new_capture_(preamble_len, fb);
+      // Option 3: backfill the leading 32 LLRs (aligned to the first 'Z') so
+      // the soft combiner sees per-bit LLRs starting exactly at ZCZC; the
+      // per-bit pushes in the CAPTURE branch then continue seamlessly.
+      this->copy_llrs_from_ring_(32);
+    } else if (t4_diag) {
+      ESP_LOGV(TAG, "T4 ZC idle-edge seen (diagnostic only; not starting capture).");
     }
     return;
   }
@@ -757,11 +762,7 @@ void SAMEDecoder::emit_bit_(bool bit) {
   if (!is_valid_same_char(c)) {
     this->cur_burst_ += '?';
     this->bad_char_run_++;
-    // Without a recent AB lock the bit phase is untrusted; abort garbage
-    // captures quickly so a false ZCZC Hamming hit does not burn the
-    // watchdog / indicator for the full single-burst timeout.
-    const int bad_limit = this->ab_lock_active_() ? 4 : 2;
-    if (this->bad_char_run_ >= bad_limit || this->cur_burst_.size() >= (size_t) MAX_HEADER_BYTES) {
+    if (this->bad_char_run_ >= 4 || this->cur_burst_.size() >= (size_t) MAX_HEADER_BYTES) {
       this->finish_burst_();
     }
     return;
@@ -843,8 +844,6 @@ void SAMEDecoder::note_emit_() {
   this->ab_byte_ = 0;
   this->ab_nbits_ = 0;
   this->ab_match_count_ = 0;
-  this->ab_locked_ = false;
-  this->ab_lock_ms_ = 0;
   this->eom_n_count_ = 0;
   this->idle_edge_samples_ = 48000 / 2;
   // A successful emit ends the active decode session for watchdog purposes.
@@ -878,12 +877,6 @@ void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
 
   if (header.rfind("ZCZC", 0) != 0) {
     ESP_LOGW(TAG, "Missing ZCZC; discard.");
-    // End the decode session so the indicator/watchdog do not hang after a
-    // failed flush (timeout or empty collection).
-    if (from_timeout || this->burst_idx_ == 0) {
-      this->decode_active_ = false;
-      this->fire_eom_();
-    }
     return;
   }
 
@@ -894,22 +887,13 @@ void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
   if (weak) {
     if (!this->header_is_strictly_valid_(header)) {
       ESP_LOGW(TAG, "Weak evidence failed structural check: '%s'", sanitize_ascii(header).c_str());
-      if (from_timeout || this->burst_idx_ <= 1) {
-        this->decode_active_ = false;
-        this->fire_eom_();
-      }
       return;
     }
   }
 
   SameAlert alert;
-  if (!this->parse_header_(header, alert)) {
-    if (from_timeout || this->burst_idx_ <= 1) {
-      this->decode_active_ = false;
-      this->fire_eom_();
-    }
+  if (!this->parse_header_(header, alert))
     return;
-  }
 
   if (!this->header_passes_semantic_(alert)) {
     ESP_LOGW(TAG, "Semantic check soft-fail (still emitting): '%s'", sanitize_ascii(header).c_str());
