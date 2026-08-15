@@ -233,6 +233,12 @@ class SAMEDecoder : public Component {
   uint32_t fast_acquire_bits_left_{0};        // remaining fast-acquire bit budget
   static constexpr uint32_t FAST_ACQUIRE_BITS = 48;  // ~fast lock, then normal
 
+  // ---- T0 diagnostics (instrumentation only; no behavioral effect) ----
+  uint32_t pre_dbg_last_ms_{0};          // throttle for density ramp logging
+  uint32_t t0_lock_bit_marker_{0};       // hunt-bit count at T0 lock
+  bool     t0_lock_pending_{false};      // waiting to report lock->sync latency
+  uint32_t hunt_bit_counter_{0};         // monotonic hunt-bit counter
+
   // Timeouts + dead-time
   uint32_t last_burst_ms_{0};
   std::atomic<uint32_t> timeout_ms_{3000};
