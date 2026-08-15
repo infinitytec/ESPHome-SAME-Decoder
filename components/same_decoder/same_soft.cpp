@@ -62,7 +62,7 @@ bool SoftCombiner::looks_like_org_(const std::string &f) {
 bool SoftCombiner::looks_like_event_(const std::string &f) {
   if (f.size() != 3) return false;
   for (char c : f) if (!std::isupper((unsigned char) c)) return false;
-  return true;   // lenient: any 3 uppercase letters
+  return true;
 }
 
 bool SoftCombiner::looks_like_fips_(const std::string &f) {
@@ -71,7 +71,6 @@ bool SoftCombiner::looks_like_fips_(const std::string &f) {
   return true;
 }
 
-// Combine per-bit LLRs across bursts for aligned char indices; decide the char.
 char SoftCombiner::combine_char_(const DecodedBurst *db, const int *char_index,
                                  int nbursts, float *out_margin) {
   float combined[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -94,14 +93,11 @@ SoftResult SoftCombiner::combine(const SoftBurst *bursts, int nbursts,
                                  const std::string &hard_fallback) {
   SoftResult res;
 
-  // Decode each non-empty burst individually.
   DecodedBurst db[3];
   int used = 0;
-  int used_map[3] = {-1, -1, -1};
   for (int i = 0; i < nbursts && i < 3; i++) {
     if (bursts[i].nbits() >= 8 * 4) {   // at least "ZCZC"
       decode_burst_(bursts[i], db[used]);
-      used_map[used] = i;
       used++;
     }
   }
@@ -112,54 +108,72 @@ SoftResult SoftCombiner::combine(const SoftBurst *bursts, int nbursts,
     return res;
   }
 
-  // Pick the highest-quality burst as the alignment reference: the one whose
-  // hard decode has the longest run that starts with "ZCZC" and has the highest
-  // mean confidence. Simplest robust heuristic: longest decoded char string.
-  int ref = 0;
-  for (int b = 1; b < used; b++)
-    if (db[b].chars.size() > db[ref].chars.size())
-      ref = b;
+  // FIX 2: choose the reference burst by QUALITY, not length. The reference is
+  // the burst with the highest mean per-character confidence (mean min|l|),
+  // among those that actually start with a plausible "ZCZC" front. A clean
+  // burst must anchor the alignment, never a long-but-garbage one.
+  int ref = -1;
+  float best_quality = -1.0f;
+  for (int b = 0; b < used; b++) {
+    // Front sanity: require the first 4 chars to be "ZCZC" (soft-decided).
+    if (db[b].chars.size() < 4) continue;
+    if (db[b].chars.compare(0, 4, "ZCZC") != 0) continue;
+    // Mean confidence over the burst.
+    double sum = 0.0;
+    for (float m : db[b].char_min_abs) sum += m;
+    float q = db[b].char_min_abs.empty() ? 0.0f
+                : (float) (sum / db[b].char_min_abs.size());
+    if (q > best_quality) { best_quality = q; ref = b; }
+  }
+
+  // If no burst has a clean ZCZC front, fall back to hard result immediately.
+  if (ref < 0) {
+    ESP_LOGD(TAG, "Soft combine: no burst with clean ZCZC front; using hard fallback.");
+    res.header = hard_fallback;
+    res.ok = !hard_fallback.empty();
+    return res;
+  }
 
   const std::string &refc = db[ref].chars;
-
-  // Field-anchor: split the reference into dash-delimited fields. For each
-  // reference char position, find the aligned char index in each other burst.
-  // Alignment strategy (bounded slip): within each field, allow each burst a
-  // small per-field offset in {-1, 0, +1} chosen to maximize agreement with the
-  // reference over that field. This bounds slip damage to a single field.
   auto ref_fields = field_spans_(refc);
+
+  std::vector<std::vector<std::pair<int, int>>> burst_fields(used);
+  for (int b = 0; b < used; b++)
+    burst_fields[b] = field_spans_(db[b].chars);
 
   std::string out;
   out.reserve(refc.size());
   double margin_sum = 0.0;
   int margin_n = 0;
 
-  // Precompute field spans for each burst for offset search.
-  std::vector<std::vector<std::pair<int, int>>> burst_fields(used);
-  for (int b = 0; b < used; b++)
-    burst_fields[b] = field_spans_(db[b].chars);
-
   for (size_t fi = 0; fi < ref_fields.size(); fi++) {
     int rstart = ref_fields[fi].first;
     int rend = ref_fields[fi].second;
 
-    // Determine per-burst base offset for this field: match the fi-th field of
-    // each burst if it exists; otherwise fall back to reference position.
+    // Per-burst base offset for this field (dash-anchored slip bounding). A
+    // burst only contributes to this field if it HAS a corresponding field of
+    // similar length; otherwise it's skipped for this field (contributes -1),
+    // which prevents a mis-length burst from shifting the combine.
     int base_off[3] = {0, 0, 0};
+    bool contributes[3] = {false, false, false};
     for (int b = 0; b < used; b++) {
-      if (b == ref) { base_off[b] = 0; continue; }
+      if (b == ref) { base_off[b] = 0; contributes[b] = true; continue; }
       if (fi < burst_fields[b].size()) {
-        base_off[b] = burst_fields[b][fi].first - rstart;
-      } else {
-        base_off[b] = 0;   // no such field; align 1:1 and let LLRs fall out
+        int blen = burst_fields[b][fi].second - burst_fields[b][fi].first;
+        int rlen = rend - rstart;
+        // Only align if this burst's field length is within +/-1 of reference.
+        if (std::abs(blen - rlen) <= 1) {
+          base_off[b] = burst_fields[b][fi].first - rstart;
+          contributes[b] = true;
+        }
       }
     }
 
     for (int rp = rstart; rp < rend; rp++) {
       int char_index[3];
       for (int b = 0; b < used; b++) {
-        if (b == ref) { char_index[b] = rp; continue; }
-        int idx = rp + base_off[b];
+        if (!contributes[b]) { char_index[b] = -1; continue; }
+        int idx = (b == ref) ? rp : (rp + base_off[b]);
         if (idx < 0 || idx >= (int) db[b].chars.size())
           idx = -1;
         char_index[b] = idx;
@@ -171,7 +185,6 @@ SoftResult SoftCombiner::combine(const SoftBurst *bursts, int nbursts,
       margin_n++;
     }
 
-    // Re-append the dash delimiter (except after the last field).
     if (fi + 1 < ref_fields.size())
       out += '-';
   }
@@ -180,19 +193,20 @@ SoftResult SoftCombiner::combine(const SoftBurst *bursts, int nbursts,
   res.mean_margin = (margin_n > 0) ? (float) (margin_sum / margin_n) : 0.0f;
   res.bursts_used = used;
 
-  // Lenient sanity gate: must start with ZCZC and contain a '+'. If the soft
-  // result fails this, fall back to the caller's hard majority result so we
-  // never regress below the prior behavior.
+  // FIX 3: mandatory ZCZC anchoring + strict sanity. The combined output MUST
+  // start with "ZCZC" and contain a '+'. If not, the alignment shifted the
+  // front (which must never happen) -> fall back to hard majority.
   bool soft_ok = (out.rfind("ZCZC", 0) == 0) && (out.find('+') != std::string::npos);
   if (!soft_ok) {
-    ESP_LOGD(TAG, "Soft combine failed sanity ('%s'); using hard fallback.", out.c_str());
+    ESP_LOGD(TAG, "Soft combine failed sanity ('%s'); using hard fallback.",
+             out.c_str());
     res.header = hard_fallback;
     res.ok = !hard_fallback.empty();
     return res;
   }
 
-  ESP_LOGD(TAG, "Soft combine ok (bursts=%d, mean_margin=%.2f): '%s'",
-           used, res.mean_margin, out.c_str());
+  ESP_LOGD(TAG, "Soft combine ok (bursts=%d, ref=%d, mean_margin=%.2f): '%s'",
+           used, ref, res.mean_margin, out.c_str());
   res.ok = true;
   return res;
 }
