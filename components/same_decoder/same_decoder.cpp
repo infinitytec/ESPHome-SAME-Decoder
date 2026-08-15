@@ -628,6 +628,16 @@ void SAMEDecoder::finish_burst_() {
     this->soft_bursts_[0] = this_soft;
     this->burst_idx_ = 1;
     this->last_burst_ms_ = millis();
+
+    // Fix: a promoted differing burst that is already a COMPLETE header must
+    // get the same immediate emit as the normal single-complete-burst path,
+    // otherwise it hangs until the decode watchdog salvages it (~10 s).
+    if (!this->early_emitted_ && this->header_is_complete_(this->bursts_[0])) {
+      ESP_LOGD(TAG, "Immediate emit on promoted COMPLETE differing burst.");
+      this->vote_and_emit_(false, this->fallback_sync_used_);
+      this->early_emitted_ = true;
+    }
+
     this->rearm_sync_();
     return;
   }
