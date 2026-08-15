@@ -237,22 +237,6 @@ number:
     disabled_by_default: true
     set_action:
       - lambda: 'id(same_dec).set_preamble_energy_mult(x);'
-      
-  - platform: template
-    name: "SAME Acquisition Boost"
-    id: same_acq_boost_number
-    icon: "mdi:rocket-launch"
-    min_value: 1.0
-    max_value: 8.0
-    step: 0.5
-    mode: slider
-    optimistic: true
-    restore_value: true
-    initial_value: 4.0
-    entity_category: config
-    disabled_by_default: true
-    set_action:
-      - lambda: 'id(same_dec).set_acq_boost(x);'
 
 sensor:
   - platform: template
@@ -313,7 +297,6 @@ same_decoder:
   eom_require_context: true
   eom_context_ms: 120000
   decode_watchdog_ms: 10000
-  acq_boost: 4.0
   decode_count_sensor: same_decode_count
   last_raw_sensor: same_last_raw
   on_sync:
