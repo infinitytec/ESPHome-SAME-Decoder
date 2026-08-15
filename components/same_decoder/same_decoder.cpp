@@ -1,5 +1,6 @@
 // components/same_decoder/same_decoder.cpp
-// T0 preamble-lock (PRIMARY) + ALWAYS-WARM tiers + strong post-emit recovery
+// T0 preamble-lock (PRIMARY) + watchdog + ALWAYS-WARM tiers
+// + immediate single-burst emit + strong post-emit recovery
 // + T0 acquisition instrumentation (DEBUG diagnostics only)
 #include "same_decoder.h"
 #include "same_event_codes.h"
@@ -153,11 +154,12 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "  Freq offset: %.1f Hz", this->freq_offset_hz_);
   ESP_LOGCONFIG(TAG, "  Samples/bit: %.2f  Goertzel window: %d", this->samples_per_bit_, GWIN);
   ESP_LOGCONFIG(TAG, "  Coeffs mark=%.6f space=%.6f", this->coeff_mark_, this->coeff_space_);
-  ESP_LOGCONFIG(TAG, "  T0 preamble lock: %s (min density %.2f, min bits %" PRIu32 ", acq gain %.1f)",
+  ESP_LOGCONFIG(TAG, "  T0 preamble lock: %s (min density %.2f, min bits %" PRIu32 ", acq gain %.1f, watchdog %" PRIu32 " ms)",
                 this->preamble_lock_ ? "on" : "off",
                 this->preamble_min_density_.load(std::memory_order_relaxed),
                 this->preamble_min_bits_.load(std::memory_order_relaxed),
-                this->preamble_acq_gain_.load(std::memory_order_relaxed));
+                this->preamble_acq_gain_.load(std::memory_order_relaxed),
+                this->preamble_lock_timeout_ms_.load(std::memory_order_relaxed));
   ESP_LOGCONFIG(TAG, "  AB preamble required: %s (min match %d)", this->ab_required_ ? "yes" : "no", AB_MIN_MATCH);
   ESP_LOGCONFIG(TAG, "  Timeout (>=2 bursts): %" PRIu32 " ms", this->timeout_ms_.load(std::memory_order_relaxed));
   ESP_LOGCONFIG(TAG, "  Single-burst min: %" PRIu32 " ms", this->single_burst_min_ms_);
@@ -193,6 +195,10 @@ void SAMEDecoder::reset_preamble_detector_() {
   this->pre_last_bit_ = false;
   this->pre_run_bits_ = 0;
   this->preamble_locked_ = false;
+  this->preamble_lock_ms_ = 0;
+  this->t0_lock_pending_ = false;
+  this->fast_acquire_ = false;
+  this->fast_acquire_bits_left_ = 0;
 }
 
 // Phase-independent preamble detector. Called for every demodulated bit while
@@ -251,6 +257,7 @@ void SAMEDecoder::update_preamble_detector_(bool bit) {
 // and enter fast-acquire so the bit clock converges on the AB run *before* ZCZC.
 void SAMEDecoder::enter_preamble_lock_() {
   this->preamble_locked_ = true;
+  this->preamble_lock_ms_ = millis();
   ESP_LOGD(TAG, "T0 preamble lock (density>=%.2f over %" PRIu32 " bits). Priming clock.",
            this->preamble_min_density_.load(std::memory_order_relaxed),
            this->pre_run_bits_);
@@ -264,12 +271,22 @@ void SAMEDecoder::enter_preamble_lock_() {
   this->fast_acquire_ = true;
   this->fast_acquire_bits_left_ = FAST_ACQUIRE_BITS;
 
-  // --- INSTRUMENTATION: start lock->sync latency measurement ---
-  this->t0_lock_bit_marker_ = this->hunt_bit_counter_;
+  // --- INSTRUMENTATION: start lock->sync latency measurement (fresh each lock) ---
+  this->hunt_bit_counter_ = 0;
+  this->t0_lock_bit_marker_ = 0;
   this->t0_lock_pending_ = true;
 
   // Earliest possible user feedback: light the decode LED at the preamble.
   this->fire_sync_once_();
+}
+
+// Watchdog release: a T0 lock that never led to a real sync (e.g. EOM preamble,
+// voice, or a mangled header) must not hang. Clear all T0 state and drop the
+// decode indicator via the on_eom path.
+void SAMEDecoder::release_preamble_lock_(const char *reason) {
+  ESP_LOGD(TAG, "T0 lock released (%s). Clearing indicator, resuming hunt.", reason);
+  this->reset_preamble_detector_();   // clears preamble_locked_, fast-acquire, markers
+  this->fire_eom_();                   // reuse EOM path to clear the LED
 }
 
 // Debounced sync fire: one on_sync per acquisition, not once per preamble byte.
@@ -331,6 +348,16 @@ void SAMEDecoder::feed_sample_(int16_t s) {
   }
   if (this->idle_edge_samples_ > 0)
     this->idle_edge_samples_--;
+
+  // T0 watchdog: if we locked on a preamble but never progressed to a real sync
+  // within the timeout, release the lock so the LED/state cannot hang.
+  if (this->phase_state_ == HUNT_SYNC && this->preamble_locked_) {
+    uint32_t wd = this->preamble_lock_timeout_ms_.load(std::memory_order_relaxed);
+    if (this->preamble_lock_ms_ != 0 &&
+        (uint32_t) (millis() - this->preamble_lock_ms_) >= wd) {
+      this->release_preamble_lock_("watchdog timeout");
+    }
+  }
 
   if (this->last_emit_ms_ != 0 &&
       (uint32_t) (millis() - this->last_emit_ms_) < this->post_emit_dead_ms_) {
@@ -471,7 +498,7 @@ bool SAMEDecoder::ab_preamble_ok_() const {
 
 void SAMEDecoder::begin_new_capture_(int preamble_len, bool fallback) {
   this->phase_state_ = CAPTURE;
-  this->reset_preamble_detector_();   // T0: clear tone tracker on capture start
+  this->reset_preamble_detector_();   // T0: clear tone tracker + lock state on capture start
   if (preamble_len >= 4)
     this->cur_burst_ = "ZCZC";
   else if (preamble_len == 3)
@@ -556,6 +583,18 @@ void SAMEDecoder::finish_burst_() {
   if (this->burst_idx_ >= 3) {
     this->vote_and_emit_(false, this->fallback_sync_used_);
     this->reset_capture_();
+    return;
+  }
+
+  // C2: a single structurally-valid burst emits immediately, rather than waiting
+  // for the single-burst timeout. Consensus from later bursts can still reissue a
+  // corrected header via the dedup "consensus changed" path.
+  if (this->burst_idx_ == 1 && !this->early_emitted_ &&
+      this->header_is_strictly_valid_(this_burst)) {
+    ESP_LOGD(TAG, "Immediate emit on single structurally-valid burst.");
+    this->vote_and_emit_(false, this->fallback_sync_used_);
+    this->early_emitted_ = true;
+    this->rearm_sync_();
     return;
   }
 
@@ -739,10 +778,9 @@ void SAMEDecoder::note_emit_() {
   this->ab_match_count_ = 0;
   this->eom_n_count_ = 0;
 
-  // 1b. Clear T0 preamble detector so the next preamble (e.g. EOM) locks clean.
+  // 1b. Clear T0 preamble detector + lock state so the next preamble (e.g. EOM)
+  //     locks clean and no lock/latency state leaks across acquisitions.
   this->reset_preamble_detector_();
-  this->fast_acquire_ = false;
-  this->fast_acquire_bits_left_ = 0;
 
   // 2. Zero the entire sample ring so residual audio from the previous
   //    message cannot contaminate the next preamble.
