@@ -458,6 +458,16 @@ bool SAMEDecoder::ab_lock_active_() const {
 // The lock is latched for AB_LOCK_HOLD_MS so subsequent header bits (which
 // are not 0xAB) do not erase it before ZCZC is detected.
 void SAMEDecoder::lock_from_ab_preamble_() {
+  // Prefer locking when the passive tone gate also sees balanced mark/space
+  // energy. Pure correlator hits on random audio are the main source of the
+  // "AB lock seconds before a real header" pattern in the logs.
+  if (!this->tone_gate_ && !this->preamble_present_) {
+    // Still allow a strong correlator-only lock (count well above threshold)
+    // so a clean but low-energy recording is not ignored.
+    if (this->ab_match_count_ < (AB_LOCK_THRESH + 4))
+      return;
+  }
+
   const bool already = this->ab_locked_;
   this->ab_locked_ = true;
   this->ab_lock_ms_ = millis();
@@ -467,8 +477,10 @@ void SAMEDecoder::lock_from_ab_preamble_() {
   this->phase_ = 0.5f;
   this->w_off_ = 0.0f;
   if (!already) {
-    ESP_LOGD(TAG, "AB preamble lock (count=%d). Phase re-centered to mid-bit (hold %u ms).",
-             this->ab_match_count_, (unsigned) AB_LOCK_HOLD_MS);
+    ESP_LOGD(TAG, "AB preamble lock (count=%d, tone=%s). Phase re-centered (hold %u ms).",
+             this->ab_match_count_,
+             (this->tone_gate_ || this->preamble_present_) ? "yes" : "no",
+             (unsigned) AB_LOCK_HOLD_MS);
   }
 }
 
@@ -476,19 +488,36 @@ void SAMEDecoder::begin_new_capture_(int preamble_len, bool fallback) {
   this->phase_state_ = CAPTURE;
   this->soft_cur_.clear();
   this->bad_char_run_ = 0;
+
+  // Pre-seed the hard string from the sync tier that fired.
   if (preamble_len >= 4)
     this->cur_burst_ = "ZCZC";
   else if (preamble_len == 3)
     this->cur_burst_ = "ZCZ";
   else
     this->cur_burst_ = "ZC";
+  if (fallback)
+    this->cur_burst_ += '-';
+
+  // Also seed matching soft LLRs so SoftCombiner sees a clean ZCZC front.
+  // Without this, soft combine always reports "no burst with clean ZCZC front"
+  // even when the hard path is perfect (LLRs only accumulate after sync).
+  // LSB-first ASCII: strong positive LLR => bit 1, strong negative => bit 0.
+  static constexpr float SEED_LLR = 8.0f;
+  auto seed_char = [&](char ch) {
+    for (int k = 0; k < 8; k++) {
+      bool bit1 = ((ch >> k) & 1) != 0;
+      this->soft_cur_.llr.push_back(bit1 ? SEED_LLR : -SEED_LLR);
+    }
+  };
+  for (char ch : this->cur_burst_)
+    seed_char(ch);
+
   this->cur_byte_ = 0;
   this->cur_nbits_ = 0;
   this->plus_seen_ = false;
   this->tail_count_ = 0;
   this->eom_n_count_ = 0;
-  if (fallback)
-    this->cur_burst_ += '-';
 }
 
 bool SAMEDecoder::bursts_agree_(int count) {
@@ -728,7 +757,11 @@ void SAMEDecoder::emit_bit_(bool bit) {
   if (!is_valid_same_char(c)) {
     this->cur_burst_ += '?';
     this->bad_char_run_++;
-    if (this->bad_char_run_ >= 4 || this->cur_burst_.size() >= (size_t) MAX_HEADER_BYTES) {
+    // Without a recent AB lock the bit phase is untrusted; abort garbage
+    // captures quickly so a false ZCZC Hamming hit does not burn the
+    // watchdog / indicator for the full single-burst timeout.
+    const int bad_limit = this->ab_lock_active_() ? 4 : 2;
+    if (this->bad_char_run_ >= bad_limit || this->cur_burst_.size() >= (size_t) MAX_HEADER_BYTES) {
       this->finish_burst_();
     }
     return;
@@ -845,6 +878,12 @@ void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
 
   if (header.rfind("ZCZC", 0) != 0) {
     ESP_LOGW(TAG, "Missing ZCZC; discard.");
+    // End the decode session so the indicator/watchdog do not hang after a
+    // failed flush (timeout or empty collection).
+    if (from_timeout || this->burst_idx_ == 0) {
+      this->decode_active_ = false;
+      this->fire_eom_();
+    }
     return;
   }
 
@@ -855,13 +894,22 @@ void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
   if (weak) {
     if (!this->header_is_strictly_valid_(header)) {
       ESP_LOGW(TAG, "Weak evidence failed structural check: '%s'", sanitize_ascii(header).c_str());
+      if (from_timeout || this->burst_idx_ <= 1) {
+        this->decode_active_ = false;
+        this->fire_eom_();
+      }
       return;
     }
   }
 
   SameAlert alert;
-  if (!this->parse_header_(header, alert))
+  if (!this->parse_header_(header, alert)) {
+    if (from_timeout || this->burst_idx_ <= 1) {
+      this->decode_active_ = false;
+      this->fire_eom_();
+    }
     return;
+  }
 
   if (!this->header_passes_semantic_(alert)) {
     ESP_LOGW(TAG, "Semantic check soft-fail (still emitting): '%s'", sanitize_ascii(header).c_str());
