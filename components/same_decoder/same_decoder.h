@@ -1,20 +1,22 @@
 // components/same_decoder/same_decoder.h
-// Preamble-locked fixed-phase SAME decoder with automatic closed-loop fallback.
+// Preamble-locked fixed-phase SAME decoder with always-on tracked timing.
 //
-// Timing architecture (redesign):
-//  * PRIMARY: lock the bit clock + byte phase on the 0xAB preamble (the preamble
-//    exists to "set asynchronous decoder clocking cycles", 47 CFR 11.31), then
-//    sample at the fixed nominal rate with a small residual-drift trim.
-//  * FALLBACK: a Gardner/early-late closed-loop tracker, seeded by the locked
-//    phase, engages automatically per-symbol only when decision confidence
-//    drops below fallback_conf_thresh_. No user control is exposed.
+// Timing architecture (redesign, v3 bumpless):
+//  * PRIMARY: lock the bit clock on the 0xAB preamble (the preamble exists to
+//    "set asynchronous decoder clocking cycles", 47 CFR 11.31). Declaring lock
+//    is BUMPLESS -- it never discontinuously modifies phase_ or w_off_; it only
+//    confirms good phase and gates captures.
+//  * TRACKING: an early-late timing loop stays alive for the entire session
+//    (gated by a hysteretic confidence gate) so the sampler is never open-loop
+//    between lock and ZCZC. The converged w_off_ correction is preserved across
+//    the lock event and the ~1s inter-burst gap, keeping the payload on
+//    bit-center. w_off_ is reset ONLY on true session boundaries
+//    (emit/EOM/watchdog/feed-gap).
 //
-// Lock persistence (redesign v2): the preamble lock (and its byte phase / timing
-// offset) is carried across the ~1s inter-burst gap so bursts 2/3 decode at
-// already-converged timing. It is time-aged (LOCK_HOLD_MS) so it can never
-// bridge a full message boundary, and is fully torn down on emit/EOM/watchdog/
-// feed-gap. An unlocked ZCZC start is allowed but flagged low-trust: it can
-// never emit on its own and must pass strict structural validation + 2-of-3.
+// Lock persistence: the preamble lock is carried across the ~1s inter-burst gap
+// (time-aged via LOCK_HOLD_MS so it cannot bridge a full message boundary). An
+// unlocked ZCZC start is allowed but flagged low-trust: it can never emit on its
+// own and must pass strict structural validation + 2-of-3 corroboration.
 #pragma once
 
 #include "esphome/core/component.h"
@@ -141,13 +143,13 @@ class SAMEDecoder : public Component {
 
   // --- Preamble lock helpers ---
   // Update the preamble correlator with the current bit-period tone energies and
-  // the just-decided bit; declares/refreshes lock when a sufficient run of the
-  // alternating 0xAB pattern is seen at adequate confidence.
+  // the just-decided bit; declares/refreshes lock (BUMPLESS: never touches
+  // phase_/w_off_) and is read-only w.r.t. timing once a capture is in progress.
   void update_preamble_lock_(float mark_e, float space_e, bool bit, float llr);
   // Full teardown: clears timing state AND last_lock_ms_ (message boundaries).
   void reset_preamble_lock_();
-  // Per-burst run-accumulator clear ONLY; preserves lock/byte_phase/w_off/recency
-  // so bursts 2/3 stay locked across the ~1s inter-burst gap.
+  // Per-burst run-accumulator clear ONLY; preserves lock/w_off_/recency/gate so
+  // bursts 2/3 stay locked with converged timing across the ~1s inter-burst gap.
   void clear_preamble_run_();
   // Strong lock now, or held one within LOCK_HOLD_MS (bridges inter-burst gap).
   bool lock_is_effective_() const;
@@ -238,8 +240,17 @@ class SAMEDecoder : public Component {
 
   static constexpr int CENTER_LAG = GWIN / 2;
   static constexpr int TR_DELTA = 12;
-  static constexpr float TR_CONF_MIN = 0.20f;
   static constexpr float TR_DPHI_CLAMP = 0.125f;
+
+  // Hysteretic + dwell gate for the always-on timing loop. Keeps the loop closed
+  // for the entire session (no open-loop slip between lock and ZCZC) while
+  // preventing idle noise from walking the phase.
+  static constexpr float TR_CONF_ENGAGE = 0.25f;   // open gate above this
+  static constexpr float TR_CONF_RELEASE = 0.20f;  // close gate below this
+  static constexpr int   TR_GATE_DWELL = 4;        // consecutive good bits to open
+  bool tr_gate_open_{false};   // hysteretic timing-loop gate state
+  int  tr_gate_run_{0};        // consecutive qualifying decisions toward opening
+
   float w_off_{0.0f};
   uint32_t samples_seen_{0};
 
@@ -256,10 +267,9 @@ class SAMEDecoder : public Component {
   // the adaptive noise floor, and (b) mark/space are sufficiently balanced
   // across the alternation (|m-s|/(m+s) < preamble_balance_max_). When a run of
   // >= preamble_lock_bits_ qualifying bit-periods is seen at mean |LLR| >=
-  // lock_confidence_min_, we declare LOCK: the current phase_ is the bit-clock
-  // phase and the byte boundary is aligned to the run. The lock is CARRIED
-  // across the ~1s inter-burst gap (see LOCK_HOLD_MS) so bursts 2/3 stay locked;
-  // it is fully torn down on emit/EOM/watchdog/feed-gap.
+  // lock_confidence_min_, we declare LOCK (BUMPLESS: state + recency only, no
+  // timing change). The lock is CARRIED across the ~1s inter-burst gap (see
+  // LOCK_HOLD_MS); it is fully torn down on emit/EOM/watchdog/feed-gap.
   int preamble_lock_bits_{32};
   std::atomic<float> preamble_energy_mult_{8.0f};
   float preamble_balance_max_{0.40f};
@@ -273,18 +283,19 @@ class SAMEDecoder : public Component {
   bool preamble_locked_{false};
   bool was_preamble_locked_{false};
   uint32_t last_lock_ms_{0};    // millis() of most recent lock (0 = never/torn down)
-  int byte_phase_{0};           // 0..7 bit index within the locked byte frame
+  int byte_phase_{0};           // reserved/diagnostic; not used by the payload path
 
   // Lock is carried across the inter-burst gap for up to this long, then
-  // time-aged out. Sized comfortably above the standard's ~1s inter-burst pause
-  // but short enough that it cannot bridge a full message boundary.
+  // time-aged out. Sized above the standard's ~1s inter-burst pause but short
+  // enough that it cannot bridge a full message boundary.
   static constexpr uint32_t LOCK_HOLD_MS = 1200;
 
-  // Fallback closed-loop tracker (seeded by the locked phase).
+  // Timing tracker (early-late). Gains are shared across the whole session; the
+  // always-on gate (above) decides when they are applied.
   float fallback_conf_thresh_{0.20f};
   float fallback_kp_{0.06f};
   float fallback_ki_{0.0015f};
-  bool fallback_active_{false};      // currently tracking (low-confidence run)
+  bool fallback_active_{false};      // diagnostic: low-confidence run in progress
   uint32_t fallback_engagements_{0}; // diagnostic
   float tr_woff_clamp_{0.01f * (1.0f / 92.16f)};
 
