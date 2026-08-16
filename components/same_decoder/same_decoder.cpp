@@ -1,5 +1,7 @@
 // components/same_decoder/same_decoder.cpp
 // Preamble-locked fixed-phase SAME decoder + automatic closed-loop fallback.
+// Lock now persists across the ~1s inter-burst gap (time-aged), and unlocked
+// ZCZC starts are allowed but flagged low-trust (option b).
 #include "same_decoder.h"
 #include "same_soft.h"
 #include "same_event_codes.h"
@@ -71,8 +73,6 @@ void SAMEDecoder::compute_coeffs_() {
   const float baud = 520.0f + 5.0f / 6.0f;   // 520 5/6 bps, per 47 CFR 11.31
   this->samples_per_bit_ = sr / baud;
   this->phase_inc_ = 1.0f / this->samples_per_bit_;
-  // Residual-drift trim clamp: residual_drift_ppm_ of the bit period, expressed
-  // in the same units as phase_inc_.
   this->tr_woff_clamp_ = (this->residual_drift_ppm_ * 1e-6f) * this->phase_inc_;
 
   ESP_LOGCONFIG(TAG, "Coeffs: sr=%" PRIu32 " mark=%.6f space=%.6f spb=%.3f",
@@ -168,10 +168,12 @@ void SAMEDecoder::dump_config() {
                 this->preamble_energy_mult_.load(std::memory_order_relaxed),
                 this->preamble_balance_max_);
   ESP_LOGCONFIG(TAG, "    (partial preamble is sufficient; full 16-byte preamble NOT required)");
+  ESP_LOGCONFIG(TAG, "    Lock carried across inter-burst gap for up to %d ms (time-aged).", LOCK_HOLD_MS);
   ESP_LOGCONFIG(TAG, "  Residual-drift trim: %.0f ppm of bit period", this->residual_drift_ppm_);
   ESP_LOGCONFIG(TAG, "  Fallback tracker: auto engage at conf<%.2f, Kp=%.4f Ki=%.5f",
                 this->fallback_conf_thresh_, this->fallback_kp_, this->fallback_ki_);
   ESP_LOGCONFIG(TAG, "    ZCZC hamming: strict<=%d (sampled at preamble-locked timing)", SYNC_MAX_HAMMING);
+  ESP_LOGCONFIG(TAG, "    Unlocked ZCZC starts allowed but LOW-TRUST (strict-valid + 2-of-3 only).");
   ESP_LOGCONFIG(TAG, "  EOM requires context: %s (%" PRIu32 " ms)",
                 this->eom_require_context_ ? "yes" : "no", this->eom_context_ms_);
   ESP_LOGCONFIG(TAG, "  Decode watchdog: %" PRIu32 " ms",
@@ -196,6 +198,9 @@ void SAMEDecoder::reprime_detector_() {
   this->reset_preamble_lock_();
 }
 
+// Full lock teardown: clears timing state AND last_lock_ms_, so right after an
+// emit/EOM/watchdog/feed-gap the lock is neither strong nor "recent". Called on
+// message boundaries only -- NOT on per-burst rearm.
 void SAMEDecoder::reset_preamble_lock_() {
   this->pre_run_ = 0;
   this->pre_run_conf_sum_ = 0.0;
@@ -204,17 +209,29 @@ void SAMEDecoder::reset_preamble_lock_() {
   this->byte_phase_ = 0;
   this->fallback_active_ = false;
   this->w_off_ = 0.0f;
+  this->last_lock_ms_ = 0;   // clear recency so it doesn't look "recent" post-boundary
 }
 
-// Preamble lock: qualify each decided bit-period against the 0xAB alternating
-// pattern by tone energy and mark/space balance. When a sufficient RUN of good
-// bit-periods accumulates at adequate confidence, declare lock. The run length
-// (not full-preamble decode) is what locks the clock; per 47 CFR 11.31 the
-// preamble exists to "set asynchronous decoder clocking cycles".
+// Per-burst run-accumulator clear ONLY. Preserves preamble_locked_, byte_phase_,
+// w_off_, last_lock_ms_ so bursts 2/3 stay locked across the ~1s inter-burst gap.
+void SAMEDecoder::clear_preamble_run_() {
+  this->pre_run_ = 0;
+  this->pre_run_conf_sum_ = 0.0;
+}
+
+// True if we hold a strong lock, or held one within LOCK_HOLD_MS (bridges the
+// ~1s inter-burst gap). Aging is enforced in feed_sample_ so preamble_locked_
+// itself can never persist past the window.
+bool SAMEDecoder::lock_is_effective_() const {
+  if (this->preamble_locked_)
+    return true;
+  return (this->last_lock_ms_ != 0) &&
+         ((uint32_t) (millis() - this->last_lock_ms_) <= LOCK_HOLD_MS);
+}
+
 void SAMEDecoder::update_preamble_lock_(float mark_e, float space_e, bool bit, float llr) {
   float tone_energy = mark_e + space_e;
 
-  // Adaptive noise floor (slow tracks the minimum tone energy).
   float f = this->pre_noise_floor_;
   float target = std::min(tone_energy, f);
   f += PRE_FLOOR_ALPHA * (target - f);
@@ -231,31 +248,29 @@ void SAMEDecoder::update_preamble_lock_(float mark_e, float space_e, bool bit, f
   if (qualifies) {
     this->pre_run_++;
     this->pre_run_conf_sum_ += std::fabs(llr);
-    // Track byte phase within the run so the byte boundary is known at lock.
     this->byte_phase_ = (this->byte_phase_ + 1) & 7;
 
     if (!this->preamble_locked_ && this->pre_run_ >= this->preamble_lock_bits_) {
       float mean_conf = (float) (this->pre_run_conf_sum_ / (double) this->pre_run_);
       if (mean_conf >= this->lock_confidence_min_) {
-        // LOCK. The current phase_ is the bit-clock phase; byte boundary is the
-        // run start. Align the byte frame so the next full byte starts clean.
         this->preamble_locked_ = true;
         this->last_lock_ms_ = millis();
-        this->byte_phase_ = 0;   // re-anchor byte framing to the lock instant
+        this->byte_phase_ = 0;
         this->fallback_active_ = false;
-        this->w_off_ = 0.0f;     // seed the fallback tracker at zero offset
+        this->w_off_ = 0.0f;
       }
     }
   } else {
-    // A broken run: decay it. Losing a few periods to noise shouldn't drop lock
-    // instantly, but a sustained loss re-arms so the next burst re-locks fresh.
     if (this->pre_run_ > 0) this->pre_run_--;
     if (this->pre_run_ == 0) {
       this->pre_run_conf_sum_ = 0.0;
     }
   }
 
-  // Rising-edge: fire on_preamble once per lock acquisition.
+  // Refresh recency whenever lock is held so continuous preamble keeps it warm.
+  if (this->preamble_locked_)
+    this->last_lock_ms_ = millis();
+
   if (this->preamble_locked_ && !this->was_preamble_locked_) {
     ESP_LOGI(TAG, "Preamble LOCK (run=%d, mean_conf=%.2f).", this->pre_run_,
              this->pre_run_ > 0 ? (float) (this->pre_run_conf_sum_ / (double) this->pre_run_) : 0.0f);
@@ -300,7 +315,7 @@ void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
   if (prev != 0 && (uint32_t) (now - prev) >= FEED_GAP_MS) {
     this->w_off_ = 0.0f;
     this->phase_ = 0.0f;
-    this->reset_preamble_lock_();
+    this->reset_preamble_lock_();   // genuine audio discontinuity: full teardown
   }
 
   const size_t n = data.size() / 2;
@@ -328,6 +343,15 @@ void SAMEDecoder::feed_sample_(int16_t s) {
   float mag = std::fabs((float) s);
   this->update_agc_(mag);
 
+  // Time-age the lock: a strong lock can never persist beyond LOCK_HOLD_MS
+  // without fresh preamble, so it cannot bridge a full message boundary even if
+  // an EOM/emit reset was somehow missed.
+  if (this->preamble_locked_ && this->last_lock_ms_ != 0 &&
+      (uint32_t) (millis() - this->last_lock_ms_) > LOCK_HOLD_MS) {
+    this->preamble_locked_ = false;
+    this->was_preamble_locked_ = false;
+  }
+
   this->env_slow_ += ENV_ALPHA * (mag - this->env_slow_);
   if (this->was_idle_) {
     if (mag > ENV_SILENCE * ENV_RISE_MULT) {
@@ -350,9 +374,6 @@ void SAMEDecoder::feed_sample_(int16_t s) {
   this->ring_pos_ = (this->ring_pos_ + 1) % RINGLEN;
   if (this->samples_seen_ < 0x7fffffff) this->samples_seen_++;
 
-  // Fixed-phase advance. Once preamble-locked, phase_ is at the correct bit
-  // instant; we advance by the nominal increment plus a small residual trim
-  // (w_off_), which the fallback tracker adjusts only when confidence is low.
   this->phase_ += (this->phase_inc_ + this->w_off_);
   if (this->phase_ < 1.0f) {
     if (this->burst_idx_ >= 1 && this->burst_idx_ < 3 && this->last_burst_ms_ != 0) {
@@ -382,14 +403,8 @@ void SAMEDecoder::feed_sample_(int16_t s) {
   float les = std::log(es_c > LLR_EPS ? es_c : LLR_EPS);
   this->last_bit_llr_ = lem - les;
 
-  // Primary path: preamble lock. Feed the correlator every bit-period so a run
-  // of good preamble bits locks the clock BEFORE ZCZC arrives.
   this->update_preamble_lock_(em_c, es_c, bit, this->last_bit_llr_);
 
-  // Automatic fallback tracker: engage the closed-loop (Gardner/early-late) only
-  // when the current decision confidence is below the threshold. Seeded by the
-  // preamble-locked phase; above threshold, the deterministic fixed-phase path
-  // runs with only a light residual trim.
   bool primed = this->samples_seen_ >= (uint32_t) (CENTER_LAG + TR_DELTA + GWIN + 2);
   float conf = 0.0f;
   {
@@ -404,7 +419,6 @@ void SAMEDecoder::feed_sample_(int16_t s) {
     ESP_LOGV(TAG, "Fallback tracker engaged (conf=%.2f).", conf);
   } else if (!low_conf && this->fallback_active_) {
     this->fallback_active_ = false;
-    // Bleed the offset back toward zero when we return to the fixed-phase path.
     this->w_off_ *= 0.5f;
   }
 
@@ -419,7 +433,6 @@ void SAMEDecoder::feed_sample_(int16_t s) {
     const float eps = 1e-9f;
     float e_raw = (d_late - d_early) / (d_late + d_early + eps);
 
-    // Only steer when we have adequate confidence in the error estimate.
     if (conf >= TR_CONF_MIN) {
       float e = e_raw;
       float dphi = this->fallback_kp_ * e;
@@ -432,7 +445,6 @@ void SAMEDecoder::feed_sample_(int16_t s) {
       if (this->w_off_ < -this->tr_woff_clamp_) this->w_off_ = -this->tr_woff_clamp_;
     }
   } else if (primed && this->phase_state_ != CAPTURE) {
-    // Fixed-phase idle: gently decay any residual offset.
     this->w_off_ *= 0.999f;
     if (std::fabs(this->w_off_) < 1e-9f)
       this->w_off_ = 0.0f;
@@ -463,9 +475,12 @@ void SAMEDecoder::rearm_sync_() {
   this->eom_n_count_ = 0;
   this->bad_char_run_ = 0;
   this->soft_cur_.clear();
-  // Re-arm the preamble lock so the NEXT burst re-locks on its own fresh
-  // preamble (each header and EOM is preceded by a preamble, per 47 CFR 11.31).
-  this->reset_preamble_lock_();
+  this->cur_low_trust_ = false;
+  // IMPORTANT: do NOT tear down the preamble lock here. Only clear the run
+  // accumulators so the next burst's preamble is counted fresh, while
+  // preamble_locked_/byte_phase_/w_off_/last_lock_ms_ persist across the ~1s
+  // inter-burst gap (each burst is preceded by its own preamble, 47 CFR 11.31).
+  this->clear_preamble_run_();
 }
 
 void SAMEDecoder::reset_capture_() {
@@ -477,9 +492,11 @@ void SAMEDecoder::reset_capture_() {
   this->session_emitted_header_.clear();
   for (int i = 0; i < 3; i++) this->bursts_[i].clear();
   for (int i = 0; i < 3; i++) this->soft_bursts_[i].clear();
+  for (int i = 0; i < 3; i++) this->burst_low_trust_[i] = false;
   this->soft_cur_.clear();
   this->bad_char_run_ = 0;
   this->eom_n_count_ = 0;
+  this->cur_low_trust_ = false;
   // decode_active_ is cleared explicitly by emit/EOM/watchdog, not here.
 }
 
@@ -549,10 +566,13 @@ bool SAMEDecoder::same_message_as_current_(const std::string &new_burst) {
 }
 
 void SAMEDecoder::finish_burst_() {
-  ESP_LOGD(TAG, "Burst %d ascii: '%s'", this->burst_idx_, sanitize_ascii(this->cur_burst_).c_str());
+  ESP_LOGD(TAG, "Burst %d ascii: '%s'%s", this->burst_idx_,
+           sanitize_ascii(this->cur_burst_).c_str(),
+           this->cur_low_trust_ ? " (low-trust)" : "");
 
   std::string this_burst = this->cur_burst_;
   SoftBurst this_soft = this->soft_cur_;
+  bool this_low_trust = this->cur_low_trust_;
   this->soft_cur_.clear();
 
   if (this->header_is_strictly_valid_(this_burst))
@@ -563,10 +583,14 @@ void SAMEDecoder::finish_burst_() {
     this->reset_capture_();
     this->bursts_[0] = this_burst;
     this->soft_bursts_[0] = this_soft;
+    this->burst_low_trust_[0] = this_low_trust;
     this->burst_idx_ = 1;
     this->last_burst_ms_ = millis();
 
-    if (!this->early_emitted_ && this->header_is_complete_(this->bursts_[0])) {
+    // A promoted differing burst may only emit immediately if it is NOT
+    // low-trust and is a complete header. Low-trust captures never emit solo.
+    if (!this->early_emitted_ && !this_low_trust &&
+        this->header_is_complete_(this->bursts_[0])) {
       ESP_LOGD(TAG, "Immediate emit on promoted COMPLETE differing burst.");
       this->vote_and_emit_(false, this->fallback_sync_used_);
       this->early_emitted_ = true;
@@ -579,6 +603,7 @@ void SAMEDecoder::finish_burst_() {
   if (this->burst_idx_ < 3) {
     this->bursts_[this->burst_idx_] = this_burst;
     this->soft_bursts_[this->burst_idx_] = this_soft;
+    this->burst_low_trust_[this->burst_idx_] = this_low_trust;
   }
   this->burst_idx_++;
   this->last_burst_ms_ = millis();
@@ -589,7 +614,9 @@ void SAMEDecoder::finish_burst_() {
     return;
   }
 
-  if (this->burst_idx_ == 1 && !this->early_emitted_ &&
+  // Single-burst immediate emit only when NOT low-trust (option b: a low-trust
+  // capture can never emit on its own; it must be corroborated by 2-of-3).
+  if (this->burst_idx_ == 1 && !this->early_emitted_ && !this_low_trust &&
       this->header_is_complete_(this_burst)) {
     ESP_LOGD(TAG, "Immediate emit on single COMPLETE burst.");
     this->vote_and_emit_(false, this->fallback_sync_used_);
@@ -611,8 +638,6 @@ void SAMEDecoder::emit_bit_(bool bit) {
   if (this->phase_state_ == HUNT_SYNC) {
     this->sync_shift_ = (this->sync_shift_ >> 1) | ((uint32_t) (bit ? 1u : 0u) << 31);
 
-    // ZCZC is now sampled at preamble-locked timing, so the strict hamming
-    // threshold is appropriate: no acquisition-time relaxation is needed.
     uint32_t diffbits = this->sync_shift_ ^ SYNC_ZCZC;
     int hamming = __builtin_popcount(diffbits);
     bool t1 = (hamming <= SYNC_MAX_HAMMING);
@@ -640,8 +665,14 @@ void SAMEDecoder::emit_bit_(bool bit) {
       if (this->burst_idx_ == 0)
         this->fallback_sync_used_ = fb || t3;
 
-      ESP_LOGD(TAG, "Sync via %s (locked=%s). Capture start.",
-               tier, this->preamble_locked_ ? "yes" : "no");
+      // Option (b): allow an unlocked ZCZC start, but flag this capture
+      // low-trust. lock_is_effective_() bridges the ~1s inter-burst gap.
+      bool locked_now = this->lock_is_effective_();
+      this->cur_low_trust_ = !locked_now;
+
+      ESP_LOGD(TAG, "Sync via %s (locked=%s)%s. Capture start.",
+               tier, locked_now ? "yes" : "no",
+               this->cur_low_trust_ ? " [LOW-TRUST]" : "");
 
       if (!this->decode_active_) {
         this->decode_active_ = true;
@@ -654,8 +685,7 @@ void SAMEDecoder::emit_bit_(bool bit) {
     return;
   }
 
-  // CAPTURE: push the per-bit LLR so the soft combiner sees exactly the bits
-  // starting at ZCZC (timing already locked on the preamble).
+  // CAPTURE
   this->soft_cur_.llr.push_back(this->last_bit_llr_);
 
   this->cur_byte_ >>= 1;
@@ -680,6 +710,7 @@ void SAMEDecoder::emit_bit_(bool bit) {
         if (this->burst_idx_ >= 1)
           this->vote_and_emit_(true, this->fallback_sync_used_);
         this->reset_capture_();
+        this->reset_preamble_lock_();   // message boundary: full lock teardown
         this->decode_active_ = false;
         this->fire_eom_();
       } else {
@@ -777,9 +808,7 @@ void SAMEDecoder::note_emit_() {
   this->last_emit_ms_ = millis();
   this->eom_n_count_ = 0;
   this->idle_edge_samples_ = 48000 / 2;
-  this->reset_preamble_lock_();
-  // A successful emit ends the active decode session for watchdog purposes.
-  // (The LED is cleared by on_alert; EOM may still arrive to double-confirm.)
+  this->reset_preamble_lock_();   // message boundary: full lock teardown
   this->decode_active_ = false;
 }
 
@@ -815,7 +844,20 @@ void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
   int collected = 0;
   for (int i = 0; i < 3; i++) if (!this->bursts_[i].empty()) collected++;
 
-  bool weak = (from_timeout && collected < 2) || fallback_synced;
+  // Any contributing low-trust capture? If the winning evidence rests on
+  // low-trust captures, require corroboration: at least 2 collected bursts.
+  int low_trust_collected = 0;
+  int trusted_collected = 0;
+  for (int i = 0; i < 3; i++) {
+    if (this->bursts_[i].empty()) continue;
+    if (this->burst_low_trust_[i]) low_trust_collected++;
+    else trusted_collected++;
+  }
+
+  // Weak evidence = timeout-with-<2-bursts, fallback sync tier, OR the decode
+  // is carried solely by low-trust captures without >=2 corroborating bursts.
+  bool low_trust_uncorroborated = (trusted_collected == 0) && (collected < 2);
+  bool weak = (from_timeout && collected < 2) || fallback_synced || low_trust_uncorroborated;
   if (weak) {
     if (!this->header_is_strictly_valid_(header)) {
       ESP_LOGW(TAG, "Weak evidence failed structural check: '%s'", sanitize_ascii(header).c_str());
