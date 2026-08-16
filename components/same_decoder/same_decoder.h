@@ -8,6 +8,13 @@
 //  * FALLBACK: a Gardner/early-late closed-loop tracker, seeded by the locked
 //    phase, engages automatically per-symbol only when decision confidence
 //    drops below fallback_conf_thresh_. No user control is exposed.
+//
+// Lock persistence (redesign v2): the preamble lock (and its byte phase / timing
+// offset) is carried across the ~1s inter-burst gap so bursts 2/3 decode at
+// already-converged timing. It is time-aged (LOCK_HOLD_MS) so it can never
+// bridge a full message boundary, and is fully torn down on emit/EOM/watchdog/
+// feed-gap. An unlocked ZCZC start is allowed but flagged low-trust: it can
+// never emit on its own and must pass strict structural validation + 2-of-3.
 #pragma once
 
 #include "esphome/core/component.h"
@@ -137,9 +144,13 @@ class SAMEDecoder : public Component {
   // the just-decided bit; declares/refreshes lock when a sufficient run of the
   // alternating 0xAB pattern is seen at adequate confidence.
   void update_preamble_lock_(float mark_e, float space_e, bool bit, float llr);
-  // Reset the preamble-lock state (called on rearm and after emit/EOM).
+  // Full teardown: clears timing state AND last_lock_ms_ (message boundaries).
   void reset_preamble_lock_();
-  bool is_locked_() const { return this->preamble_locked_; }
+  // Per-burst run-accumulator clear ONLY; preserves lock/byte_phase/w_off/recency
+  // so bursts 2/3 stay locked across the ~1s inter-burst gap.
+  void clear_preamble_run_();
+  // Strong lock now, or held one within LOCK_HOLD_MS (bridges inter-burst gap).
+  bool lock_is_effective_() const;
 
   void fire_sync_once_();
   void fire_eom_();
@@ -246,8 +257,9 @@ class SAMEDecoder : public Component {
   // across the alternation (|m-s|/(m+s) < preamble_balance_max_). When a run of
   // >= preamble_lock_bits_ qualifying bit-periods is seen at mean |LLR| >=
   // lock_confidence_min_, we declare LOCK: the current phase_ is the bit-clock
-  // phase and the byte boundary is aligned to the run. Lock is re-armed at the
-  // start of every burst (each header/EOM is preceded by a fresh preamble).
+  // phase and the byte boundary is aligned to the run. The lock is CARRIED
+  // across the ~1s inter-burst gap (see LOCK_HOLD_MS) so bursts 2/3 stay locked;
+  // it is fully torn down on emit/EOM/watchdog/feed-gap.
   int preamble_lock_bits_{32};
   std::atomic<float> preamble_energy_mult_{8.0f};
   float preamble_balance_max_{0.40f};
@@ -260,8 +272,13 @@ class SAMEDecoder : public Component {
   double pre_run_conf_sum_{0};  // sum of |LLR| over the current run
   bool preamble_locked_{false};
   bool was_preamble_locked_{false};
-  uint32_t last_lock_ms_{0};
+  uint32_t last_lock_ms_{0};    // millis() of most recent lock (0 = never/torn down)
   int byte_phase_{0};           // 0..7 bit index within the locked byte frame
+
+  // Lock is carried across the inter-burst gap for up to this long, then
+  // time-aged out. Sized comfortably above the standard's ~1s inter-burst pause
+  // but short enough that it cannot bridge a full message boundary.
+  static constexpr uint32_t LOCK_HOLD_MS = 1200;
 
   // Fallback closed-loop tracker (seeded by the locked phase).
   float fallback_conf_thresh_{0.20f};
@@ -310,9 +327,19 @@ class SAMEDecoder : public Component {
       (static_cast<uint32_t>('C') << 8) |
       (static_cast<uint32_t>('Z'));
 
+  static constexpr uint32_t SYNC_ZC_16 =
+      (static_cast<uint32_t>('C') << 8) |
+      (static_cast<uint32_t>('Z'));
+
   static constexpr uint32_t MASK16 = 0x0000FFFFu;
   static constexpr uint32_t MASK24 = 0x00FFFFFFu;
   bool fallback_sync_used_{false};
+
+  // Low-trust: a capture that started from a ZCZC match while NOT effectively
+  // locked. Such a capture can never emit on its own and must pass strict
+  // structural validation + 2-of-3 corroboration before it counts.
+  bool cur_low_trust_{false};                     // current in-progress capture
+  bool burst_low_trust_[3]{false, false, false};  // per-collected-burst flag
 
   uint8_t cur_byte_{0};
   int cur_nbits_{0};
