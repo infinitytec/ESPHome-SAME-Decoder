@@ -1,5 +1,8 @@
 # =============================================================================
 #  NOAA Weather Radio SAME Decoder - AI-Thinker ESP32-Audio-Kit (ESP32-A1S / ES8388)
+#  Redesign: preamble-locked fixed-phase sampler (primary) + automatic
+#  confidence-triggered closed-loop tracker (fallback). Timing locks on the
+#  0xAB preamble ("set asynchronous decoder clocking cycles", 47 CFR 11.31).
 # =============================================================================
 
 substitutions:
@@ -222,6 +225,7 @@ number:
     set_action:
       - lambda: 'id(same_dec).set_decode_watchdog_ms((uint32_t) (x * 1000.0f));'
 
+  # --- Preamble-lock tuning (redesign) ---
   - platform: template
     name: "SAME Preamble Energy Mult"
     id: same_pre_energy_number
@@ -298,17 +302,21 @@ same_decoder:
   single_burst_min_ms: 7000
   post_emit_dead_ms: 1500
   sample_rate: 48000
-  preamble_status: true
+  # --- Preamble lock (primary timing path) ---
+  # Minimum consecutive good preamble bit-periods to declare lock. This is a
+  # floor for reliable convergence, NOT a requirement to decode all 16 preamble
+  # bytes; a partial-but-sufficient run locks the clock. 32 bits (~4 bytes) is
+  # comfortably below the full 128-bit preamble.
+  preamble_lock_bits: 32
   preamble_energy_mult: 8.0
-  # --- Option 3: continuous preamble-assisted acquisition (T0 preamble priming) ---
-  pre_td_thresh: 0.52            # preamble transition-density gate (0.5-1.0)
-  pre_abd5_ham_thresh: 4         # AB/D5 min-hamming over 16 bits to call preamble
-  tr_kp_acq_mult: 2.0            # timing-loop Kp multiplier during preamble
-  tr_ki_acq_mult: 1.5            # timing-loop Ki multiplier during preamble
-  kpki_slew_symbols: 16          # bumpless gain slew length (symbols)
-  tr_woff_clamp_acq_factor: 0.6  # tighter integrator clamp during acquisition
-  zczc_ham_relaxed: 2            # ZCZC hamming tolerance when preamble present/recent
-  preamble_recent_ms: 200        # how long a preamble stays "recent" for relaxing ZCZC
+  preamble_balance_max: 0.40
+  lock_confidence_min: 0.5
+  residual_drift_ppm: 2000.0
+  # --- Automatic closed-loop fallback (engages only on low confidence) ---
+  fallback_conf_thresh: 0.20
+  fallback_kp: 0.06
+  fallback_ki: 0.0015
+  # --- EOM / watchdog ---
   eom_require_context: true
   eom_context_ms: 120000
   decode_watchdog_ms: 10000
