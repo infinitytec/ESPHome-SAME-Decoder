@@ -621,7 +621,7 @@ void SAMEDecoder::finish_burst_() {
   if (this->header_is_strictly_valid_(this_burst))
     this->last_valid_header_ms_ = millis();
 
-    if (this->burst_idx_ >= 1 && !this->same_message_as_current_(this_burst)) {
+  if (this->burst_idx_ >= 1 && !this->same_message_as_current_(this_burst)) {
     ESP_LOGD(TAG, "Differing burst mid-collection: finalising old, starting new.");
     this->reset_capture_();
     this->bursts_[0] = this_burst;
@@ -637,10 +637,6 @@ void SAMEDecoder::finish_burst_() {
       this->vote_and_emit_(false, this->fallback_sync_used_);
       this->early_emitted_ = true;
     }
-
-    this->rearm_sync_();
-    return;
-  }
 
     this->rearm_sync_();
     return;
