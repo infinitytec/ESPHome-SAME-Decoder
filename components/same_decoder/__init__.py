@@ -1,5 +1,9 @@
 # components/same_decoder/__init__.py
-# Config schema + codegen for the SAME decoder (soft-decision + commercial-style TR).
+# Config schema + codegen for the SAME decoder.
+# Redesign: preamble-locked fixed-phase sampler (primary) + automatic
+# confidence-triggered closed-loop tracker (fallback). Timing is now locked on
+# the 0xAB preamble ("set asynchronous decoder clocking cycles" per 47 CFR
+# 11.31), NOT on the ZCZC letters. See the SAME/EAS protocol spec inline below.
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
@@ -26,25 +30,39 @@ CONF_AGC_MAX_GAIN = "agc_max_gain"
 CONF_TIMEOUT_MS = "timeout_ms"
 CONF_SINGLE_BURST_MIN_MS = "single_burst_min_ms"
 CONF_POST_EMIT_DEAD_MS = "post_emit_dead_ms"
-CONF_AB_REQUIRED = "ab_required"
-
-CONF_PREAMBLE_STATUS = "preamble_status"
-CONF_PREAMBLE_ENERGY_MULT = "preamble_energy_mult"
 
 CONF_EOM_REQUIRE_CONTEXT = "eom_require_context"
 CONF_EOM_CONTEXT_MS = "eom_context_ms"
 
 CONF_DECODE_WATCHDOG_MS = "decode_watchdog_ms"
 
-# --- Option 3: continuous preamble-assisted acquisition ---
-CONF_PRE_TD_THRESH = "pre_td_thresh"
-CONF_PRE_ABD5_HAM_THRESH = "pre_abd5_ham_thresh"
-CONF_TR_KP_ACQ_MULT = "tr_kp_acq_mult"
-CONF_TR_KI_ACQ_MULT = "tr_ki_acq_mult"
-CONF_KPKI_SLEW_SYMBOLS = "kpki_slew_symbols"
-CONF_TR_WOFF_CLAMP_ACQ_FACTOR = "tr_woff_clamp_acq_factor"
-CONF_ZCZC_HAM_RELAXED = "zczc_ham_relaxed"
-CONF_PREAMBLE_RECENT_MS = "preamble_recent_ms"
+# --- Preamble-lock (redesign) parameters ---
+# preamble_lock_bits: the MINIMUM number of consecutive good preamble bit-periods
+#   required to declare timing lock. This is a floor for reliable convergence,
+#   NOT a requirement to receive the full 16-byte (128-bit) preamble. A partial
+#   but sufficient run locks the clock; extra preamble bytes just keep the loop
+#   warm until ZCZC arrives. Default 32 bits (~4 bytes) is comfortably below the
+#   full preamble length and locks robustly on clean and typical off-air audio.
+CONF_PREAMBLE_LOCK_BITS = "preamble_lock_bits"
+# preamble_energy_mult: tone-energy multiple over the adaptive noise floor that
+#   qualifies a sample window as "tone present" for the preamble correlator.
+CONF_PREAMBLE_ENERGY_MULT = "preamble_energy_mult"
+# preamble_balance_max: max |mark-space|/(mark+space) imbalance still accepted as
+#   a valid alternating-preamble bit-period (rejects single-tone noise).
+CONF_PREAMBLE_BALANCE_MAX = "preamble_balance_max"
+# lock_confidence_min: mean per-bit decision margin (|LLR|) over the qualifying
+#   preamble run required to accept the lock. Guards against locking on noise.
+CONF_LOCK_CONFIDENCE_MIN = "lock_confidence_min"
+# residual_drift_ppm: bound on the slow residual clock trim applied by the
+#   fixed-phase sampler after lock (parts-per-million of the bit period).
+CONF_RESIDUAL_DRIFT_PPM = "residual_drift_ppm"
+# fallback_conf_thresh: per-symbol decision confidence (|LLR|) below which the
+#   automatic closed-loop (Gardner/early-late) tracker engages, seeded by the
+#   preamble-locked phase. Above it, the deterministic fixed-phase path runs.
+CONF_FALLBACK_CONF_THRESH = "fallback_conf_thresh"
+# fallback_kp / fallback_ki: PI gains for the fallback closed-loop tracker.
+CONF_FALLBACK_KP = "fallback_kp"
+CONF_FALLBACK_KI = "fallback_ki"
 
 same_decoder_ns = cg.esphome_ns.namespace("same_decoder")
 SAMEDecoder = same_decoder_ns.class_("SAMEDecoder", cg.Component)
@@ -54,12 +72,28 @@ SyncTrigger = same_decoder_ns.class_("SyncTrigger", automation.Trigger.template(
 EomTrigger = same_decoder_ns.class_("EomTrigger", automation.Trigger.template())
 PreambleTrigger = same_decoder_ns.class_("PreambleTrigger", automation.Trigger.template())
 
+# Keys removed across redesigns. Old configs fail loudly (never silently
+# misbehave). The ZCZC-acquisition knobs are removed here because timing is now
+# locked on the preamble, not acquired from the ZCZC letters.
 _REMOVED_KEYS = {
-    "preamble_lock": "Preamble no longer resets the clock; acquisition is via ZCZC tiers.",
+    # Pre-redesign (already removed previously).
+    "preamble_lock": "Timing now locks on the 0xAB preamble by design; there is no separate lock flag.",
     "preamble_min_density": "The bit-density preamble detector was removed.",
-    "preamble_min_bits": "The bit-density preamble detector was removed.",
+    "preamble_min_bits": "Replaced by 'preamble_lock_bits' (minimum consecutive good preamble bit-periods to lock).",
     "preamble_acq_gain": "PLL fast-acquire was removed (it corrupted decodes).",
     "preamble_lock_timeout_ms": "The preamble-lock watchdog is no longer needed.",
+    # ZCZC-acquisition knobs removed in THIS redesign.
+    "preamble_status": "The diagnostic-only preamble energy gate was replaced by a real preamble timing lock.",
+    "ab_required": "AB preamble presence is now intrinsic to timing lock; a separate requirement flag is obsolete.",
+    "pre_td_thresh": "ZCZC-acquisition transition-density gate removed; timing now locks on the preamble.",
+    "pre_abd5_ham_thresh": "ZCZC-acquisition AB/D5 hamming gate removed; timing now locks on the preamble.",
+    "tr_kp_acq_mult": "ZCZC-acquisition timing-loop multiplier removed; use 'fallback_kp' for the fallback tracker.",
+    "tr_ki_acq_mult": "ZCZC-acquisition timing-loop multiplier removed; use 'fallback_ki' for the fallback tracker.",
+    "kpki_slew_symbols": "Bumpless gearshift slew removed; the fixed-phase sampler locks directly on the preamble.",
+    "tr_woff_clamp_acq_factor": "ZCZC-acquisition integrator clamp factor removed.",
+    "zczc_ham_relaxed": "Relaxed ZCZC hamming (preamble-recent) removed; ZCZC is now sampled at preamble-locked timing.",
+    "preamble_recent_ms": "The 'preamble recent' relaxation window removed; timing lock is explicit now.",
+    "single_burst_min_ms_legacy": "Renamed; use 'single_burst_min_ms'.",
 }
 
 
@@ -67,7 +101,7 @@ def _reject_removed_keys(config):
     for key, why in _REMOVED_KEYS.items():
         if key in config:
             raise cv.Invalid(
-                f"'{key}' has been removed in the redesign. {why} "
+                f"'{key}' has been removed in the preamble-lock redesign. {why} "
                 f"Please delete it from your 'same_decoder:' block."
             )
     return config
@@ -87,17 +121,15 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_TIMEOUT_MS, default=3000): cv.int_range(min=500, max=30000),
             cv.Optional(CONF_SINGLE_BURST_MIN_MS, default=7000): cv.int_range(min=1000, max=60000),
             cv.Optional(CONF_POST_EMIT_DEAD_MS, default=800): cv.int_range(min=0, max=10000),
-            cv.Optional(CONF_AB_REQUIRED, default=False): cv.boolean,
-            cv.Optional(CONF_PREAMBLE_STATUS, default=True): cv.boolean,
+            # --- Preamble-lock parameters ---
+            cv.Optional(CONF_PREAMBLE_LOCK_BITS, default=32): cv.int_range(min=8, max=128),
             cv.Optional(CONF_PREAMBLE_ENERGY_MULT, default=8.0): cv.float_range(min=2.0, max=50.0),
-            cv.Optional(CONF_PRE_TD_THRESH, default=0.70): cv.float_range(min=0.5, max=1.0),
-            cv.Optional(CONF_PRE_ABD5_HAM_THRESH, default=2): cv.int_range(min=0, max=6),
-            cv.Optional(CONF_TR_KP_ACQ_MULT, default=2.0): cv.float_range(min=1.0, max=8.0),
-            cv.Optional(CONF_TR_KI_ACQ_MULT, default=1.5): cv.float_range(min=1.0, max=8.0),
-            cv.Optional(CONF_KPKI_SLEW_SYMBOLS, default=16): cv.int_range(min=1, max=128),
-            cv.Optional(CONF_TR_WOFF_CLAMP_ACQ_FACTOR, default=0.6): cv.float_range(min=0.1, max=1.0),
-            cv.Optional(CONF_ZCZC_HAM_RELAXED, default=2): cv.int_range(min=1, max=4),
-            cv.Optional(CONF_PREAMBLE_RECENT_MS, default=200): cv.int_range(min=0, max=5000),
+            cv.Optional(CONF_PREAMBLE_BALANCE_MAX, default=0.40): cv.float_range(min=0.05, max=0.9),
+            cv.Optional(CONF_LOCK_CONFIDENCE_MIN, default=0.5): cv.float_range(min=0.0, max=50.0),
+            cv.Optional(CONF_RESIDUAL_DRIFT_PPM, default=2000.0): cv.float_range(min=0.0, max=50000.0),
+            cv.Optional(CONF_FALLBACK_CONF_THRESH, default=0.20): cv.float_range(min=0.0, max=50.0),
+            cv.Optional(CONF_FALLBACK_KP, default=0.06): cv.float_range(min=0.0, max=1.0),
+            cv.Optional(CONF_FALLBACK_KI, default=0.0015): cv.float_range(min=0.0, max=0.5),
             cv.Optional(CONF_EOM_REQUIRE_CONTEXT, default=True): cv.boolean,
             cv.Optional(CONF_EOM_CONTEXT_MS, default=120000): cv.int_range(min=1000, max=600000),
             cv.Optional(CONF_DECODE_WATCHDOG_MS, default=10000): cv.int_range(min=2000, max=60000),
@@ -135,17 +167,16 @@ async def to_code(config):
     cg.add(var.set_timeout_ms(config[CONF_TIMEOUT_MS]))
     cg.add(var.set_single_burst_min_ms(config[CONF_SINGLE_BURST_MIN_MS]))
     cg.add(var.set_post_emit_dead_ms(config[CONF_POST_EMIT_DEAD_MS]))
-    cg.add(var.set_ab_required(config[CONF_AB_REQUIRED]))
-    cg.add(var.set_preamble_status(config[CONF_PREAMBLE_STATUS]))
+
+    cg.add(var.set_preamble_lock_bits(config[CONF_PREAMBLE_LOCK_BITS]))
     cg.add(var.set_preamble_energy_mult(config[CONF_PREAMBLE_ENERGY_MULT]))
-    cg.add(var.set_pre_td_thresh(config[CONF_PRE_TD_THRESH]))
-    cg.add(var.set_pre_abd5_ham_thresh(config[CONF_PRE_ABD5_HAM_THRESH]))
-    cg.add(var.set_tr_kp_acq_mult(config[CONF_TR_KP_ACQ_MULT]))
-    cg.add(var.set_tr_ki_acq_mult(config[CONF_TR_KI_ACQ_MULT]))
-    cg.add(var.set_kpki_slew_symbols(config[CONF_KPKI_SLEW_SYMBOLS]))
-    cg.add(var.set_tr_woff_clamp_acq_factor(config[CONF_TR_WOFF_CLAMP_ACQ_FACTOR]))
-    cg.add(var.set_zczc_ham_relaxed(config[CONF_ZCZC_HAM_RELAXED]))
-    cg.add(var.set_preamble_recent_ms(config[CONF_PREAMBLE_RECENT_MS]))
+    cg.add(var.set_preamble_balance_max(config[CONF_PREAMBLE_BALANCE_MAX]))
+    cg.add(var.set_lock_confidence_min(config[CONF_LOCK_CONFIDENCE_MIN]))
+    cg.add(var.set_residual_drift_ppm(config[CONF_RESIDUAL_DRIFT_PPM]))
+    cg.add(var.set_fallback_conf_thresh(config[CONF_FALLBACK_CONF_THRESH]))
+    cg.add(var.set_fallback_kp(config[CONF_FALLBACK_KP]))
+    cg.add(var.set_fallback_ki(config[CONF_FALLBACK_KI]))
+
     cg.add(var.set_eom_require_context(config[CONF_EOM_REQUIRE_CONTEXT]))
     cg.add(var.set_eom_context_ms(config[CONF_EOM_CONTEXT_MS]))
     cg.add(var.set_decode_watchdog_ms(config[CONF_DECODE_WATCHDOG_MS]))
