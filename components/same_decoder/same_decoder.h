@@ -1,4 +1,13 @@
 // components/same_decoder/same_decoder.h
+// Preamble-locked fixed-phase SAME decoder with automatic closed-loop fallback.
+//
+// Timing architecture (redesign):
+//  * PRIMARY: lock the bit clock + byte phase on the 0xAB preamble (the preamble
+//    exists to "set asynchronous decoder clocking cycles", 47 CFR 11.31), then
+//    sample at the fixed nominal rate with a small residual-drift trim.
+//  * FALLBACK: a Gardner/early-late closed-loop tracker, seeded by the locked
+//    phase, engages automatically per-symbol only when decision confidence
+//    drops below fallback_conf_thresh_. No user control is exposed.
 #pragma once
 
 #include "esphome/core/component.h"
@@ -70,20 +79,16 @@ class SAMEDecoder : public Component {
   uint32_t get_timeout_ms() const { return this->timeout_ms_.load(std::memory_order_relaxed); }
   void set_single_burst_min_ms(uint32_t v) { this->single_burst_min_ms_ = v; }
   void set_post_emit_dead_ms(uint32_t v) { this->post_emit_dead_ms_ = v; }
-  void set_ab_required(bool v) { this->ab_required_ = v; }
 
-  void set_preamble_status(bool v) { this->preamble_status_ = v; }
+  // --- Preamble-lock parameter setters ---
+  void set_preamble_lock_bits(int v) { this->preamble_lock_bits_ = v; }
   void set_preamble_energy_mult(float v) { this->preamble_energy_mult_.store(v, std::memory_order_relaxed); }
-
-  // --- Option 3: continuous preamble-assisted acquisition setters ---
-  void set_pre_td_thresh(float v) { this->pre_td_thresh_ = v; }
-  void set_pre_abd5_ham_thresh(int v) { this->pre_abd5_ham_thresh_ = v; }
-  void set_tr_kp_acq_mult(float v) { this->tr_kp_acq_mult_ = v; }
-  void set_tr_ki_acq_mult(float v) { this->tr_ki_acq_mult_ = v; }
-  void set_kpki_slew_symbols(int v) { this->kpki_slew_symbols_ = v; }
-  void set_tr_woff_clamp_acq_factor(float v) { this->tr_woff_clamp_acq_factor_ = v; }
-  void set_zczc_ham_relaxed(int v) { this->zczc_ham_relaxed_ = v; }
-  void set_preamble_recent_ms(uint32_t v) { this->preamble_recent_ms_ = v; }
+  void set_preamble_balance_max(float v) { this->preamble_balance_max_ = v; }
+  void set_lock_confidence_min(float v) { this->lock_confidence_min_ = v; }
+  void set_residual_drift_ppm(float v) { this->residual_drift_ppm_ = v; }
+  void set_fallback_conf_thresh(float v) { this->fallback_conf_thresh_ = v; }
+  void set_fallback_kp(float v) { this->fallback_kp_ = v; }
+  void set_fallback_ki(float v) { this->fallback_ki_ = v; }
 
   void set_eom_require_context(bool v) { this->eom_require_context_ = v; }
   void set_eom_context_ms(uint32_t v) { this->eom_context_ms_ = v; }
@@ -124,16 +129,17 @@ class SAMEDecoder : public Component {
   void finish_burst_();
   void compute_coeffs_();
   void update_agc_(float mag);
-  bool ab_preamble_ok_() const;
   void note_emit_();
   void check_decode_watchdog_();
 
-  void update_preamble_gate_(float mark_e, float space_e);
-
-  // --- Option 3 helpers ---
-  void update_preamble_metrics_(bool bit, float llr);
-  void update_timing_gains_();
-  void copy_llrs_from_ring_(int n_bits);
+  // --- Preamble lock helpers ---
+  // Update the preamble correlator with the current bit-period tone energies and
+  // the just-decided bit; declares/refreshes lock when a sufficient run of the
+  // alternating 0xAB pattern is seen at adequate confidence.
+  void update_preamble_lock_(float mark_e, float space_e, bool bit, float llr);
+  // Reset the preamble-lock state (called on rearm and after emit/EOM).
+  void reset_preamble_lock_();
+  bool is_locked_() const { return this->preamble_locked_; }
 
   void fire_sync_once_();
   void fire_eom_();
@@ -221,11 +227,8 @@ class SAMEDecoder : public Component {
 
   static constexpr int CENTER_LAG = GWIN / 2;
   static constexpr int TR_DELTA = 12;
-  static constexpr float TR_KP = 0.06f;
-  static constexpr float TR_KI = 0.0015f;
   static constexpr float TR_CONF_MIN = 0.20f;
   static constexpr float TR_DPHI_CLAMP = 0.125f;
-  float tr_woff_clamp_{0.002f * (1.0f / 92.16f)};
   float w_off_{0.0f};
   uint32_t samples_seen_{0};
 
@@ -235,53 +238,38 @@ class SAMEDecoder : public Component {
   static constexpr float LLR_EPS = 1.0f;
   int bad_char_run_{0};
 
-  bool preamble_status_{true};
+  // ---------------- Preamble lock state (redesign) ----------------
+  // The preamble is 0xAB = 10101011 repeated; LSB-first that is a regular
+  // alternating-ish transition pattern. We qualify each bit-period as a valid
+  // preamble bit-period when: (a) tone energy exceeds preamble_energy_mult_ over
+  // the adaptive noise floor, and (b) mark/space are sufficiently balanced
+  // across the alternation (|m-s|/(m+s) < preamble_balance_max_). When a run of
+  // >= preamble_lock_bits_ qualifying bit-periods is seen at mean |LLR| >=
+  // lock_confidence_min_, we declare LOCK: the current phase_ is the bit-clock
+  // phase and the byte boundary is aligned to the run. Lock is re-armed at the
+  // start of every burst (each header/EOM is preceded by a fresh preamble).
+  int preamble_lock_bits_{32};
   std::atomic<float> preamble_energy_mult_{8.0f};
+  float preamble_balance_max_{0.40f};
+  float lock_confidence_min_{0.5f};
+  float residual_drift_ppm_{2000.0f};
+
   float pre_noise_floor_{1.0f};
   static constexpr float PRE_FLOOR_ALPHA = 0.01f;
-  static constexpr float PRE_BALANCE_MAX = 0.40f;
-  bool preamble_present_{false};
-  bool was_preamble_present_{false};  // rising-edge latch (audio task only)
-  uint32_t pre_on_ms_{0};
-  uint32_t pre_off_ms_{0};
-  bool tone_gate_{false};
-  static constexpr uint32_t PRE_ON_DWELL_MS = 25;
-  static constexpr uint32_t PRE_OFF_DWELL_MS = 150;
+  int pre_run_{0};              // consecutive qualifying preamble bit-periods
+  double pre_run_conf_sum_{0};  // sum of |LLR| over the current run
+  bool preamble_locked_{false};
+  bool was_preamble_locked_{false};
+  uint32_t last_lock_ms_{0};
+  int byte_phase_{0};           // 0..7 bit index within the locked byte frame
 
-  // --- Option 3: continuous preamble-assisted acquisition state ---
-  // Per-bit LLR ring so a ZCZC (T1/T1b) hit can backfill the 32 header bits
-  // (aligned to the first 'Z') into soft_cur_ for the soft combiner.
-  static constexpr int LLR_RING_BITS = 4096;  // power of two; ~16 KB of float
-  float llr_ring_[LLR_RING_BITS];
-  uint32_t llr_head_{0};
-
-  // Preamble (T0) correlator: transition-density + AB/D5 min-hamming.
-  uint64_t trans_shift_{0};
-  uint16_t pre_shift_{0};
-  static constexpr int PRE_TD_WINDOW_BITS = 64;
-  float pre_td_thresh_{0.70f};
-  int pre_abd5_ham_thresh_{2};
-  float transition_ratio_{0.0f};
-  int pre_min_hamming_{16};
-  uint32_t last_preamble_seen_ms_{0};
-  uint32_t preamble_recent_ms_{200};
-
-  // Timing gearshift (bumpless): runtime Kp/Ki that slew between track and acq.
-  float tr_kp_cur_{TR_KP};
-  float tr_ki_cur_{TR_KI};
-  float tr_kp_acq_mult_{2.0f};
-  float tr_ki_acq_mult_{1.5f};
-  int kpki_slew_symbols_{16};
-  int kpki_slew_countdown_{0};
-  bool in_acq_gains_{false};
-  float tr_woff_clamp_acq_factor_{0.6f};
-
-  // Relaxed ZCZC hamming when preamble present/recent.
-  int zczc_ham_relaxed_{2};
-
-  // Diagnostics.
-  uint32_t zczc_relaxed_hits_{0};
-  uint32_t preamble_on_events_{0};
+  // Fallback closed-loop tracker (seeded by the locked phase).
+  float fallback_conf_thresh_{0.20f};
+  float fallback_kp_{0.06f};
+  float fallback_ki_{0.0015f};
+  bool fallback_active_{false};      // currently tracking (low-confidence run)
+  uint32_t fallback_engagements_{0}; // diagnostic
+  float tr_woff_clamp_{0.01f * (1.0f / 92.16f)};
 
   uint32_t last_burst_ms_{0};
   std::atomic<uint32_t> timeout_ms_{3000};
@@ -293,18 +281,9 @@ class SAMEDecoder : public Component {
   uint32_t eom_context_ms_{120000};
   uint32_t last_valid_header_ms_{0};
 
-  // Decode watchdog: if a decode session (LED on) persists this long without a
-  // successful emit or EOM, abandon it (emit valid partial, else discard) and
-  // clear the indicator so state never hangs.
   std::atomic<uint32_t> decode_watchdog_ms_{10000};
-  bool decode_active_{false};        // true from sync until emit/EOM/watchdog
-  uint32_t decode_active_since_{0};  // millis() when decode_active_ went true
-
-  bool ab_required_{false};
-  uint8_t ab_byte_{0};
-  int ab_nbits_{0};
-  int ab_match_count_{0};
-  static constexpr int AB_MIN_MATCH = 2;
+  bool decode_active_{false};
+  uint32_t decode_active_since_{0};
 
   enum Phase { HUNT_SYNC, CAPTURE };
   Phase phase_state_{HUNT_SYNC};
@@ -328,10 +307,6 @@ class SAMEDecoder : public Component {
       (static_cast<uint32_t>('C'));
   static constexpr uint32_t SYNC_ZCZ_24 =
       (static_cast<uint32_t>('Z') << 16) |
-      (static_cast<uint32_t>('C') << 8) |
-      (static_cast<uint32_t>('Z'));
-
-  static constexpr uint32_t SYNC_ZC_16 =
       (static_cast<uint32_t>('C') << 8) |
       (static_cast<uint32_t>('Z'));
 
