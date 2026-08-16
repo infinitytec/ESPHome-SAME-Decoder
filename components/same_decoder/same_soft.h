@@ -1,5 +1,5 @@
 // components/same_decoder/same_soft.h
-// Soft-decision SAME burst combiner.
+// Soft-decision SAME burst combiner (best-2-of-3).
 //
 // Given up to 3 bursts, each stored as an array of per-bit pseudo-LLRs
 //   l = ln(Em) - ln(Es)
@@ -10,6 +10,10 @@
 //   4. Applies light SAME grammar to score/repair (lenient: never hard-blocks on
 //      an unknown event code).
 // It NEVER touches the DSP/clock; it only post-processes buffered LLRs.
+//
+// LSB-first is mandated by the SAME/EAS spec: "The least-significant bit of each
+// byte is transmitted first, including the preamble." The 8th bit is the ASCII
+// null bit (7-bit ASCII + one null bit = full 8-bit byte, per 47 CFR 11.31).
 #pragma once
 
 #include <string>
@@ -36,7 +40,7 @@ struct SoftResult {
 
 class SoftCombiner {
  public:
-  // Combine up to 3 soft bursts into a best-estimate header.
+  // Combine up to 3 soft bursts into a best-estimate header (best-2-of-3).
   // hard_fallback: if soft combining fails a sanity check, the caller's hard
   // majority result (may be empty) is returned instead so we never regress.
   static SoftResult combine(const SoftBurst *bursts, int nbursts,
@@ -45,7 +49,7 @@ class SoftCombiner {
  private:
   // Decode one burst's LLRs into (chars, per-char confidence, per-bit LLR ptr).
   struct DecodedBurst {
-    std::string chars;              // hard chars from this burst alone
+    std::string chars;                // hard chars from this burst alone
     std::vector<float> char_min_abs;  // min|l| per char (fragility)
     const std::vector<float> *llr{nullptr};
   };
