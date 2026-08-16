@@ -81,7 +81,7 @@ char SoftCombiner::combine_char_(const DecodedBurst *db, const int *char_index,
     size_t base = (size_t) ci * 8;
     if (base + 8 > llr->size()) continue;
     for (int k = 0; k < 8; k++)
-      combined[k] += (*llr)[base + k];   // additive LLR combine
+      combined[k] += (*llr)[base + k];   // additive LLR combine (best-2-of-3)
   }
   float min_abs = 0.0f;
   char c = decide_char_(combined, &min_abs);
@@ -108,10 +108,10 @@ SoftResult SoftCombiner::combine(const SoftBurst *bursts, int nbursts,
     return res;
   }
 
-  // FIX 2: choose the reference burst by QUALITY, not length. The reference is
-  // the burst with the highest mean per-character confidence (mean min|l|),
-  // among those that actually start with a plausible "ZCZC" front. A clean
-  // burst must anchor the alignment, never a long-but-garbage one.
+  // Choose the reference burst by QUALITY, not length. The reference is the
+  // burst with the highest mean per-character confidence (mean min|l|), among
+  // those that actually start with a plausible "ZCZC" front. A clean burst must
+  // anchor the alignment, never a long-but-garbage one.
   int ref = -1;
   float best_quality = -1.0f;
   for (int b = 0; b < used; b++) {
@@ -193,9 +193,9 @@ SoftResult SoftCombiner::combine(const SoftBurst *bursts, int nbursts,
   res.mean_margin = (margin_n > 0) ? (float) (margin_sum / margin_n) : 0.0f;
   res.bursts_used = used;
 
-  // FIX 3: mandatory ZCZC anchoring + strict sanity. The combined output MUST
-  // start with "ZCZC" and contain a '+'. If not, the alignment shifted the
-  // front (which must never happen) -> fall back to hard majority.
+  // Mandatory ZCZC anchoring + strict sanity. The combined output MUST start
+  // with "ZCZC" and contain a '+'. If not, the alignment shifted the front
+  // (which must never happen) -> fall back to hard majority.
   bool soft_ok = (out.rfind("ZCZC", 0) == 0) && (out.find('+') != std::string::npos);
   if (!soft_ok) {
     ESP_LOGD(TAG, "Soft combine failed sanity ('%s'); using hard fallback.",
