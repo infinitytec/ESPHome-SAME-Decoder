@@ -121,7 +121,7 @@ microphone:
     adc_type: external
     i2s_din_pin: GPIO35
     sample_rate: 48000
-    bits_per_sample: 16bit
+    bits_per_sample: 16 bit
     channel: right
     on_data:
       then:
@@ -299,8 +299,8 @@ same_decoder:
   agc_min_gain: 0.25
   agc_max_gain: 32.0
   timeout_ms: 3000
-  single_burst_min_ms: 7000
-  post_emit_dead_ms: 1500
+  single_burst_min_ms: 3000
+  post_emit_dead_ms: 500
   sample_rate: 48000
   # --- Preamble lock (primary timing path) ---
   # Minimum consecutive good preamble bit-periods to declare lock. This is a
@@ -311,7 +311,7 @@ same_decoder:
   preamble_energy_mult: 8.0
   preamble_balance_max: 0.40
   lock_confidence_min: 0.5
-  residual_drift_ppm: 2000.0
+  residual_drift_ppm: 12000.0
   # --- Automatic closed-loop fallback (engages only on low confidence) ---
   fallback_conf_thresh: 0.20
   fallback_kp: 0.06
