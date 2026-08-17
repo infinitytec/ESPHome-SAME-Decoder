@@ -184,7 +184,7 @@ void SAMEDecoder::dump_config() {
                 this->preamble_balance_max_);
   ESP_LOGCONFIG(TAG, "    Phase-snap: one-shot sub-bit align at lock (+/-%d samples, step %d, %d centers); w_off_ untouched.",
                 SNAP_THETA_MAX, SNAP_THETA_STEP, SNAP_USE);
-  ESP_LOGCONFIG(TAG, "    Lock carried across inter-burst gap for up to %d ms (time-aged).", LOCK_HOLD_MS);
+  ESP_LOGCONFIG(TAG, "    Lock carried across inter-burst gap for up to %" PRIu32 " ms (time-aged).", (uint32_t) LOCK_HOLD_MS);
   ESP_LOGCONFIG(TAG, "  Residual-drift trim: %.0f ppm of bit period", this->residual_drift_ppm_);
   ESP_LOGCONFIG(TAG, "  Timing gate: engage conf>=%.2f, release conf<%.2f, dwell %d (confidence-weighted)",
                 TR_CONF_ENGAGE, TR_CONF_RELEASE, TR_GATE_DWELL);
