@@ -1,17 +1,22 @@
 // components/same_decoder/same_decoder.h
 // Preamble-locked fixed-phase SAME decoder with always-on tracked timing.
 //
-// Timing architecture (redesign, v3 bumpless):
+// Timing architecture (redesign, v4 phase-snap):
 //  * PRIMARY: lock the bit clock on the 0xAB preamble (the preamble exists to
 //    "set asynchronous decoder clocking cycles", 47 CFR 11.31). Declaring lock
-//    is BUMPLESS -- it never discontinuously modifies phase_ or w_off_; it only
-//    confirms good phase and gates captures.
-//  * TRACKING: an early-late timing loop stays alive for the entire session
-//    (gated by a hysteretic confidence gate) so the sampler is never open-loop
-//    between lock and ZCZC. The converged w_off_ correction is preserved across
-//    the lock event and the ~1s inter-burst gap, keeping the payload on
-//    bit-center. w_off_ is reset ONLY on true session boundaries
-//    (emit/EOM/watchdog/feed-gap).
+//    performs a ONE-SHOT phase snap: it aligns phase_ to bit-center using a
+//    sub-bit offset search over recent preamble bit-periods. It still NEVER
+//    touches w_off_ (frequency remains bumpless); only phase_ is adjusted, once.
+//  * TRACKING: a signed early-late timing loop stays alive for the entire
+//    session (gated by a soft, low-threshold confidence gate, with the update
+//    weighted by confidence) so the sampler is never open-loop between lock and
+//    ZCZC. The converged w_off_ correction is preserved across the lock event
+//    and the ~1s inter-burst gap, keeping the payload on bit-center. w_off_ is
+//    reset ONLY on true session boundaries (emit/EOM/watchdog/feed-gap).
+//  * DETECTION: the Goertzel analysis window is one full bit long (GWIN=92) and
+//    is CENTERED on the bit instant via a fixed decision delay (DEC_DELAY), so
+//    the decision variable is symmetric about the bit and mark/space
+//    discrimination is maximized.
 //
 // Lock persistence: the preamble lock is carried across the ~1s inter-burst gap
 // (time-aged via LOCK_HOLD_MS so it cannot bridge a full message boundary). An
@@ -143,8 +148,9 @@ class SAMEDecoder : public Component {
 
   // --- Preamble lock helpers ---
   // Update the preamble correlator with the current bit-period tone energies and
-  // the just-decided bit; declares/refreshes lock (BUMPLESS: never touches
-  // phase_/w_off_) and is read-only w.r.t. timing once a capture is in progress.
+  // the just-decided bit; declares/refreshes lock. On the transition into lock
+  // it arms a ONE-SHOT sub-bit phase snap (see request_phase_snap_); it never
+  // touches w_off_ (frequency remains bumpless).
   void update_preamble_lock_(float mark_e, float space_e, bool bit, float llr);
   // Full teardown: clears timing state AND last_lock_ms_ (message boundaries).
   void reset_preamble_lock_();
@@ -153,6 +159,12 @@ class SAMEDecoder : public Component {
   void clear_preamble_run_();
   // Strong lock now, or held one within LOCK_HOLD_MS (bridges inter-burst gap).
   bool lock_is_effective_() const;
+
+  // --- Phase snap (one-shot bit-center alignment at lock) ---
+  // Search recent preamble bit-centers over a sub-bit offset grid and arm a
+  // one-shot phase_ adjustment that snaps the sampler onto bit-center. Adjusts
+  // phase_ ONLY (never w_off_), preserving the bumpless-frequency philosophy.
+  void request_phase_snap_();
 
   void fire_sync_once_();
   void fire_eom_();
@@ -218,8 +230,22 @@ class SAMEDecoder : public Component {
   float phase_inc_{1.0f / 92.16f};
   float coeff_mark_{1.926090f};
   float coeff_space_{1.958313f};
-  static constexpr int GWIN = 64;
-  static constexpr int RINGLEN = 256;
+
+  // Detection window: one full bit long and CENTERED on the bit instant.
+  //   GWIN         : Goertzel window length (~= samples_per_bit for best SNR).
+  //   HALF_AFTER   : samples of the window that lie at/after the bit center.
+  //   HALF_BEFORE  : samples of the window that lie before the bit center.
+  //   TR_DELTA     : early/late window offset (~0.17 bit).
+  //   DEC_DELAY    : fixed decision latency so a window centered on the bit
+  //                  instant (and its LATE early-late window) is fully in the
+  //                  past. DEC_DELAY = HALF_BEFORE + TR_DELTA guarantees the
+  //                  late window end is <= s_now.
+  static constexpr int GWIN = 92;
+  static constexpr int HALF_AFTER = (GWIN - 1) / 2;      // 45
+  static constexpr int HALF_BEFORE = GWIN - 1 - HALF_AFTER;  // 46
+  static constexpr int TR_DELTA = 16;
+  static constexpr int DEC_DELAY = HALF_BEFORE + TR_DELTA;   // 62
+  static constexpr int RINGLEN = 256;                    // > DEC_DELAY + TR_DELTA + HALF_BEFORE
   int16_t ring_[RINGLEN];
   int ring_pos_{0};
   float phase_{0.0f};
@@ -238,18 +264,25 @@ class SAMEDecoder : public Component {
   static constexpr float AGC_ATTACK = 0.002f;
   static constexpr float AGC_RELEASE = 0.0002f;
 
-  static constexpr int CENTER_LAG = GWIN / 2;
-  static constexpr int TR_DELTA = 12;
+  // Hysteretic + dwell gate for the always-on timing loop. Softened for early
+  // acquisition: low thresholds and dwell=1 so the loop can start pulling the
+  // sampler toward bit-center even at modest confidence, instead of deadlocking
+  // when the initial phase is off-center. The per-update magnitude is also
+  // weighted by confidence in feed_sample_(), so weak bits contribute little.
+  static constexpr float TR_CONF_ENGAGE = 0.15f;   // open gate above this
+  static constexpr float TR_CONF_RELEASE = 0.10f;  // close gate below this
+  static constexpr int   TR_GATE_DWELL = 1;        // consecutive good bits to open
   static constexpr float TR_DPHI_CLAMP = 0.125f;
-
-  // Hysteretic + dwell gate for the always-on timing loop. Keeps the loop closed
-  // for the entire session (no open-loop slip between lock and ZCZC) while
-  // preventing idle noise from walking the phase.
-  static constexpr float TR_CONF_ENGAGE = 0.25f;   // open gate above this
-  static constexpr float TR_CONF_RELEASE = 0.20f;  // close gate below this
-  static constexpr int   TR_GATE_DWELL = 4;        // consecutive good bits to open
   bool tr_gate_open_{false};   // hysteretic timing-loop gate state
   int  tr_gate_run_{0};        // consecutive qualifying decisions toward opening
+
+  // Two-stage timing-loop gains. Acquisition gains are higher so the loop pulls
+  // in quickly right after lock; once N_GOOD_TO_TRACK good bits have elapsed we
+  // fall back to the gentle tracking gains (the configured fallback_kp/ki).
+  static constexpr float ACQ_KP = 0.25f;
+  static constexpr float ACQ_KI = 0.006f;
+  static constexpr int   N_GOOD_TO_TRACK = 16;
+  int good_bits_since_lock_{0};
 
   float w_off_{0.0f};
   uint32_t samples_seen_{0};
@@ -267,9 +300,10 @@ class SAMEDecoder : public Component {
   // the adaptive noise floor, and (b) mark/space are sufficiently balanced
   // across the alternation (|m-s|/(m+s) < preamble_balance_max_). When a run of
   // >= preamble_lock_bits_ qualifying bit-periods is seen at mean |LLR| >=
-  // lock_confidence_min_, we declare LOCK (BUMPLESS: state + recency only, no
-  // timing change). The lock is CARRIED across the ~1s inter-burst gap (see
-  // LOCK_HOLD_MS); it is fully torn down on emit/EOM/watchdog/feed-gap.
+  // lock_confidence_min_, we declare LOCK and arm a ONE-SHOT phase snap that
+  // aligns phase_ to bit-center (frequency/w_off_ untouched -- still bumpless).
+  // The lock is CARRIED across the ~1s inter-burst gap (see LOCK_HOLD_MS); it is
+  // fully torn down on emit/EOM/watchdog/feed-gap.
   int preamble_lock_bits_{32};
   std::atomic<float> preamble_energy_mult_{8.0f};
   float preamble_balance_max_{0.40f};
@@ -284,6 +318,20 @@ class SAMEDecoder : public Component {
   bool was_preamble_locked_{false};
   uint32_t last_lock_ms_{0};    // millis() of most recent lock (0 = never/torn down)
   int byte_phase_{0};           // reserved/diagnostic; not used by the payload path
+
+  // --- Phase-snap state (one-shot bit-center alignment) ---
+  // last_centers_ holds the ring index of recent decided bit-centers (absolute
+  // sample index of the bit instant). A small history is enough for the snap
+  // search; RINGLEN=256 safely covers the last two centers plus GWIN/TR_DELTA.
+  static constexpr int SNAP_CENTERS = 4;      // capacity of the recent-center log
+  static constexpr int SNAP_USE = 2;          // centers actually used in the search
+  static constexpr int SNAP_THETA_MAX = HALF_BEFORE;  // +/- search span in samples
+  static constexpr int SNAP_THETA_STEP = 3;   // grid step in samples
+  uint32_t center_hist_[SNAP_CENTERS]{0};     // absolute sample index of each center
+  int center_hist_count_{0};                  // how many valid entries
+  int center_hist_pos_{0};                    // next write slot (ring)
+  bool snap_pending_{false};                  // a snap adjustment is armed
+  float snap_delta_phase_{0.0f};              // fraction-of-bit adjustment to apply
 
   // Lock is carried across the inter-burst gap for up to this long, then
   // time-aged out. Sized above the standard's ~1s inter-burst pause but short
