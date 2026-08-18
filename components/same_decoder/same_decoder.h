@@ -22,6 +22,7 @@
 // (time-aged via LOCK_HOLD_MS so it cannot bridge a full message boundary). An
 // unlocked ZCZC start is allowed but flagged low-trust: it can never emit on its
 // own and must pass strict structural validation + 2-of-3 corroboration.
+
 #pragma once
 
 #include "esphome/core/component.h"
@@ -136,7 +137,6 @@ class SAMEDecoder : public Component {
   void feed_sample_(int16_t s);
   void emit_bit_(bool bit);
   void rearm_sync_();
-  void reprime_detector_();
   void reset_capture_();
   void begin_new_capture_(int preamble_len, bool fallback);
   void vote_and_emit_(bool from_timeout, bool fallback_synced);
@@ -260,7 +260,6 @@ class SAMEDecoder : public Component {
   float agc_max_gain_{32.0f};
   float agc_gain_{1.0f};
   float agc_peak_{0.0f};
-  static constexpr float AGC_PEAK_ALPHA = 0.001f;
   static constexpr float AGC_ATTACK = 0.002f;
   static constexpr float AGC_RELEASE = 0.0002f;
 
@@ -344,7 +343,6 @@ class SAMEDecoder : public Component {
   float fallback_kp_{0.06f};
   float fallback_ki_{0.0015f};
   bool fallback_active_{false};      // diagnostic: low-confidence run in progress
-  uint32_t fallback_engagements_{0}; // diagnostic
   float tr_woff_clamp_{0.01f * (1.0f / 92.16f)};
 
   uint32_t last_burst_ms_{0};
@@ -386,11 +384,6 @@ class SAMEDecoder : public Component {
       (static_cast<uint32_t>('C') << 8) |
       (static_cast<uint32_t>('Z'));
 
-  static constexpr uint32_t SYNC_ZC_16 =
-      (static_cast<uint32_t>('C') << 8) |
-      (static_cast<uint32_t>('Z'));
-
-  static constexpr uint32_t MASK16 = 0x0000FFFFu;
   static constexpr uint32_t MASK24 = 0x00FFFFFFu;
   bool fallback_sync_used_{false};
 
