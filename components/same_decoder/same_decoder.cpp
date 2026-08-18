@@ -10,6 +10,7 @@
 // mark/space discrimination. w_off_ is reset only on true session boundaries
 // (emit/EOM/watchdog/feed-gap), preserving the converged timing correction that
 // keeps the sampler on bit-center through the payload.
+
 #include "same_decoder.h"
 #include "same_soft.h"
 #include "same_event_codes.h"
@@ -202,18 +203,6 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "  Alert triggers: %u  sync: %u  eom: %u  preamble: %u",
                 (unsigned) this->alert_triggers_.size(), (unsigned) this->sync_triggers_.size(),
                 (unsigned) this->eom_triggers_.size(), (unsigned) this->preamble_triggers_.size());
-}
-
-void SAMEDecoder::reprime_detector_() {
-  ESP_LOGD(TAG, "Re-priming detector (explicit).");
-  this->reset_capture_();
-  for (int i = 0; i < RINGLEN; i++) this->ring_[i] = 0;
-  this->ring_pos_ = 0;
-  this->phase_ = 0.0f;
-  this->w_off_ = 0.0f;
-  this->samples_seen_ = 0;
-  this->eom_n_count_ = 0;
-  this->reset_preamble_lock_();
 }
 
 // Full teardown: clears timing state AND last_lock_ms_ (message boundaries only).
@@ -547,7 +536,6 @@ void SAMEDecoder::feed_sample_(int16_t s) {
   bool low_conf = (conf < this->fallback_conf_thresh_);
   if (low_conf && !this->fallback_active_) {
     this->fallback_active_ = true;
-    this->fallback_engagements_++;
     ESP_LOGV(TAG, "Fallback tracker engaged (conf=%.2f).", conf);
   } else if (!low_conf && this->fallback_active_) {
     this->fallback_active_ = false;
