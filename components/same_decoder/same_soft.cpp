@@ -55,22 +55,6 @@ std::vector<std::pair<int, int>> SoftCombiner::field_spans_(const std::string &s
   return spans;
 }
 
-bool SoftCombiner::looks_like_org_(const std::string &f) {
-  return f == "EAS" || f == "CIV" || f == "WXR" || f == "PEP";
-}
-
-bool SoftCombiner::looks_like_event_(const std::string &f) {
-  if (f.size() != 3) return false;
-  for (char c : f) if (!std::isupper((unsigned char) c)) return false;
-  return true;
-}
-
-bool SoftCombiner::looks_like_fips_(const std::string &f) {
-  if (f.size() != 6) return false;
-  for (char c : f) if (!std::isdigit((unsigned char) c)) return false;
-  return true;
-}
-
 char SoftCombiner::combine_char_(const DecodedBurst *db, const int *char_index,
                                  int nbursts, float *out_margin) {
   float combined[8] = {0, 0, 0, 0, 0, 0, 0, 0};
