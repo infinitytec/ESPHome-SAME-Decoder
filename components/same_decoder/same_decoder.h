@@ -308,8 +308,8 @@ class SAMEDecoder : public Component {
 
   // ---------------- Debug telemetry (read-only; does NOT affect timing) -------
   // Per-bit lines are emitted at VERBOSE; a rolling summary at DEBUG every
-  // DBG_SUMMARY_EVERY bits. All accumulators are fixed-size (no allocation).
-  static constexpr uint32_t DBG_SUMMARY_EVERY = 64;  // power of two (bitmask cheap)
+  // DBG_SUMMARY_EVERY bits (DBG_SUMMARY_EVERY is a file-scope constant in the
+  // .cpp). All accumulators are fixed-size (no allocation).
   uint32_t dbg_bit_count_{0};
   float    dbg_conf_accum_{0.0f};
   uint16_t dbg_conf_n_{0};
