@@ -198,8 +198,9 @@ void SAMEDecoder::dump_config() {
                 TR_CONF_ENGAGE, TR_CONF_RELEASE, TR_GATE_DWELL, TR_CONF_FLOOR, (double) TR_WOFF_LEAK);
   ESP_LOGCONFIG(TAG, "  Timing loop: decision-directed early-late; acq Kp=%.4f Ki=%.5f -> track Kp=%.4f Ki=%.5f after %d bits",
                 ACQ_KP, ACQ_KI, this->fallback_kp_, this->fallback_ki_, N_GOOD_TO_TRACK);
-  ESP_LOGCONFIG(TAG, "    Telemetry: per-bit at VERBOSE, summary every %" PRIu32 " bits at DEBUG.",
-                (uint32_t) DBG_SUMMARY_EVERY);
+  ESP_LOGCONFIG(TAG, "    Telemetry: per-bit at VERBOSE (updates only, 1-in-%" PRIu32 " decimated), summary every %" PRIu32 " bits at DEBUG.",
+                (uint32_t) DBG_DECIM_K, (uint32_t) DBG_SUMMARY_EVERY);
+  ESP_LOGCONFIG(TAG, "    Sample-rate self-measurement logged once/second at INFO.");
   ESP_LOGCONFIG(TAG, "    ZCZC hamming: strict<=%d (sampled at preamble-locked timing)", SYNC_MAX_HAMMING);
   ESP_LOGCONFIG(TAG, "    Unlocked ZCZC starts allowed but LOW-TRUST (strict-valid + 2-of-3 only).");
   ESP_LOGCONFIG(TAG, "  EOM requires context: %s (%" PRIu32 " ms)",
@@ -426,6 +427,25 @@ void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
   }
 
   const size_t n = data.size() / 2;
+
+  // ---- Sample-rate self-measurement (read-only diagnostic). Count RAW samples
+  // fed here (not samples_seen_, which can skip during post-emit dead-time) and
+  // report the measured effective Hz once per ~second. If this reads far from
+  // the configured sample_rate_ (e.g. ~44100 vs 48000), the bit clock is
+  // fundamentally mis-scaled and NO w_off_ correction can compensate. ----
+  if (this->sr_meas_last_ms_ == 0) {
+    this->sr_meas_last_ms_ = now;   // lazy init: skip the first (partial) window
+  }
+  this->sr_meas_samples_ += (uint32_t) n;
+  uint32_t sr_dt = now - this->sr_meas_last_ms_;
+  if (sr_dt >= 1000) {
+    float hz = (float) this->sr_meas_samples_ * 1000.0f / (float) sr_dt;
+    ESP_LOGI(TAG, "Measured effective sample rate: %.1f Hz (configured %" PRIu32 " Hz, samples/bit=%.2f)",
+             hz, this->sample_rate_, this->samples_per_bit_);
+    this->sr_meas_samples_ = 0;
+    this->sr_meas_last_ms_ = now;
+  }
+
   const int16_t *samples = reinterpret_cast<const int16_t *>(data.data());
   for (size_t i = 0; i < n; i++) {
     float v = (float) samples[i] * this->gain_;
@@ -544,11 +564,12 @@ void SAMEDecoder::feed_sample_(int16_t s) {
   }
 
   // Diagnostic fallback-engagement flag (does not gate the loop anymore; the
-  // loop is always-on when the hysteretic timing gate is open).
+  // loop is always-on when the hysteretic timing gate is open). Logged at
+  // VVERBOSE only: at 520 Hz this would otherwise flood the transport.
   bool low_conf = (conf < this->fallback_conf_thresh_);
   if (low_conf && !this->fallback_active_) {
     this->fallback_active_ = true;
-    ESP_LOGV(TAG, "Fallback tracker engaged (conf=%.2f).", conf);
+    ESP_LOGVV(TAG, "Fallback tracker engaged (conf=%.2f).", conf);
   } else if (!low_conf && this->fallback_active_) {
     this->fallback_active_ = false;
   }
@@ -639,22 +660,25 @@ void SAMEDecoder::feed_sample_(int16_t s) {
   // When the gate is closed we HOLD w_off_ (bumpless) -- no bleed, no reset.
   // It is only zeroed on true session boundaries (reset_preamble_lock_/feed-gap).
 
-  // ---- Per-bit VERBOSE telemetry (read-only). w_off_ reported as ppm of the
-  // bit period (w_off_ / phase_inc_ * 1e6). gate: O=open, C=closed; upd=1 when
-  // the timing loop actually updated this bit; clamp=1 when w_off_ saturated. ----
-  {
+  // ---- Per-bit VERBOSE telemetry (read-only). GATED to updated bits only and
+  // DECIMATED 1-in-DBG_DECIM_K so it cannot flood the transport at 520 Hz (that
+  // previously starved mic_task and faulted the MCU). w_off_ reported as ppm of
+  // the bit period (w_off_ / phase_inc_ * 1e6); gate O=open/C=closed;
+  // clamp=1 when w_off_ saturated this bit. ----
+  if (dbg_updated && (++this->dbg_decim_ % DBG_DECIM_K == 0)) {
     float wppm = (this->phase_inc_ != 0.0f) ? (this->w_off_ / this->phase_inc_) * 1e6f : 0.0f;
     ESP_LOGV(TAG,
-             "TL bit=%d conf=%.2f e=%+.4f dphi=%+.5f wppm=%+.1f gate=%c upd=%d acq=%d good=%d clamp=%d",
+             "TL bit=%d conf=%.2f e=%+.4f dphi=%+.5f wppm=%+.1f gate=%c upd=1 acq=%d good=%d clamp=%d",
              bit ? 1 : 0, conf, dbg_e, dbg_dphi, wppm,
              this->tr_gate_open_ ? 'O' : 'C',
-             dbg_updated ? 1 : 0, dbg_acquiring ? 1 : 0,
+             dbg_acquiring ? 1 : 0,
              this->good_bits_since_lock_, dbg_clamp_hit ? 1 : 0);
   }
 
   // ---- Periodic DEBUG summary every DBG_SUMMARY_EVERY bits: rolling mean conf,
   // last conf, current w_off_ in ppm, and gate state. Fixed-size accumulators,
-  // no allocation; power-of-two interval lets us mask instead of modulo. ----
+  // no allocation; power-of-two interval lets us mask instead of modulo. This is
+  // the intended NORMAL monitoring path (safe line rate at DEBUG). ----
   this->dbg_bit_count_++;
   this->dbg_conf_accum_ += conf;
   if (this->dbg_conf_n_ < 0xFFFF) this->dbg_conf_n_++;
