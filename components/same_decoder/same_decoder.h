@@ -315,6 +315,21 @@ class SAMEDecoder : public Component {
   uint16_t dbg_conf_n_{0};
   float    dbg_last_conf_{0.0f};
 
+  // Per-bit VERBOSE telemetry decimation: only 1 in DBG_DECIM_K updated bits is
+  // logged, capping the line rate (~520/8 ~= 65 lines/sec) so VERBOSE cannot
+  // flood the transport and starve mic_task (which previously faulted the MCU).
+  static constexpr uint32_t DBG_DECIM_K = 8;
+  uint32_t dbg_decim_{0};
+
+  // ---------------- Sample-rate self-measurement (read-only diagnostic) -------
+  // Confirms the effective audio rate the decoder is actually receiving. Raw
+  // samples are counted in feed_bytes (NOT feed_sample_, which can early-return
+  // during post-emit dead-time). Once per ~second we log the measured Hz; if it
+  // is far from the configured sample_rate_ (e.g. ~44100 vs 48000), the bit
+  // clock is fundamentally mis-scaled and NO w_off_ correction can compensate.
+  uint32_t sr_meas_samples_{0};   // raw samples fed since last measurement
+  uint32_t sr_meas_last_ms_{0};   // millis() of last measurement (0 = uninit)
+
   // ---------------- Preamble lock state (redesign) ----------------
   // The preamble is 0xAB = 10101011 repeated; LSB-first that is a regular
   // alternating-ish transition pattern. We qualify each bit-period as a valid
