@@ -33,7 +33,8 @@ namespace same_decoder {
 static const char *const TAG = "same_decoder";
 
 // Debug summary interval (bits). Power of two so we can mask instead of modulo.
-static constexpr uint32_t DBG_SUMMARY_EVERY = SAMEDecoder::DBG_SUMMARY_EVERY;
+// File-scope (DSP-internal detail; not part of the public API).
+static constexpr uint32_t DBG_SUMMARY_EVERY = 64;
 
 static inline int imod(int a, int m) {
   a %= m;
