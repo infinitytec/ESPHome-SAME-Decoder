@@ -5,9 +5,12 @@
 // ONE-SHOT sub-bit phase snap that aligns phase_ onto bit-center; it still
 // NEVER modifies w_off_ (frequency stays bumpless). The timing loop stays alive
 // for the whole session (gated by a soft, confidence-weighted gate) so it can
-// never run open-loop between lock and ZCZC. The Goertzel window is one full bit
-// long and centered on the bit instant via a fixed decision delay, maximizing
-// mark/space discrimination. w_off_ is reset only on true session boundaries
+// never run open-loop between lock and ZCZC. The early-late discriminator is
+// DECISION-DIRECTED (symbol-invariant): it is multiplied by the decided-bit
+// sign so the timing gradient points the same way on mark and space bits and
+// cannot cancel on mixed payload. The Goertzel window is one full bit long and
+// centered on the bit instant via a fixed decision delay, maximizing mark/space
+// discrimination. w_off_ is reset only on true session boundaries
 // (emit/EOM/watchdog/feed-gap), preserving the converged timing correction that
 // keeps the sampler on bit-center through the payload.
 
@@ -28,6 +31,9 @@ namespace esphome {
 namespace same_decoder {
 
 static const char *const TAG = "same_decoder";
+
+// Debug summary interval (bits). Power of two so we can mask instead of modulo.
+static constexpr uint32_t DBG_SUMMARY_EVERY = SAMEDecoder::DBG_SUMMARY_EVERY;
 
 static inline int imod(int a, int m) {
   a %= m;
@@ -187,10 +193,12 @@ void SAMEDecoder::dump_config() {
                 SNAP_THETA_MAX, SNAP_THETA_STEP, SNAP_USE);
   ESP_LOGCONFIG(TAG, "    Lock carried across inter-burst gap for up to %" PRIu32 " ms (time-aged).", (uint32_t) LOCK_HOLD_MS);
   ESP_LOGCONFIG(TAG, "  Residual-drift trim: %.0f ppm of bit period", this->residual_drift_ppm_);
-  ESP_LOGCONFIG(TAG, "  Timing gate: engage conf>=%.2f, release conf<%.2f, dwell %d (confidence-weighted)",
-                TR_CONF_ENGAGE, TR_CONF_RELEASE, TR_GATE_DWELL);
-  ESP_LOGCONFIG(TAG, "  Timing loop: signed early-late; acq Kp=%.4f Ki=%.5f -> track Kp=%.4f Ki=%.5f after %d bits",
+  ESP_LOGCONFIG(TAG, "  Timing gate: engage conf>=%.2f, release conf<%.2f, dwell %d (confidence-weighted, KI floor %.2f, leak %.0e)",
+                TR_CONF_ENGAGE, TR_CONF_RELEASE, TR_GATE_DWELL, TR_CONF_FLOOR, (double) TR_WOFF_LEAK);
+  ESP_LOGCONFIG(TAG, "  Timing loop: decision-directed early-late; acq Kp=%.4f Ki=%.5f -> track Kp=%.4f Ki=%.5f after %d bits",
                 ACQ_KP, ACQ_KI, this->fallback_kp_, this->fallback_ki_, N_GOOD_TO_TRACK);
+  ESP_LOGCONFIG(TAG, "    Telemetry: per-bit at VERBOSE, summary every %" PRIu32 " bits at DEBUG.",
+                (uint32_t) DBG_SUMMARY_EVERY);
   ESP_LOGCONFIG(TAG, "    ZCZC hamming: strict<=%d (sampled at preamble-locked timing)", SYNC_MAX_HAMMING);
   ESP_LOGCONFIG(TAG, "    Unlocked ZCZC starts allowed but LOW-TRUST (strict-valid + 2-of-3 only).");
   ESP_LOGCONFIG(TAG, "  EOM requires context: %s (%" PRIu32 " ms)",
@@ -225,6 +233,9 @@ void SAMEDecoder::reset_preamble_lock_() {
   this->center_hist_count_ = 0;
   this->center_hist_pos_ = 0;
   this->good_bits_since_lock_ = 0;
+  // Debug accumulators are session-scoped too (keeps summaries per-session).
+  this->dbg_conf_accum_ = 0.0f;
+  this->dbg_conf_n_ = 0;
 }
 
 // Per-burst run-accumulator clear ONLY. Preserves preamble_locked_, w_off_,
@@ -541,10 +552,11 @@ void SAMEDecoder::feed_sample_(int16_t s) {
     this->fallback_active_ = false;
   }
 
-  // Hysteretic + dwell confidence gate for the ALWAYS-ON timing loop. Softened
-  // (low thresholds, dwell=1) so it engages early; this keeps the loop closed
-  // for the entire session (no open-loop slip between lock and ZCZC) while
-  // preventing idle noise from walking the phase.
+  // Hysteretic + dwell confidence gate for the ALWAYS-ON timing loop. Engages
+  // early (low thresholds) but, once open, holds through low-confidence payload
+  // runs via a lower release threshold + multi-bit dwell so the loop never runs
+  // open-loop between lock and ZCZC or through payload. This keeps the sampler
+  // tracked while preventing idle noise from walking the phase.
   if (!this->tr_gate_open_) {
     if (conf >= TR_CONF_ENGAGE) {
       if (++this->tr_gate_run_ >= TR_GATE_DWELL)
@@ -559,23 +571,39 @@ void SAMEDecoder::feed_sample_(int16_t s) {
     }
   }
 
+  // Telemetry values captured per bit (read-only; do not affect timing).
+  float dbg_e = 0.0f;
+  float dbg_dphi = 0.0f;
+  bool dbg_acquiring = (this->good_bits_since_lock_ < N_GOOD_TO_TRACK);
+  bool dbg_clamp_hit = false;
+  bool dbg_updated = false;
+
   if (primed && this->tr_gate_open_) {
     float em_e = goertzel_ring_end(this->ring_, RINGLEN, t_early, GWIN, this->coeff_mark_);
     float es_e = goertzel_ring_end(this->ring_, RINGLEN, t_early, GWIN, this->coeff_space_);
     float em_l = goertzel_ring_end(this->ring_, RINGLEN, t_late,  GWIN, this->coeff_mark_);
     float es_l = goertzel_ring_end(this->ring_, RINGLEN, t_late,  GWIN, this->coeff_space_);
 
-    // SIGNED decision variables so the timing gradient has a consistent sign
-    // regardless of whether this bit is mark or space. e>0 => sampling LATE
-    // (early window is closer to true center) => advance phase (sample earlier).
+    // DECISION-DIRECTED (symbol-invariant) early-late timing error. The raw
+    // d_early/d_late are SIGNED normalized separations (em-es)/(em+es); their
+    // polarity FLIPS between mark and space bits, so the bare difference
+    // (d_early - d_late) would push timing opposite ways on marks vs spaces and
+    // cancel on mixed payload -- the sampler then walks off through the header.
+    // Multiplying by the decided-bit sign (sym_sign) makes the gradient point
+    // the same way regardless of mark/space. Convention after the fix:
+    //   e > 0 => sampling LATE (early window is closer to true center)
+    //         => advance phase (sample earlier).
     const float eps = 1e-9f;
     float d_early = (em_e - es_e) / (em_e + es_e + eps);
     float d_late  = (em_l - es_l) / (em_l + es_l + eps);
-    float e = d_early - d_late;
+    float sym_sign = (em_c >= es_c) ? 1.0f : -1.0f;
+    float e = sym_sign * (d_early - d_late);
 
     // Two-stage gains: pull in fast right after lock, then settle to the gentle
-    // tracking gains once enough good bits have elapsed. The update is weighted
-    // by confidence so weak bits contribute little.
+    // tracking gains once enough good bits have elapsed. The acquisition window
+    // (N_GOOD_TO_TRACK) spans well into the early payload so the rate correction
+    // converges before the gains soften. The proportional update is weighted by
+    // confidence so weak bits contribute little.
     bool acquiring = (this->good_bits_since_lock_ < N_GOOD_TO_TRACK);
     float kp = acquiring ? ACQ_KP : this->fallback_kp_;
     float ki = acquiring ? ACQ_KI : this->fallback_ki_;
@@ -585,15 +613,62 @@ void SAMEDecoder::feed_sample_(int16_t s) {
     if (dphi < -TR_DPHI_CLAMP) dphi = -TR_DPHI_CLAMP;
     this->phase_ += dphi;
 
-    this->w_off_ += ki * conf * e;
+    // Integral (rate) path uses a FLOORED confidence so w_off_ keeps tracking
+    // slow drift through low-confidence payload runs instead of freezing. A very
+    // slow leak pulls w_off_ toward zero if the loop is starved of good timing
+    // information for a long time, preventing unbounded wander. The update is
+    // computed exactly as: w_off_ += ki*conf_ki*e; then w_off_ -= leak*w_off_;
+    // we only stage it in a temporary to observe clamp saturation for telemetry.
+    float conf_ki = (conf > TR_CONF_FLOOR) ? conf : TR_CONF_FLOOR;
+    float w_tmp = this->w_off_ + ki * conf_ki * e;
+    w_tmp -= TR_WOFF_LEAK * w_tmp;
+    dbg_clamp_hit = (w_tmp > this->tr_woff_clamp_) || (w_tmp < -this->tr_woff_clamp_);
+    this->w_off_ = w_tmp;
     if (this->w_off_ >  this->tr_woff_clamp_) this->w_off_ =  this->tr_woff_clamp_;
     if (this->w_off_ < -this->tr_woff_clamp_) this->w_off_ = -this->tr_woff_clamp_;
 
     if (conf >= TR_CONF_ENGAGE && this->good_bits_since_lock_ < 0x7fffffff)
       this->good_bits_since_lock_++;
+
+    dbg_e = e;
+    dbg_dphi = dphi;
+    dbg_acquiring = acquiring;
+    dbg_updated = true;
   }
   // When the gate is closed we HOLD w_off_ (bumpless) -- no bleed, no reset.
   // It is only zeroed on true session boundaries (reset_preamble_lock_/feed-gap).
+
+  // ---- Per-bit VERBOSE telemetry (read-only). w_off_ reported as ppm of the
+  // bit period (w_off_ / phase_inc_ * 1e6). gate: O=open, C=closed; upd=1 when
+  // the timing loop actually updated this bit; clamp=1 when w_off_ saturated. ----
+  {
+    float wppm = (this->phase_inc_ != 0.0f) ? (this->w_off_ / this->phase_inc_) * 1e6f : 0.0f;
+    ESP_LOGV(TAG,
+             "TL bit=%d conf=%.2f e=%+.4f dphi=%+.5f wppm=%+.1f gate=%c upd=%d acq=%d good=%d clamp=%d",
+             bit ? 1 : 0, conf, dbg_e, dbg_dphi, wppm,
+             this->tr_gate_open_ ? 'O' : 'C',
+             dbg_updated ? 1 : 0, dbg_acquiring ? 1 : 0,
+             this->good_bits_since_lock_, dbg_clamp_hit ? 1 : 0);
+  }
+
+  // ---- Periodic DEBUG summary every DBG_SUMMARY_EVERY bits: rolling mean conf,
+  // last conf, current w_off_ in ppm, and gate state. Fixed-size accumulators,
+  // no allocation; power-of-two interval lets us mask instead of modulo. ----
+  this->dbg_bit_count_++;
+  this->dbg_conf_accum_ += conf;
+  if (this->dbg_conf_n_ < 0xFFFF) this->dbg_conf_n_++;
+  this->dbg_last_conf_ = conf;
+  if ((this->dbg_bit_count_ & (DBG_SUMMARY_EVERY - 1u)) == 0u) {
+    float mean_conf = (this->dbg_conf_n_ != 0)
+                          ? (this->dbg_conf_accum_ / (float) this->dbg_conf_n_)
+                          : 0.0f;
+    float wppm = (this->phase_inc_ != 0.0f) ? (this->w_off_ / this->phase_inc_) * 1e6f : 0.0f;
+    ESP_LOGD(TAG, "TL summary bits=%" PRIu32 " mean_conf=%.2f last_conf=%.2f wppm=%+.1f gate=%c",
+             this->dbg_bit_count_, mean_conf, this->dbg_last_conf_, wppm,
+             this->tr_gate_open_ ? 'O' : 'C');
+    this->dbg_conf_accum_ = 0.0f;
+    this->dbg_conf_n_ = 0;
+  }
 
   this->emit_bit_(bit);
 
