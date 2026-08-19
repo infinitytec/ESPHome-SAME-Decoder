@@ -13,6 +13,9 @@
 //    ZCZC. The converged w_off_ correction is preserved across the lock event
 //    and the ~1s inter-burst gap, keeping the payload on bit-center. w_off_ is
 //    reset ONLY on true session boundaries (emit/EOM/watchdog/feed-gap).
+//    The early-late discriminator is DECISION-DIRECTED (symbol-invariant): it
+//    is multiplied by the decided-bit sign so the timing gradient points the
+//    same way on mark and space bits and does not cancel on mixed payload.
 //  * DETECTION: the Goertzel analysis window is one full bit long (GWIN=92) and
 //    is CENTERED on the bit instant via a fixed decision delay (DEC_DELAY), so
 //    the decision variable is symmetric about the bit and mark/space
@@ -264,23 +267,34 @@ class SAMEDecoder : public Component {
   static constexpr float AGC_RELEASE = 0.0002f;
 
   // Hysteretic + dwell gate for the always-on timing loop. Softened for early
-  // acquisition: low thresholds and dwell=1 so the loop can start pulling the
-  // sampler toward bit-center even at modest confidence, instead of deadlocking
-  // when the initial phase is off-center. The per-update magnitude is also
-  // weighted by confidence in feed_sample_(), so weak bits contribute little.
+  // acquisition: low thresholds so the loop can start pulling the sampler toward
+  // bit-center even at modest confidence, instead of deadlocking when the
+  // initial phase is off-center. Once engaged, a LOWER release threshold plus a
+  // multi-bit dwell keep the loop closed through low-confidence payload runs
+  // (avoiding open-loop slip). The per-update magnitude is also weighted by
+  // confidence in feed_sample_(), so weak bits contribute little; the integral
+  // path additionally uses a confidence FLOOR so it never freezes entirely.
   static constexpr float TR_CONF_ENGAGE = 0.15f;   // open gate above this
-  static constexpr float TR_CONF_RELEASE = 0.10f;  // close gate below this
-  static constexpr int   TR_GATE_DWELL = 1;        // consecutive good bits to open
+  static constexpr float TR_CONF_RELEASE = 0.07f;  // close gate below this
+  static constexpr int   TR_GATE_DWELL = 8;        // consecutive good bits to open
   static constexpr float TR_DPHI_CLAMP = 0.125f;
+  // Confidence floor for the integral (rate) update so w_off_ keeps tracking
+  // slow drift through low-confidence stretches instead of freezing.
+  static constexpr float TR_CONF_FLOOR = 0.04f;
+  // Very slow leak on w_off_ toward zero, preventing unbounded wander if the
+  // loop is starved of good timing information for a long time.
+  static constexpr float TR_WOFF_LEAK = 1e-4f;
   bool tr_gate_open_{false};   // hysteretic timing-loop gate state
   int  tr_gate_run_{0};        // consecutive qualifying decisions toward opening
 
   // Two-stage timing-loop gains. Acquisition gains are higher so the loop pulls
   // in quickly right after lock; once N_GOOD_TO_TRACK good bits have elapsed we
-  // fall back to the gentle tracking gains (the configured fallback_kp/ki).
+  // fall back to the gentle tracking gains (the configured fallback_kp/ki). The
+  // acquisition window spans well into the early payload so the rate correction
+  // (w_off_) has time to converge before the gains soften.
   static constexpr float ACQ_KP = 0.25f;
   static constexpr float ACQ_KI = 0.006f;
-  static constexpr int   N_GOOD_TO_TRACK = 16;
+  static constexpr int   N_GOOD_TO_TRACK = 48;
   int good_bits_since_lock_{0};
 
   float w_off_{0.0f};
@@ -291,6 +305,15 @@ class SAMEDecoder : public Component {
   SoftBurst soft_cur_;
   static constexpr float LLR_EPS = 1.0f;
   int bad_char_run_{0};
+
+  // ---------------- Debug telemetry (read-only; does NOT affect timing) -------
+  // Per-bit lines are emitted at VERBOSE; a rolling summary at DEBUG every
+  // DBG_SUMMARY_EVERY bits. All accumulators are fixed-size (no allocation).
+  static constexpr uint32_t DBG_SUMMARY_EVERY = 64;  // power of two (bitmask cheap)
+  uint32_t dbg_bit_count_{0};
+  float    dbg_conf_accum_{0.0f};
+  uint16_t dbg_conf_n_{0};
+  float    dbg_last_conf_{0.0f};
 
   // ---------------- Preamble lock state (redesign) ----------------
   // The preamble is 0xAB = 10101011 repeated; LSB-first that is a regular
@@ -340,8 +363,8 @@ class SAMEDecoder : public Component {
   // Timing tracker (early-late). Gains are shared across the whole session; the
   // always-on gate (above) decides when they are applied.
   float fallback_conf_thresh_{0.20f};
-  float fallback_kp_{0.06f};
-  float fallback_ki_{0.0015f};
+  float fallback_kp_{0.08f};
+  float fallback_ki_{0.0025f};
   bool fallback_active_{false};      // diagnostic: low-confidence run in progress
   float tr_woff_clamp_{0.01f * (1.0f / 92.16f)};
 
