@@ -170,7 +170,7 @@ globals:
 # An EMPTY list means "no location filter" (all areas pass).
 text:
   - platform: template
-    name: "SAME Allowed Counties"
+    name: "SAME County Codes"
     id: same_allowed_counties
     icon: "mdi:map-marker-multiple"
     mode: text
@@ -774,7 +774,6 @@ text_sensor:
   - platform: template
     id: same_last_raw_all
     name: "SAME Last Raw Header (All)"
-    disabled_by_default: true
 
   - platform: template
     id: same_last_alert_time
