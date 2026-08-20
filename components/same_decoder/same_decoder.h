@@ -339,6 +339,19 @@ class SAMEDecoder : public Component {
   uint32_t sr_meas_samples_{0};   // raw samples fed since last measurement
   uint32_t sr_meas_last_ms_{0};   // millis() of last measurement (0 = uninit)
 
+  // ---------------- Preamble-lock diagnostic (read-only; throttled) -----------
+  // Logs WHICH gate (tone / balance / confidence) is blocking preamble lock.
+  // Throttled to reason-changes + every PRE_DIAG_EVERY calls so it cannot flood
+  // at 520 Hz. Purely observational; touches no DSP or lock state. Expected
+  // finding with bit-centered detection: each clean preamble bit is a single
+  // tone, so balance = |m-s|/(m+s) ~ 0.99 FAILS the 'balanced' gate.
+  static constexpr int PRE_DIAG_EVERY = 32;
+  int  pre_diag_bits_{0};
+  bool pre_diag_last_qual_{false};
+  bool pre_diag_last_bal_{false};
+  bool pre_diag_last_tone_{false};
+  int  pre_diag_last_run_{0};
+
   // ---------------- Preamble lock state (redesign) ----------------
   // The preamble is 0xAB = 10101011 repeated; LSB-first that is a regular
   // alternating-ish transition pattern. We qualify each bit-period as a valid
@@ -350,6 +363,10 @@ class SAMEDecoder : public Component {
   // aligns phase_ to bit-center (frequency/w_off_ untouched -- still bumpless).
   // The lock is CARRIED across the ~1s inter-burst gap (see LOCK_HOLD_MS); it is
   // fully torn down on emit/EOM/watchdog/feed-gap.
+  //
+  // NOTE (diagnostic in progress): the 'balanced' gate above is suspected to be
+  // incompatible with bit-centered detection (clean preamble bits are single
+  // tones => high imbalance). The PRE diag logging confirms this before any fix.
   int preamble_lock_bits_{32};
   std::atomic<float> preamble_energy_mult_{8.0f};
   float preamble_balance_max_{0.40f};
