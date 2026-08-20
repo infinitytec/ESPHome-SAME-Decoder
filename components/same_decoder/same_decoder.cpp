@@ -195,6 +195,7 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "    Phase-snap: one-shot sub-bit align at lock (+/-%d samples, step %d, %d centers); w_off_ untouched.",
                 SNAP_THETA_MAX, SNAP_THETA_STEP, SNAP_USE);
   ESP_LOGCONFIG(TAG, "    Lock carried across inter-burst gap for up to %" PRIu32 " ms (time-aged).", (uint32_t) LOCK_HOLD_MS);
+  ESP_LOGCONFIG(TAG, "    Preamble-lock diagnostic ACTIVE at DEBUG (PRE diag: shows blocking gate).");
   ESP_LOGCONFIG(TAG, "  Residual-drift trim: %.0f ppm of bit period", this->residual_drift_ppm_);
   ESP_LOGCONFIG(TAG, "  Timing gate: engage conf>=%.2f, release conf<%.2f, dwell %d (confidence-weighted, KI floor %.2f, leak %.0e)",
                 TR_CONF_ENGAGE, TR_CONF_RELEASE, TR_GATE_DWELL, TR_CONF_FLOOR, (double) TR_WOFF_LEAK);
@@ -242,6 +243,12 @@ void SAMEDecoder::reset_preamble_lock_() {
   // Debug accumulators are session-scoped too (keeps summaries per-session).
   this->dbg_conf_accum_ = 0.0f;
   this->dbg_conf_n_ = 0;
+  // Preamble-lock diagnostic throttle state.
+  this->pre_diag_bits_ = 0;
+  this->pre_diag_last_qual_ = false;
+  this->pre_diag_last_bal_ = false;
+  this->pre_diag_last_tone_ = false;
+  this->pre_diag_last_run_ = 0;
 }
 
 // Per-burst run-accumulator clear ONLY. Preserves preamble_locked_, w_off_,
@@ -329,7 +336,8 @@ void SAMEDecoder::request_phase_snap_() {
 // Preamble lock declares/refreshes lock and fires the trigger. On the rising
 // edge into lock it ARMS a one-shot phase snap (phase_ only). It never modifies
 // w_off_, and it does not touch timing once a capture is in progress. Its
-// metrics are read-only w.r.t. the sampler otherwise.
+// metrics are read-only w.r.t. the sampler otherwise. A throttled PRE diag line
+// (read-only) reports which gate is blocking lock while hunting.
 void SAMEDecoder::update_preamble_lock_(float mark_e, float space_e, bool bit, float llr) {
   (void) bit;
   float tone_energy = mark_e + space_e;
@@ -389,6 +397,46 @@ void SAMEDecoder::update_preamble_lock_(float mark_e, float space_e, bool bit, f
     this->fire_preamble_once_();
   }
   this->was_preamble_locked_ = this->preamble_locked_;
+
+  // ---- Preamble-lock diagnostic (read-only, throttled). Reveals WHICH gate is
+  // blocking lock. Expected finding with bit-centered detection: each clean
+  // preamble bit is a single tone, so balance = |m-s|/(m+s) ~ 0.99 and FAILS the
+  // 'balanced < preamble_balance_max_' test -- so qualifies stays false and
+  // pre_run_ never accumulates. This block changes NO state. Only runs while
+  // hunting (the CAPTURE path returned above). ----
+  this->pre_diag_bits_++;
+  {
+    bool reason_change = (qualifies != this->pre_diag_last_qual_) ||
+                         (balanced != this->pre_diag_last_bal_) ||
+                         (tone_present != this->pre_diag_last_tone_) ||
+                         (this->pre_run_ < this->pre_diag_last_run_);
+    if (reason_change || this->pre_diag_bits_ >= PRE_DIAG_EVERY) {
+      float threshold = mult * f;
+      float mean_conf = (this->pre_run_ > 0)
+                            ? (float) (this->pre_run_conf_sum_ / (double) this->pre_run_)
+                            : 0.0f;
+      const char *blocker = "ok";
+      if (!tone_present)
+        blocker = "no_tone";
+      else if (!balanced)
+        blocker = "unbalanced";
+      else if (!qualifies)
+        blocker = "other";
+      else if (this->pre_run_ >= this->preamble_lock_bits_ && mean_conf < this->lock_confidence_min_)
+        blocker = "low_conf";
+      ESP_LOGD(TAG,
+               "PRE diag: m=%.1f s=%.1f tone=%.1f nf=%.1f thr=%.1f tp=%c bal=%.3f bal_ok=%c qual=%c run=%d/%d mean=%.2f llr=%.2f gate=%s",
+               mark_e, space_e, tone_energy, f, threshold,
+               tone_present ? 'Y' : 'N', balance, balanced ? 'Y' : 'N',
+               qualifies ? 'Y' : 'N', this->pre_run_, this->preamble_lock_bits_,
+               mean_conf, std::fabs(llr), blocker);
+      this->pre_diag_bits_ = 0;
+      this->pre_diag_last_qual_ = qualifies;
+      this->pre_diag_last_bal_ = balanced;
+      this->pre_diag_last_tone_ = tone_present;
+      this->pre_diag_last_run_ = this->pre_run_;
+    }
+  }
 }
 
 void SAMEDecoder::fire_sync_once_() {
