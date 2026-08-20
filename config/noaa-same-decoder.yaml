@@ -186,6 +186,7 @@ number:
     max_value: 512
     step: 1
     mode: slider
+    entity_category: diagnostic
     optimistic: true
     restore_value: true
     initial_value: 256
@@ -204,7 +205,7 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 3
-    entity_category: config
+    entity_category: diagnostic
     set_action:
       - lambda: 'id(same_dec).set_timeout_ms((uint32_t) (x * 1000.0f));'
 
@@ -220,7 +221,7 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 10
-    entity_category: config
+    entity_category: diagnostic
     disabled_by_default: true
     set_action:
       - lambda: 'id(same_dec).set_decode_watchdog_ms((uint32_t) (x * 1000.0f));'
@@ -237,7 +238,7 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 8.0
-    entity_category: config
+    entity_category: diagnostic
     disabled_by_default: true
     set_action:
       - lambda: 'id(same_dec).set_preamble_energy_mult(x);'
