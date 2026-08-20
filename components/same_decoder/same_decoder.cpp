@@ -1,20 +1,13 @@
 // components/same_decoder/same_decoder.cpp
 // Preamble-locked fixed-phase SAME decoder + automatic closed-loop fallback.
 //
-// v4 (phase-snap + centered detection): declaring preamble lock performs a
-// ONE-SHOT sub-bit phase snap that aligns phase_ onto bit-center; it still
-// NEVER modifies w_off_ (frequency stays bumpless). The timing loop stays alive
-// for the whole session (gated by a soft, confidence-weighted gate) so it can
-// never run open-loop between lock and ZCZC. The early-late discriminator is
-// DECISION-DIRECTED (symbol-invariant): it is multiplied by the decided-bit
-// sign so the timing gradient points the same way on mark and space bits and
-// cannot cancel on mixed payload. The INTEGRAL (rate) term runs only while a
-// real burst is in progress (lock effective or CAPTURE); off-signal it drains
-// toward zero with anti-windup so voice/noise cannot rail w_off_. The Goertzel
-// window is one full bit long and centered on the bit instant via a fixed
-// decision delay, maximizing mark/space discrimination. w_off_ is reset only on
-// true session boundaries (emit/EOM/watchdog/feed-gap), preserving the converged
-// timing correction that keeps the sampler on bit-center through the payload.
+// v5 (preamble qualifier fix): the bit-centered one-bit Goertzel makes each
+// clean preamble bit a SINGLE tone, so the old per-bit mark/space "balance"
+// gate (balanced < preamble_balance_max_) never qualified and preamble lock
+// never fired. The qualifier is now tone-present + high per-bit confidence +
+// alternation. Everything else is unchanged: decision-directed early-late TED,
+// integral gated on lock/CAPTURE with anti-windup + off-signal drain, phase-snap
+// at lock, bumpless w_off_ across the inter-burst gap.
 
 #include "same_decoder.h"
 #include "same_soft.h"
@@ -35,8 +28,8 @@ namespace same_decoder {
 static const char *const TAG = "same_decoder";
 
 // Debug summary interval (bits). Power of two so we can mask instead of modulo.
-// File-scope (DSP-internal detail; not part of the public API).
-static constexpr uint32_t DBG_SUMMARY_EVERY = 64;
+// Reduced to 512 (was 64) now that the core path is validated.
+static constexpr uint32_t DBG_SUMMARY_EVERY = 512;
 
 static inline int imod(int a, int m) {
   a %= m;
@@ -188,14 +181,15 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "  Samples/bit: %.2f  Goertzel window: %d (centered, dec-delay %d)",
                 this->samples_per_bit_, GWIN, DEC_DELAY);
   ESP_LOGCONFIG(TAG, "  Coeffs mark=%.6f space=%.6f", this->coeff_mark_, this->coeff_space_);
-  ESP_LOGCONFIG(TAG, "  Preamble lock: >= %d consecutive good bit-periods, conf>=%.2f, energy mult %.1f, balance<%.2f",
-                this->preamble_lock_bits_, this->lock_confidence_min_,
-                this->preamble_energy_mult_.load(std::memory_order_relaxed),
+  ESP_LOGCONFIG(TAG, "  Preamble lock (v5 qualifier: tone + conf>=%.2f + alternation): >= %d good bit-periods, mean|LLR|>=%.2f, energy mult %.1f",
+                PRE_CONF_MIN, this->preamble_lock_bits_, this->lock_confidence_min_,
+                this->preamble_energy_mult_.load(std::memory_order_relaxed));
+  ESP_LOGCONFIG(TAG, "    (preamble_balance_max=%.2f retained for config compat; no longer gated)",
                 this->preamble_balance_max_);
   ESP_LOGCONFIG(TAG, "    Phase-snap: one-shot sub-bit align at lock (+/-%d samples, step %d, %d centers); w_off_ untouched.",
                 SNAP_THETA_MAX, SNAP_THETA_STEP, SNAP_USE);
   ESP_LOGCONFIG(TAG, "    Lock carried across inter-burst gap for up to %" PRIu32 " ms (time-aged).", (uint32_t) LOCK_HOLD_MS);
-  ESP_LOGCONFIG(TAG, "    Preamble-lock diagnostic ACTIVE at DEBUG (PRE diag: shows blocking gate).");
+  ESP_LOGCONFIG(TAG, "    Preamble-lock diagnostic ACTIVE at DEBUG (PRE diag).");
   ESP_LOGCONFIG(TAG, "  Residual-drift trim: %.0f ppm of bit period", this->residual_drift_ppm_);
   ESP_LOGCONFIG(TAG, "  Timing gate: engage conf>=%.2f, release conf<%.2f, dwell %d (confidence-weighted, KI floor %.2f, leak %.0e)",
                 TR_CONF_ENGAGE, TR_CONF_RELEASE, TR_GATE_DWELL, TR_CONF_FLOOR, (double) TR_WOFF_LEAK);
@@ -203,9 +197,7 @@ void SAMEDecoder::dump_config() {
                 (double) TR_WOFF_LEAK_UNLOCKED, TR_WOFF_CLAMP_UNLOCKED_FRAC, TR_ANTI_WINDUP_BETA);
   ESP_LOGCONFIG(TAG, "  Timing loop: decision-directed early-late; acq Kp=%.4f Ki=%.5f -> track Kp=%.4f Ki=%.5f after %d bits",
                 ACQ_KP, ACQ_KI, this->fallback_kp_, this->fallback_ki_, N_GOOD_TO_TRACK);
-  ESP_LOGCONFIG(TAG, "    Telemetry: per-bit at VERBOSE (updates only, 1-in-%" PRIu32 " decimated), summary every %" PRIu32 " bits at DEBUG.",
-                (uint32_t) DBG_DECIM_K, (uint32_t) DBG_SUMMARY_EVERY);
-  ESP_LOGCONFIG(TAG, "    Sample-rate self-measurement logged once/second at INFO.");
+  ESP_LOGCONFIG(TAG, "    TL summary every %" PRIu32 " bits at DEBUG.", (uint32_t) DBG_SUMMARY_EVERY);
   ESP_LOGCONFIG(TAG, "    ZCZC hamming: strict<=%d (sampled at preamble-locked timing)", SYNC_MAX_HAMMING);
   ESP_LOGCONFIG(TAG, "    Unlocked ZCZC starts allowed but LOW-TRUST (strict-valid + 2-of-3 only).");
   ESP_LOGCONFIG(TAG, "  EOM requires context: %s (%" PRIu32 " ms)",
@@ -234,6 +226,9 @@ void SAMEDecoder::reset_preamble_lock_() {
   this->last_lock_ms_ = 0;
   this->tr_gate_open_ = false;
   this->tr_gate_run_ = 0;
+  // v5 qualifier state.
+  this->pre_alt_score_ = 0;
+  this->pre_last_bit_ = -1;
   // Phase-snap + acquisition state are session-scoped: tear them down here.
   this->snap_pending_ = false;
   this->snap_delta_phase_ = 0.0f;
@@ -246,9 +241,8 @@ void SAMEDecoder::reset_preamble_lock_() {
   // Preamble-lock diagnostic throttle state.
   this->pre_diag_bits_ = 0;
   this->pre_diag_last_qual_ = false;
-  this->pre_diag_last_bal_ = false;
   this->pre_diag_last_tone_ = false;
-  this->pre_diag_last_run_ = 0;
+  this->pre_diag_last_alt_ = false;
 }
 
 // Per-burst run-accumulator clear ONLY. Preserves preamble_locked_, w_off_,
@@ -257,6 +251,8 @@ void SAMEDecoder::reset_preamble_lock_() {
 void SAMEDecoder::clear_preamble_run_() {
   this->pre_run_ = 0;
   this->pre_run_conf_sum_ = 0.0;
+  // Keep alternation score/last-bit warm across the gap so the next burst's
+  // preamble re-qualifies quickly (they are cheap running estimators).
 }
 
 bool SAMEDecoder::lock_is_effective_() const {
@@ -295,16 +291,14 @@ void SAMEDecoder::request_phase_snap_() {
     float sum_conf = 0.0f;
     int valid = 0;
     for (int c = 0; c < gathered; c++) {
-      // Window centered on (center + theta): end at center + theta + HALF_AFTER.
       long end_abs = (long) centers[c] + theta + HALF_AFTER;
-      // Must be fully matured in the past (leave TR_DELTA margin for symmetry).
       if (end_abs + TR_DELTA > (long) s_now_abs)
         continue;
       if (end_abs < 0)
         continue;
       int back = (int) ((long) s_now_abs - end_abs);
       if (back >= RINGLEN - GWIN)
-        continue;   // not enough history in the ring for this window
+        continue;
       int end_ring = imod(s_now - back, RINGLEN);
       float em = goertzel_ring_end(this->ring_, RINGLEN, end_ring, GWIN, this->coeff_mark_);
       float es = goertzel_ring_end(this->ring_, RINGLEN, end_ring, GWIN, this->coeff_space_);
@@ -322,24 +316,21 @@ void SAMEDecoder::request_phase_snap_() {
   }
 
   if (best_score < 0.0f)
-    return;   // nothing evaluable; leave phase as-is
+    return;
 
-  // Positive theta means "move our bit centers LATER by theta samples"; to do
-  // that we must REDUCE phase_ (delay the next threshold crossing). phase_inc_
-  // is fraction-of-bit per sample, so a theta-sample shift is theta*phase_inc_.
   this->snap_delta_phase_ = -(float) best_theta * this->phase_inc_;
   this->snap_pending_ = true;
   ESP_LOGD(TAG, "Phase-snap armed: theta=%d samples (score=%.2f, dphase=%.4f).",
            best_theta, best_score, this->snap_delta_phase_);
 }
 
-// Preamble lock declares/refreshes lock and fires the trigger. On the rising
-// edge into lock it ARMS a one-shot phase snap (phase_ only). It never modifies
-// w_off_, and it does not touch timing once a capture is in progress. Its
-// metrics are read-only w.r.t. the sampler otherwise. A throttled PRE diag line
-// (read-only) reports which gate is blocking lock while hunting.
+// Preamble lock (v5 qualifier). Declares/refreshes lock and fires the trigger.
+// Qualifier: tone-present (energy over adaptive floor) AND high per-bit
+// confidence (clean single tone) AND alternation (running score). On the rising
+// edge into lock it ARMS a one-shot phase snap (phase_ only); it never modifies
+// w_off_. A throttled PRE diag line (read-only) is emitted while HUNTING, BEFORE
+// the CAPTURE early-return so it is reliably reached.
 void SAMEDecoder::update_preamble_lock_(float mark_e, float space_e, bool bit, float llr) {
-  (void) bit;
   float tone_energy = mark_e + space_e;
 
   float f = this->pre_noise_floor_;
@@ -349,19 +340,58 @@ void SAMEDecoder::update_preamble_lock_(float mark_e, float space_e, bool bit, f
   this->pre_noise_floor_ = f;
 
   float mult = this->preamble_energy_mult_.load(std::memory_order_relaxed);
-  float balance = std::fabs(mark_e - space_e) / (mark_e + space_e + 1e-9f);
+
+  // Per-bit confidence: for a clean single-tone preamble bit this is ~0.9-1.0.
+  float conf = std::fabs(mark_e - space_e) / (mark_e + space_e + 1e-9f);
 
   bool tone_present = (tone_energy > mult * f);
-  bool balanced = (balance < this->preamble_balance_max_);
-  bool qualifies = tone_present && balanced;
+  bool clean_tone = (conf >= PRE_CONF_MIN);
+
+  // Alternation score: rises on a bit toggle, decays on a repeat. Tolerant of
+  // 0xAB's occasional double-bit because a single repeat only nudges it down.
+  int this_bit = bit ? 1 : 0;
+  if (this->pre_last_bit_ >= 0) {
+    if (this_bit != this->pre_last_bit_)
+      this->pre_alt_score_ += PRE_ALT_UP;
+    else
+      this->pre_alt_score_ -= PRE_ALT_DOWN;
+    if (this->pre_alt_score_ < 0) this->pre_alt_score_ = 0;
+    if (this->pre_alt_score_ > PRE_ALT_MAX) this->pre_alt_score_ = PRE_ALT_MAX;
+  }
+  this->pre_last_bit_ = this_bit;
+  bool alternating = (this->pre_alt_score_ >= PRE_ALT_OK);
+
+  bool qualifies = tone_present && clean_tone && alternating;
 
   // Freeze preamble lock accounting during CAPTURE so nothing about the
-  // preamble path can perturb the payload. Metrics remain read-only.
+  // preamble path can perturb the payload. Metrics remain read-only. The PRE
+  // diag is emitted only while HUNTING (below), so it is skipped here.
   if (this->phase_state_ == CAPTURE) {
     this->was_preamble_locked_ = this->preamble_locked_;
     if (this->preamble_locked_)
       this->last_lock_ms_ = millis();   // keep recency warm; no timing change
     return;
+  }
+
+  // ---- Preamble-lock diagnostic (read-only, throttled). Emitted while HUNTING,
+  // BEFORE the run/lock update so its throttle counter reliably advances. Shows
+  // the three qualifier conditions and the current run. ----
+  this->pre_diag_bits_++;
+  {
+    bool reason_change = (qualifies != this->pre_diag_last_qual_) ||
+                         (tone_present != this->pre_diag_last_tone_) ||
+                         (alternating != this->pre_diag_last_alt_);
+    if (reason_change || this->pre_diag_bits_ >= PRE_DIAG_EVERY) {
+      ESP_LOGD(TAG,
+               "PRE diag: tone=%c conf=%.2f clean=%c alt=%d/%d(%c) qual=%c run=%d/%d nf=%.1f",
+               tone_present ? 'Y' : 'N', conf, clean_tone ? 'Y' : 'N',
+               this->pre_alt_score_, PRE_ALT_OK, alternating ? 'Y' : 'N',
+               qualifies ? 'Y' : 'N', this->pre_run_, this->preamble_lock_bits_, f);
+      this->pre_diag_bits_ = 0;
+      this->pre_diag_last_qual_ = qualifies;
+      this->pre_diag_last_tone_ = tone_present;
+      this->pre_diag_last_alt_ = alternating;
+    }
   }
 
   if (qualifies) {
@@ -392,51 +422,12 @@ void SAMEDecoder::update_preamble_lock_(float mark_e, float space_e, bool bit, f
     this->last_lock_ms_ = millis();
 
   if (this->preamble_locked_ && !this->was_preamble_locked_) {
-    ESP_LOGI(TAG, "Preamble LOCK (run=%d, mean_conf=%.2f) [phase-snap].", this->pre_run_,
-             this->pre_run_ > 0 ? (float) (this->pre_run_conf_sum_ / (double) this->pre_run_) : 0.0f);
+    ESP_LOGI(TAG, "Preamble LOCK (run=%d, mean_conf=%.2f, alt=%d) [phase-snap].", this->pre_run_,
+             this->pre_run_ > 0 ? (float) (this->pre_run_conf_sum_ / (double) this->pre_run_) : 0.0f,
+             this->pre_alt_score_);
     this->fire_preamble_once_();
   }
   this->was_preamble_locked_ = this->preamble_locked_;
-
-  // ---- Preamble-lock diagnostic (read-only, throttled). Reveals WHICH gate is
-  // blocking lock. Expected finding with bit-centered detection: each clean
-  // preamble bit is a single tone, so balance = |m-s|/(m+s) ~ 0.99 and FAILS the
-  // 'balanced < preamble_balance_max_' test -- so qualifies stays false and
-  // pre_run_ never accumulates. This block changes NO state. Only runs while
-  // hunting (the CAPTURE path returned above). ----
-  this->pre_diag_bits_++;
-  {
-    bool reason_change = (qualifies != this->pre_diag_last_qual_) ||
-                         (balanced != this->pre_diag_last_bal_) ||
-                         (tone_present != this->pre_diag_last_tone_) ||
-                         (this->pre_run_ < this->pre_diag_last_run_);
-    if (reason_change || this->pre_diag_bits_ >= PRE_DIAG_EVERY) {
-      float threshold = mult * f;
-      float mean_conf = (this->pre_run_ > 0)
-                            ? (float) (this->pre_run_conf_sum_ / (double) this->pre_run_)
-                            : 0.0f;
-      const char *blocker = "ok";
-      if (!tone_present)
-        blocker = "no_tone";
-      else if (!balanced)
-        blocker = "unbalanced";
-      else if (!qualifies)
-        blocker = "other";
-      else if (this->pre_run_ >= this->preamble_lock_bits_ && mean_conf < this->lock_confidence_min_)
-        blocker = "low_conf";
-      ESP_LOGD(TAG,
-               "PRE diag: m=%.1f s=%.1f tone=%.1f nf=%.1f thr=%.1f tp=%c bal=%.3f bal_ok=%c qual=%c run=%d/%d mean=%.2f llr=%.2f gate=%s",
-               mark_e, space_e, tone_energy, f, threshold,
-               tone_present ? 'Y' : 'N', balance, balanced ? 'Y' : 'N',
-               qualifies ? 'Y' : 'N', this->pre_run_, this->preamble_lock_bits_,
-               mean_conf, std::fabs(llr), blocker);
-      this->pre_diag_bits_ = 0;
-      this->pre_diag_last_qual_ = qualifies;
-      this->pre_diag_last_bal_ = balanced;
-      this->pre_diag_last_tone_ = tone_present;
-      this->pre_diag_last_run_ = this->pre_run_;
-    }
-  }
 }
 
 void SAMEDecoder::fire_sync_once_() {
@@ -479,25 +470,6 @@ void SAMEDecoder::feed_bytes(const std::vector<uint8_t> &data) {
   }
 
   const size_t n = data.size() / 2;
-
-  // ---- Sample-rate self-measurement (read-only diagnostic). Count RAW samples
-  // fed here (not samples_seen_, which can skip during post-emit dead-time) and
-  // report the measured effective Hz once per ~second. If this reads far from
-  // the configured sample_rate_ (e.g. ~44100 vs 48000), the bit clock is
-  // fundamentally mis-scaled and NO w_off_ correction can compensate. ----
-  if (this->sr_meas_last_ms_ == 0) {
-    this->sr_meas_last_ms_ = now;   // lazy init: skip the first (partial) window
-  }
-  this->sr_meas_samples_ += (uint32_t) n;
-  uint32_t sr_dt = now - this->sr_meas_last_ms_;
-  if (sr_dt >= 1000) {
-    float hz = (float) this->sr_meas_samples_ * 1000.0f / (float) sr_dt;
-    ESP_LOGI(TAG, "Measured effective sample rate: %.1f Hz (configured %" PRIu32 " Hz, samples/bit=%.2f)",
-             hz, this->sample_rate_, this->samples_per_bit_);
-    this->sr_meas_samples_ = 0;
-    this->sr_meas_last_ms_ = now;
-  }
-
   const int16_t *samples = reinterpret_cast<const int16_t *>(data.data());
   for (size_t i = 0; i < n; i++) {
     float v = (float) samples[i] * this->gain_;
@@ -615,9 +587,6 @@ void SAMEDecoder::feed_sample_(int16_t s) {
     conf = d_center / (e_center + 1e-9f);
   }
 
-  // Diagnostic fallback-engagement flag (does not gate the loop anymore; the
-  // loop is always-on when the hysteretic timing gate is open). Logged at
-  // VVERBOSE only: at 520 Hz this would otherwise flood the transport.
   bool low_conf = (conf < this->fallback_conf_thresh_);
   if (low_conf && !this->fallback_active_) {
     this->fallback_active_ = true;
@@ -626,9 +595,7 @@ void SAMEDecoder::feed_sample_(int16_t s) {
     this->fallback_active_ = false;
   }
 
-  // Hysteretic + dwell confidence gate for the ALWAYS-ON timing loop. Raised
-  // thresholds resist voice-formant chatter on non-signal audio; a real SAME
-  // preamble/header (conf ~0.8-0.99) clears them easily.
+  // Hysteretic + dwell confidence gate for the ALWAYS-ON timing loop.
   if (!this->tr_gate_open_) {
     if (conf >= TR_CONF_ENGAGE) {
       if (++this->tr_gate_run_ >= TR_GATE_DWELL)
@@ -643,21 +610,12 @@ void SAMEDecoder::feed_sample_(int16_t s) {
     }
   }
 
-  // Telemetry values captured per bit (read-only; do not affect timing).
-  float dbg_e = 0.0f;
-  float dbg_dphi = 0.0f;
-  bool dbg_acquiring = (this->good_bits_since_lock_ < N_GOOD_TO_TRACK);
-  bool dbg_clamp_hit = false;
-  bool dbg_updated = false;
-
   // A real SAME burst is in progress when we hold an effective preamble lock OR
   // are already capturing the payload. The INTEGRAL (rate) term only runs in
-  // that window; off-signal (voice/noise hunting) it must NOT integrate, or the
-  // loop winds w_off_ to the rail chasing formants. lock precedes ZCZC and
-  // CAPTURE covers the payload, so a genuine burst is still fully tracked.
+  // that window; off-signal it drains toward 0. lock precedes ZCZC and CAPTURE
+  // covers the payload, so a genuine burst is still fully tracked.
   const bool locked_or_capture =
       this->lock_is_effective_() || (this->phase_state_ == CAPTURE);
-  // Effective rate clamp: full range on-signal, tighter off-signal (item 3).
   const float eff_clamp = locked_or_capture
                               ? this->tr_woff_clamp_
                               : this->tr_woff_clamp_ * TR_WOFF_CLAMP_UNLOCKED_FRAC;
@@ -668,52 +626,31 @@ void SAMEDecoder::feed_sample_(int16_t s) {
     float em_l = goertzel_ring_end(this->ring_, RINGLEN, t_late,  GWIN, this->coeff_mark_);
     float es_l = goertzel_ring_end(this->ring_, RINGLEN, t_late,  GWIN, this->coeff_space_);
 
-    // DECISION-DIRECTED (symbol-invariant) early-late timing error. The raw
-    // d_early/d_late are SIGNED normalized separations (em-es)/(em+es); their
-    // polarity FLIPS between mark and space bits, so the bare difference
-    // (d_early - d_late) would push timing opposite ways on marks vs spaces and
-    // cancel on mixed payload -- the sampler then walks off through the header.
-    // Multiplying by the decided-bit sign (sym_sign) makes the gradient point
-    // the same way regardless of mark/space. Convention after the fix:
-    //   e > 0 => sampling LATE (early window is closer to true center)
-    //         => advance phase (sample earlier).
+    // DECISION-DIRECTED (symbol-invariant) early-late timing error.
     const float eps = 1e-9f;
     float d_early = (em_e - es_e) / (em_e + es_e + eps);
     float d_late  = (em_l - es_l) / (em_l + es_l + eps);
     float sym_sign = (em_c >= es_c) ? 1.0f : -1.0f;
     float e = sym_sign * (d_early - d_late);
 
-    // Two-stage gains: pull in fast right after lock, then settle to the gentle
-    // tracking gains once enough good bits have elapsed. The acquisition window
-    // (N_GOOD_TO_TRACK) spans well into the early payload so the rate correction
-    // converges before the gains soften. The proportional update is weighted by
-    // confidence so weak bits contribute little.
     bool acquiring = (this->good_bits_since_lock_ < N_GOOD_TO_TRACK);
     float kp = acquiring ? ACQ_KP : this->fallback_kp_;
     float ki = acquiring ? ACQ_KI : this->fallback_ki_;
 
-    // PROPORTIONAL (phase) update is UNGATED w.r.t. lock/capture: it is bounded
-    // per-bit (TR_DPHI_CLAMP) and does NOT accumulate, so running it whenever
-    // the confidence gate is open is harmless and keeps the loop instantly
-    // responsive the moment a real signal appears.
+    // PROPORTIONAL (phase) update -- ungated w.r.t. lock/capture (bounded,
+    // non-accumulating), keeps the loop responsive the instant signal appears.
     float dphi = kp * conf * e;
     if (dphi >  TR_DPHI_CLAMP) dphi =  TR_DPHI_CLAMP;
     if (dphi < -TR_DPHI_CLAMP) dphi = -TR_DPHI_CLAMP;
     this->phase_ += dphi;
 
     if (locked_or_capture) {
-      // INTEGRAL (rate) path -- ON-SIGNAL ONLY. Floored confidence so w_off_
-      // keeps tracking slow drift through low-confidence payload runs; a very
-      // slow leak prevents long-term wander. Back-calculation anti-windup
-      // (item 2): on saturation we bleed the overshoot by TR_ANTI_WINDUP_BETA
-      // so the integrator sits just inside the rail and recovers instantly when
-      // e reverses, instead of welding to +/-clamp.
+      // INTEGRAL (rate) path -- ON-SIGNAL ONLY, floored confidence + slow leak +
+      // back-calculation anti-windup.
       float conf_ki = (conf > TR_CONF_FLOOR) ? conf : TR_CONF_FLOOR;
       float w_unclamped = this->w_off_ + ki * conf_ki * e;
       w_unclamped -= TR_WOFF_LEAK * w_unclamped;
-
       bool saturated = (w_unclamped > eff_clamp) || (w_unclamped < -eff_clamp);
-      dbg_clamp_hit = saturated;
       if (saturated) {
         float w_sat = (w_unclamped > 0.0f) ? eff_clamp : -eff_clamp;
         this->w_off_ = w_sat - TR_ANTI_WINDUP_BETA * (w_unclamped - w_sat);
@@ -723,10 +660,7 @@ void SAMEDecoder::feed_sample_(int16_t s) {
         this->w_off_ = w_unclamped;
       }
     } else {
-      // OFF-SIGNAL: never integrate. Drain w_off_ toward 0 with the stronger
-      // unlocked leak (item 4) and hold it inside the tighter unlocked clamp
-      // (item 3) so noise-accumulated offset bleeds away quickly.
-      dbg_clamp_hit = (this->w_off_ > eff_clamp) || (this->w_off_ < -eff_clamp);
+      // OFF-SIGNAL: never integrate; drain toward 0 inside the tighter clamp.
       this->w_off_ -= TR_WOFF_LEAK_UNLOCKED * this->w_off_;
       if (this->w_off_ >  eff_clamp) this->w_off_ =  eff_clamp;
       if (this->w_off_ < -eff_clamp) this->w_off_ = -eff_clamp;
@@ -734,44 +668,18 @@ void SAMEDecoder::feed_sample_(int16_t s) {
 
     if (conf >= TR_CONF_ENGAGE && this->good_bits_since_lock_ < 0x7fffffff)
       this->good_bits_since_lock_++;
-
-    dbg_e = e;
-    dbg_dphi = dphi;
-    dbg_acquiring = acquiring;
-    dbg_updated = true;
   } else {
-    // Gate closed (or not primed). On-signal we HOLD w_off_ (bumpless -- the
-    // converged rate correction must persist through low-confidence runs and
-    // the inter-burst gap). Off-signal we keep DRAINING toward 0 so a noise-
-    // accumulated offset cannot linger into the next real burst.
+    // Gate closed (or not primed). On-signal HOLD w_off_ (bumpless); off-signal
+    // keep DRAINING toward 0 so noise offset cannot linger into the next burst.
     if (!locked_or_capture) {
       this->w_off_ -= TR_WOFF_LEAK_UNLOCKED * this->w_off_;
       if (this->w_off_ >  eff_clamp) this->w_off_ =  eff_clamp;
       if (this->w_off_ < -eff_clamp) this->w_off_ = -eff_clamp;
     }
   }
-  // w_off_ is only zeroed on true session boundaries (reset_preamble_lock_/
-  // feed-gap); on-signal gate-closed HOLD keeps it bumpless.
-
-  // ---- Per-bit VERBOSE telemetry (read-only). GATED to updated bits only and
-  // DECIMATED 1-in-DBG_DECIM_K so it cannot flood the transport at 520 Hz (that
-  // previously starved mic_task and faulted the MCU). w_off_ reported as ppm of
-  // the bit period (w_off_ / phase_inc_ * 1e6); gate O=open/C=closed;
-  // clamp=1 when w_off_ saturated this bit. ----
-  if (dbg_updated && (++this->dbg_decim_ % DBG_DECIM_K == 0)) {
-    float wppm = (this->phase_inc_ != 0.0f) ? (this->w_off_ / this->phase_inc_) * 1e6f : 0.0f;
-    ESP_LOGV(TAG,
-             "TL bit=%d conf=%.2f e=%+.4f dphi=%+.5f wppm=%+.1f gate=%c upd=1 acq=%d good=%d clamp=%d",
-             bit ? 1 : 0, conf, dbg_e, dbg_dphi, wppm,
-             this->tr_gate_open_ ? 'O' : 'C',
-             dbg_acquiring ? 1 : 0,
-             this->good_bits_since_lock_, dbg_clamp_hit ? 1 : 0);
-  }
 
   // ---- Periodic DEBUG summary every DBG_SUMMARY_EVERY bits: rolling mean conf,
-  // last conf, current w_off_ in ppm, and gate state. Fixed-size accumulators,
-  // no allocation; power-of-two interval lets us mask instead of modulo. This is
-  // the intended NORMAL monitoring path (safe line rate at DEBUG). ----
+  // last conf, current w_off_ in ppm, gate state, and lock state. ----
   this->dbg_bit_count_++;
   this->dbg_conf_accum_ += conf;
   if (this->dbg_conf_n_ < 0xFFFF) this->dbg_conf_n_++;
@@ -781,9 +689,10 @@ void SAMEDecoder::feed_sample_(int16_t s) {
                           ? (this->dbg_conf_accum_ / (float) this->dbg_conf_n_)
                           : 0.0f;
     float wppm = (this->phase_inc_ != 0.0f) ? (this->w_off_ / this->phase_inc_) * 1e6f : 0.0f;
-    ESP_LOGD(TAG, "TL summary bits=%" PRIu32 " mean_conf=%.2f last_conf=%.2f wppm=%+.1f gate=%c",
+    ESP_LOGD(TAG, "TL summary bits=%" PRIu32 " mean_conf=%.2f last_conf=%.2f wppm=%+.1f gate=%c lock=%c",
              this->dbg_bit_count_, mean_conf, this->dbg_last_conf_, wppm,
-             this->tr_gate_open_ ? 'O' : 'C');
+             this->tr_gate_open_ ? 'O' : 'C',
+             this->lock_is_effective_() ? 'Y' : 'N');
     this->dbg_conf_accum_ = 0.0f;
     this->dbg_conf_n_ = 0;
   }
@@ -883,7 +792,7 @@ bool SAMEDecoder::fuzzy_equal_(const std::string &a, const std::string &b) {
 
 bool SAMEDecoder::same_message_as_current_(const std::string &new_burst) {
   if (this->burst_idx_ == 0) return true;
-  const std::string &ref = this->bursts_[0];
+  const std::string &ref = this->bursts_;
   SameAlert ra, rb;
   bool pa = this->parse_header_(ref, ra);
   bool pb = this->parse_header_(new_burst, rb);
@@ -918,14 +827,14 @@ void SAMEDecoder::finish_burst_() {
   if (this->burst_idx_ >= 1 && !this->same_message_as_current_(this_burst)) {
     ESP_LOGD(TAG, "Differing burst mid-collection: finalising old, starting new.");
     this->reset_capture_();
-    this->bursts_[0] = this_burst;
-    this->soft_bursts_[0] = this_soft;
-    this->burst_low_trust_[0] = this_low_trust;
+    this->bursts_ = this_burst;
+    this->soft_bursts_ = this_soft;
+    this->burst_low_trust_ = this_low_trust;
     this->burst_idx_ = 1;
     this->last_burst_ms_ = millis();
 
     if (!this->early_emitted_ && !this_low_trust &&
-        this->header_is_complete_(this->bursts_[0])) {
+        this->header_is_complete_(this->bursts_)) {
       ESP_LOGD(TAG, "Immediate emit on promoted COMPLETE differing burst.");
       this->vote_and_emit_(false, this->fallback_sync_used_);
       this->early_emitted_ = true;
