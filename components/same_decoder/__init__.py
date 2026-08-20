@@ -36,6 +36,13 @@ CONF_EOM_CONTEXT_MS = "eom_context_ms"
 
 CONF_DECODE_WATCHDOG_MS = "decode_watchdog_ms"
 
+# resend_suppress_ms: cross-session re-emit window. An identical header arriving
+#   in a NEW decode session is suppressed only if it comes within this many ms of
+#   the previous emit; after the window elapses it re-emits. In-transmission
+#   repeats (the 3 bursts of one message) are ALWAYS collapsed by the session key
+#   and are unaffected by this setting. 0 = never suppress cross-session repeats.
+CONF_RESEND_SUPPRESS_MS = "resend_suppress_ms"
+
 # --- Preamble-lock (redesign) parameters ---
 # preamble_lock_bits: the MINIMUM number of consecutive good preamble bit-periods
 #   required to declare timing lock. This is a floor for reliable convergence,
@@ -121,6 +128,9 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_TIMEOUT_MS, default=3000): cv.int_range(min=500, max=30000),
             cv.Optional(CONF_SINGLE_BURST_MIN_MS, default=7000): cv.int_range(min=1000, max=60000),
             cv.Optional(CONF_POST_EMIT_DEAD_MS, default=800): cv.int_range(min=0, max=10000),
+            # Cross-session re-emit window (0 .. 15 min). 0 = never suppress
+            # cross-session repeats. In-transmission repeats are always collapsed.
+            cv.Optional(CONF_RESEND_SUPPRESS_MS, default=3000): cv.int_range(min=0, max=900000),
             # --- Preamble-lock parameters ---
             cv.Optional(CONF_PREAMBLE_LOCK_BITS, default=32): cv.int_range(min=8, max=128),
             cv.Optional(CONF_PREAMBLE_ENERGY_MULT, default=8.0): cv.float_range(min=2.0, max=50.0),
@@ -167,6 +177,7 @@ async def to_code(config):
     cg.add(var.set_timeout_ms(config[CONF_TIMEOUT_MS]))
     cg.add(var.set_single_burst_min_ms(config[CONF_SINGLE_BURST_MIN_MS]))
     cg.add(var.set_post_emit_dead_ms(config[CONF_POST_EMIT_DEAD_MS]))
+    cg.add(var.set_resend_suppress_ms(config[CONF_RESEND_SUPPRESS_MS]))
 
     cg.add(var.set_preamble_lock_bits(config[CONF_PREAMBLE_LOCK_BITS]))
     cg.add(var.set_preamble_energy_mult(config[CONF_PREAMBLE_ENERGY_MULT]))
