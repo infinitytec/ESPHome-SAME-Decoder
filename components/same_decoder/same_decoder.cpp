@@ -24,9 +24,6 @@ namespace same_decoder {
 
 static const char *const TAG = "same_decoder";
 
-// Debug summary interval (bits). Power of two so we can mask instead of modulo.
-static constexpr uint32_t DBG_SUMMARY_EVERY = 512;
-
 static inline int imod(int a, int m) {
   a %= m;
   if (a < 0) a += m;
@@ -85,10 +82,6 @@ void SAMEDecoder::compute_coeffs_() {
   this->samples_per_bit_ = sr / baud;
   this->phase_inc_ = 1.0f / this->samples_per_bit_;
   this->tr_woff_clamp_ = (this->residual_drift_ppm_ * 1e-6f) * this->phase_inc_;
-
-  ESP_LOGCONFIG(TAG, "Coeffs: sr=%" PRIu32 " mark=%.6f space=%.6f spb=%.3f",
-                this->sample_rate_, this->coeff_mark_, this->coeff_space_, this->samples_per_bit_);
-}
 
 void SAMEDecoder::set_sample_rate(uint32_t rate) {
   this->sample_rate_ = rate;
@@ -591,24 +584,6 @@ void SAMEDecoder::feed_sample_(int16_t s) {
       if (this->w_off_ >  eff_clamp) this->w_off_ =  eff_clamp;
       if (this->w_off_ < -eff_clamp) this->w_off_ = -eff_clamp;
     }
-  }
-
-  // Periodic DEBUG summary every DBG_SUMMARY_EVERY bits.
-  this->dbg_bit_count_++;
-  this->dbg_conf_accum_ += conf;
-  if (this->dbg_conf_n_ < 0xFFFF) this->dbg_conf_n_++;
-  this->dbg_last_conf_ = conf;
-  if ((this->dbg_bit_count_ & (DBG_SUMMARY_EVERY - 1u)) == 0u) {
-    float mean_conf = (this->dbg_conf_n_ != 0)
-                          ? (this->dbg_conf_accum_ / (float) this->dbg_conf_n_)
-                          : 0.0f;
-    float wppm = (this->phase_inc_ != 0.0f) ? (this->w_off_ / this->phase_inc_) * 1e6f : 0.0f;
-    ESP_LOGD(TAG, "TL summary bits=%" PRIu32 " mean_conf=%.2f last_conf=%.2f wppm=%+.1f gate=%c lock=%c",
-             this->dbg_bit_count_, mean_conf, this->dbg_last_conf_, wppm,
-             this->tr_gate_open_ ? 'O' : 'C',
-             this->lock_is_effective_() ? 'Y' : 'N');
-    this->dbg_conf_accum_ = 0.0f;
-    this->dbg_conf_n_ = 0;
   }
 
   this->emit_bit_(bit);
