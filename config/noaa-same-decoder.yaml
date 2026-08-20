@@ -163,6 +163,24 @@ globals:
     restore_value: no
     initial_value: '0'
 
+# Runtime-editable list of allowed county (SAME/FIPS) codes.
+# Enter one or more 6-digit codes (PSSCCC), comma-separated, e.g. "020173,020177".
+# Partial-county (P-digit) is ignored: matching is done on the last 5 digits (SSCCC),
+# so a code like 120173 (P=1) still matches an entered 020173 for the same county.
+# An EMPTY list means "no location filter" (all areas pass).
+text:
+  - platform: template
+    name: "SAME Allowed Counties"
+    id: same_allowed_counties
+    icon: "mdi:map-marker-multiple"
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: ""
+    entity_category: config
+    min_length: 0
+    max_length: 255
+
 script:
   - id: led_indicate_on
     then:
@@ -258,6 +276,524 @@ number:
     set_action:
       - lambda: 'id(same_dec).set_preamble_energy_mult(x);'
 
+# --- Per-event-code allow/mute toggles ---
+# Semantics: switch ON = allow this event code (default). Switch OFF = mute it
+# on-device (the alert will NOT publish to the filtered header sensor nor fire
+# the Home Assistant event). Unknown/unlisted codes are always allowed.
+switch:
+  - platform: template
+    name: "SAME Allow: EAN (Emergency Action Notification)"
+    id: mute_ean
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: EAT (Emergency Action Termination)"
+    id: mute_eat
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: NIC (National Information Center)"
+    id: mute_nic
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: NPT (National Periodic Test)"
+    id: mute_npt
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: NAT (National Audible Test)"
+    id: mute_nat
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: NST (National Silent Test)"
+    id: mute_nst
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: BZW (Blizzard Warning)"
+    id: mute_bzw
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: CFA (Coastal Flood Watch)"
+    id: mute_cfa
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: CFW (Coastal Flood Warning)"
+    id: mute_cfw
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: DSW (Dust Storm Warning)"
+    id: mute_dsw
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: EWW (Extreme Wind Warning)"
+    id: mute_eww
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: FFA (Flash Flood Watch)"
+    id: mute_ffa
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: FFW (Flash Flood Warning)"
+    id: mute_ffw
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: FFS (Flash Flood Statement)"
+    id: mute_ffs
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: FLA (Flood Watch)"
+    id: mute_fla
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: FLW (Flood Warning)"
+    id: mute_flw
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: FLS (Flood Statement)"
+    id: mute_fls
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: FZW (Freeze Warning)"
+    id: mute_fzw
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: HWA (High Wind Watch)"
+    id: mute_hwa
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: HWW (High Wind Warning)"
+    id: mute_hww
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: HUA (Hurricane Watch)"
+    id: mute_hua
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: HUW (Hurricane Warning)"
+    id: mute_huw
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: HLS (Hurricane Statement)"
+    id: mute_hls
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: HWO (Severe Weather Statement Outlook)"
+    id: mute_hwo
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: MWS (Marine Weather Statement)"
+    id: mute_mws
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: SVA (Severe Thunderstorm Watch)"
+    id: mute_sva
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: SVR (Severe Thunderstorm Warning)"
+    id: mute_svr
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: SVS (Severe Weather Statement)"
+    id: mute_svs
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: SQW (Snow Squall Warning)"
+    id: mute_sqw
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: SMW (Special Marine Warning)"
+    id: mute_smw
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: SPS (Special Weather Statement)"
+    id: mute_sps
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: SSA (Storm Surge Watch)"
+    id: mute_ssa
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: SSW (Storm Surge Warning)"
+    id: mute_ssw
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: TOA (Tornado Watch)"
+    id: mute_toa
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: TOR (Tornado Warning)"
+    id: mute_tor
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: TRA (Tropical Storm Watch)"
+    id: mute_tra
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: TRW (Tropical Storm Warning)"
+    id: mute_trw
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: TSA (Tsunami Watch)"
+    id: mute_tsa
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: TSW (Tsunami Warning)"
+    id: mute_tsw
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: WSA (Winter Storm Watch)"
+    id: mute_wsa
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: WSW (Winter Storm Warning)"
+    id: mute_wsw
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: AVA (Avalanche Watch)"
+    id: mute_ava
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: AVW (Avalanche Warning)"
+    id: mute_avw
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: BLU (Blue Alert)"
+    id: mute_blu
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: CAE (Child Abduction Emergency)"
+    id: mute_cae
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: CDW (Civil Danger Warning)"
+    id: mute_cdw
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: CEM (Civil Emergency Message)"
+    id: mute_cem
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: EQW (Earthquake Warning)"
+    id: mute_eqw
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: EVI (Evacuation Immediate)"
+    id: mute_evi
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: FRW (Fire Warning)"
+    id: mute_frw
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: HMW (Hazardous Materials Warning)"
+    id: mute_hmw
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: LEW (Law Enforcement Warning)"
+    id: mute_lew
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: LAE (Local Area Emergency)"
+    id: mute_lae
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: TOE (911 Telephone Outage Emergency)"
+    id: mute_toe
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: NMN (Network Message Notification)"
+    id: mute_nmn
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: NUW (Nuclear Power Plant Warning)"
+    id: mute_nuw
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: RHW (Radiological Hazard Warning)"
+    id: mute_rhw
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: SPW (Shelter in Place Warning)"
+    id: mute_spw
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: VOW (Volcano Warning)"
+    id: mute_vow
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: NEM (National Emergency Message)"
+    id: mute_nem
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: ADR (Administrative Message)"
+    id: mute_adr
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: DMO (Practice/Demo Warning)"
+    id: mute_dmo
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: RMT (Required Monthly Test)"
+    id: mute_rmt
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+  - platform: template
+    name: "SAME Allow: RWT (Required Weekly Test)"
+    id: mute_rwt
+    icon: "mdi:bell-cancel"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    disabled_by_default: true
+
 sensor:
   - platform: template
     id: same_decode_count
@@ -290,9 +826,18 @@ sensor:
             return x / total * 100.0;
 
 text_sensor:
+  # Filtered "last raw header": only alerts that pass BOTH the county filter and
+  # the per-code allow switch are published here (driven from on_alert lambda).
   - platform: template
     id: same_last_raw
     name: "SAME Last Raw Header"
+
+  # Unfiltered "show all" header: every decoded header is published here.
+  # Disabled by default.
+  - platform: template
+    id: same_last_raw_all
+    name: "SAME Last Raw Header (All)"
+    disabled_by_default: true
 
   - platform: template
     id: same_last_alert_time
@@ -341,7 +886,9 @@ same_decoder:
   eom_context_ms: 120000
   decode_watchdog_ms: 7500
   decode_count_sensor: same_decode_count
-  last_raw_sensor: same_last_raw
+  # NOTE: last_raw_sensor is intentionally UNBOUND from the C++ component so that
+  # the "SAME Last Raw Header" entity can be driven (filtered) from on_alert below.
+  # The unfiltered header is published to same_last_raw_all instead.
   on_sync:
     then:
       - script.execute: led_indicate_on
@@ -359,6 +906,7 @@ same_decoder:
   on_alert:
     then:
       - script.execute: led_indicate_off
+      # Timestamp is UNFILTERED: reflects decode activity regardless of filters.
       - lambda: |-
           auto t = id(ha_time).now();
           if (t.is_valid()) {
@@ -368,20 +916,267 @@ same_decoder:
           } else {
             ESP_LOGW("same", "Alert decoded but time not synced yet; timestamp not published.");
           }
-      - homeassistant.event:
-          event: esphome.same_alert
-          data:
-            id: !lambda 'return id(same_dec).last_alert_id();'
-            event_code: !lambda 'return id(same_dec).last_event_code();'
-            event: !lambda 'return id(same_dec).last_event_name();'
-            severity: !lambda 'return id(same_dec).last_severity();'
-            originator: !lambda 'return id(same_dec).last_originator();'
-            status: !lambda 'return id(same_dec).last_status();'
-            areas: !lambda 'return id(same_dec).last_areas_csv();'
-            onset: !lambda 'return id(same_dec).last_onset_iso();'
-            expires: !lambda 'return id(same_dec).last_expires_iso();'
-            sender: !lambda 'return id(same_dec).last_sender();'
-            raw: !lambda 'return id(same_dec).last_raw_header();'
+      # Always publish the unfiltered "show all" header.
+      - lambda: |-
+          id(same_last_raw_all).publish_state(id(same_dec).last_raw_header());
+      # Apply county + per-code filters. If both pass: publish filtered header
+      # AND fire the Home Assistant event. Otherwise, suppress delivery to HA.
+      - lambda: |-
+          // ---- Per-code allow switch lookup (ON = allow, OFF = mute) ----
+          auto allow_code = [](const std::string &code) -> bool {
+            if (code == "EAN") return id(mute_ean).state;
+            if (code == "EAT") return id(mute_eat).state;
+            if (code == "NIC") return id(mute_nic).state;
+            if (code == "NPT") return id(mute_npt).state;
+            if (code == "NAT") return id(mute_nat).state;
+            if (code == "NST") return id(mute_nst).state;
+            if (code == "BZW") return id(mute_bzw).state;
+            if (code == "CFA") return id(mute_cfa).state;
+            if (code == "CFW") return id(mute_cfw).state;
+            if (code == "DSW") return id(mute_dsw).state;
+            if (code == "EWW") return id(mute_eww).state;
+            if (code == "FFA") return id(mute_ffa).state;
+            if (code == "FFW") return id(mute_ffw).state;
+            if (code == "FFS") return id(mute_ffs).state;
+            if (code == "FLA") return id(mute_fla).state;
+            if (code == "FLW") return id(mute_flw).state;
+            if (code == "FLS") return id(mute_fls).state;
+            if (code == "FZW") return id(mute_fzw).state;
+            if (code == "HWA") return id(mute_hwa).state;
+            if (code == "HWW") return id(mute_hww).state;
+            if (code == "HUA") return id(mute_hua).state;
+            if (code == "HUW") return id(mute_huw).state;
+            if (code == "HLS") return id(mute_hls).state;
+            if (code == "HWO") return id(mute_hwo).state;
+            if (code == "MWS") return id(mute_mws).state;
+            if (code == "SVA") return id(mute_sva).state;
+            if (code == "SVR") return id(mute_svr).state;
+            if (code == "SVS") return id(mute_svs).state;
+            if (code == "SQW") return id(mute_sqw).state;
+            if (code == "SMW") return id(mute_smw).state;
+            if (code == "SPS") return id(mute_sps).state;
+            if (code == "SSA") return id(mute_ssa).state;
+            if (code == "SSW") return id(mute_ssw).state;
+            if (code == "TOA") return id(mute_toa).state;
+            if (code == "TOR") return id(mute_tor).state;
+            if (code == "TRA") return id(mute_tra).state;
+            if (code == "TRW") return id(mute_trw).state;
+            if (code == "TSA") return id(mute_tsa).state;
+            if (code == "TSW") return id(mute_tsw).state;
+            if (code == "WSA") return id(mute_wsa).state;
+            if (code == "WSW") return id(mute_wsw).state;
+            if (code == "AVA") return id(mute_ava).state;
+            if (code == "AVW") return id(mute_avw).state;
+            if (code == "BLU") return id(mute_blu).state;
+            if (code == "CAE") return id(mute_cae).state;
+            if (code == "CDW") return id(mute_cdw).state;
+            if (code == "CEM") return id(mute_cem).state;
+            if (code == "EQW") return id(mute_eqw).state;
+            if (code == "EVI") return id(mute_evi).state;
+            if (code == "FRW") return id(mute_frw).state;
+            if (code == "HMW") return id(mute_hmw).state;
+            if (code == "LEW") return id(mute_lew).state;
+            if (code == "LAE") return id(mute_lae).state;
+            if (code == "TOE") return id(mute_toe).state;
+            if (code == "NMN") return id(mute_nmn).state;
+            if (code == "NUW") return id(mute_nuw).state;
+            if (code == "RHW") return id(mute_rhw).state;
+            if (code == "SPW") return id(mute_spw).state;
+            if (code == "VOW") return id(mute_vow).state;
+            if (code == "NEM") return id(mute_nem).state;
+            if (code == "ADR") return id(mute_adr).state;
+            if (code == "DMO") return id(mute_dmo).state;
+            if (code == "RMT") return id(mute_rmt).state;
+            if (code == "RWT") return id(mute_rwt).state;
+            return true;  // unknown/unlisted code -> allow by default
+          };
+
+          // ---- County filter (compare last 5 digits, ignore P-digit) ----
+          // Returns the last-5 "SSCCC" of a 6-digit code; passes shorter codes through.
+          auto tail5 = [](const std::string &s) -> std::string {
+            if (s.size() >= 6) return s.substr(1);   // drop leading P-digit
+            return s;
+          };
+
+          std::string counties_raw = id(same_allowed_counties).state;
+          std::string areas_raw = id(same_dec).last_areas_csv();
+          std::string code = id(same_dec).last_event_code();
+
+          // Build allowed-county tail5 set from the comma-separated text entity.
+          std::vector<std::string> allowed;
+          {
+            std::string cur;
+            for (char ch : counties_raw) {
+              if (ch == ',' || ch == ' ') {
+                if (!cur.empty()) { allowed.push_back(tail5(cur)); cur.clear(); }
+              } else {
+                cur += ch;
+              }
+            }
+            if (!cur.empty()) allowed.push_back(tail5(cur));
+          }
+
+          // County passes if the allowed list is empty (no filter) OR any of the
+          // header's area codes matches (by last-5 digits) an allowed county.
+          bool county_ok = allowed.empty();
+          if (!county_ok) {
+            std::string cur;
+            std::vector<std::string> area_tails;
+            for (char ch : areas_raw) {
+              if (ch == ',' || ch == ' ') {
+                if (!cur.empty()) { area_tails.push_back(tail5(cur)); cur.clear(); }
+              } else {
+                cur += ch;
+              }
+            }
+            if (!cur.empty()) area_tails.push_back(tail5(cur));
+
+            for (auto &at : area_tails) {
+              for (auto &al : allowed) {
+                if (at == al) { county_ok = true; break; }
+              }
+              if (county_ok) break;
+            }
+          }
+
+          bool code_ok = allow_code(code);
+          bool pass = county_ok && code_ok;
+
+          ESP_LOGI("same", "Filter: code=%s code_ok=%d county_ok=%d -> %s",
+                   code.c_str(), (int) code_ok, (int) county_ok,
+                   pass ? "DELIVER" : "SUPPRESS");
+
+          if (pass) {
+            // Publish the filtered "last raw header".
+            id(same_last_raw).publish_state(id(same_dec).last_raw_header());
+            // Fire the Home Assistant event for delivered alerts only.
+            auto call = id(ha_time);  // (no-op ref to keep scope clear)
+            esphome::api::HomeassistantServiceResponse resp;  // placeholder guard
+          }
+      # Fire the HA event ONLY when filters pass. Implemented via a condition on
+      # a global set by the lambda above would be cleaner, but to keep this fully
+      # self-contained we re-evaluate the pass flag using an if/condition below.
+      - if:
+          condition:
+            lambda: |-
+              // Re-evaluate pass compactly for the HA event gate.
+              auto allow_code = [](const std::string &code) -> bool {
+                if (code == "EAN") return id(mute_ean).state;
+                if (code == "EAT") return id(mute_eat).state;
+                if (code == "NIC") return id(mute_nic).state;
+                if (code == "NPT") return id(mute_npt).state;
+                if (code == "NAT") return id(mute_nat).state;
+                if (code == "NST") return id(mute_nst).state;
+                if (code == "BZW") return id(mute_bzw).state;
+                if (code == "CFA") return id(mute_cfa).state;
+                if (code == "CFW") return id(mute_cfw).state;
+                if (code == "DSW") return id(mute_dsw).state;
+                if (code == "EWW") return id(mute_eww).state;
+                if (code == "FFA") return id(mute_ffa).state;
+                if (code == "FFW") return id(mute_ffw).state;
+                if (code == "FFS") return id(mute_ffs).state;
+                if (code == "FLA") return id(mute_fla).state;
+                if (code == "FLW") return id(mute_flw).state;
+                if (code == "FLS") return id(mute_fls).state;
+                if (code == "FZW") return id(mute_fzw).state;
+                if (code == "HWA") return id(mute_hwa).state;
+                if (code == "HWW") return id(mute_hww).state;
+                if (code == "HUA") return id(mute_hua).state;
+                if (code == "HUW") return id(mute_huw).state;
+                if (code == "HLS") return id(mute_hls).state;
+                if (code == "HWO") return id(mute_hwo).state;
+                if (code == "MWS") return id(mute_mws).state;
+                if (code == "SVA") return id(mute_sva).state;
+                if (code == "SVR") return id(mute_svr).state;
+                if (code == "SVS") return id(mute_svs).state;
+                if (code == "SQW") return id(mute_sqw).state;
+                if (code == "SMW") return id(mute_smw).state;
+                if (code == "SPS") return id(mute_sps).state;
+                if (code == "SSA") return id(mute_ssa).state;
+                if (code == "SSW") return id(mute_ssw).state;
+                if (code == "TOA") return id(mute_toa).state;
+                if (code == "TOR") return id(mute_tor).state;
+                if (code == "TRA") return id(mute_tra).state;
+                if (code == "TRW") return id(mute_trw).state;
+                if (code == "TSA") return id(mute_tsa).state;
+                if (code == "TSW") return id(mute_tsw).state;
+                if (code == "WSA") return id(mute_wsa).state;
+                if (code == "WSW") return id(mute_wsw).state;
+                if (code == "AVA") return id(mute_ava).state;
+                if (code == "AVW") return id(mute_avw).state;
+                if (code == "BLU") return id(mute_blu).state;
+                if (code == "CAE") return id(mute_cae).state;
+                if (code == "CDW") return id(mute_cdw).state;
+                if (code == "CEM") return id(mute_cem).state;
+                if (code == "EQW") return id(mute_eqw).state;
+                if (code == "EVI") return id(mute_evi).state;
+                if (code == "FRW") return id(mute_frw).state;
+                if (code == "HMW") return id(mute_hmw).state;
+                if (code == "LEW") return id(mute_lew).state;
+                if (code == "LAE") return id(mute_lae).state;
+                if (code == "TOE") return id(mute_toe).state;
+                if (code == "NMN") return id(mute_nmn).state;
+                if (code == "NUW") return id(mute_nuw).state;
+                if (code == "RHW") return id(mute_rhw).state;
+                if (code == "SPW") return id(mute_spw).state;
+                if (code == "VOW") return id(mute_vow).state;
+                if (code == "NEM") return id(mute_nem).state;
+                if (code == "ADR") return id(mute_adr).state;
+                if (code == "DMO") return id(mute_dmo).state;
+                if (code == "RMT") return id(mute_rmt).state;
+                if (code == "RWT") return id(mute_rwt).state;
+                return true;
+              };
+              auto tail5 = [](const std::string &s) -> std::string {
+                if (s.size() >= 6) return s.substr(1);
+                return s;
+              };
+              std::string counties_raw = id(same_allowed_counties).state;
+              std::string areas_raw = id(same_dec).last_areas_csv();
+              std::string code = id(same_dec).last_event_code();
+              std::vector<std::string> allowed;
+              {
+                std::string cur;
+                for (char ch : counties_raw) {
+                  if (ch == ',' || ch == ' ') {
+                    if (!cur.empty()) { allowed.push_back(tail5(cur)); cur.clear(); }
+                  } else { cur += ch; }
+                }
+                if (!cur.empty()) allowed.push_back(tail5(cur));
+              }
+              bool county_ok = allowed.empty();
+              if (!county_ok) {
+                std::string cur;
+                std::vector<std::string> area_tails;
+                for (char ch : areas_raw) {
+                  if (ch == ',' || ch == ' ') {
+                    if (!cur.empty()) { area_tails.push_back(tail5(cur)); cur.clear(); }
+                  } else { cur += ch; }
+                }
+                if (!cur.empty()) area_tails.push_back(tail5(cur));
+                for (auto &at : area_tails) {
+                  for (auto &al : allowed) {
+                    if (at == al) { county_ok = true; break; }
+                  }
+                  if (county_ok) break;
+                }
+              }
+              return county_ok && allow_code(code);
+          then:
+            - homeassistant.event:
+                event: esphome.same_alert
+                data:
+                  id: !lambda 'return id(same_dec).last_alert_id();'
+                  event_code: !lambda 'return id(same_dec).last_event_code();'
+                  event: !lambda 'return id(same_dec).last_event_name();'
+                  severity: !lambda 'return id(same_dec).last_severity();'
+                  originator: !lambda 'return id(same_dec).last_originator();'
+                  status: !lambda 'return id(same_dec).last_status();'
+                  areas: !lambda 'return id(same_dec).last_areas_csv();'
+                  onset: !lambda 'return id(same_dec).last_onset_iso();'
+                  expires: !lambda 'return id(same_dec).last_expires_iso();'
+                  sender: !lambda 'return id(same_dec).last_sender();'
+                  raw: !lambda 'return id(same_dec).last_raw_header();'
   on_eom:
     then:
       - script.execute: led_indicate_off
