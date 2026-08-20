@@ -391,6 +391,8 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "  Timeout (>=2 bursts): %" PRIu32 " ms", this->timeout_ms_.load(std::memory_order_relaxed));
   ESP_LOGCONFIG(TAG, "  Single-burst min: %" PRIu32 " ms", this->single_burst_min_ms_);
   ESP_LOGCONFIG(TAG, "  Post-emit dead-time: %" PRIu32 " ms", this->post_emit_dead_ms_);
+  ESP_LOGCONFIG(TAG, "  Re-emit suppress window (cross-session): %" PRIu32 " ms",
+                this->resend_suppress_ms_.load(std::memory_order_relaxed));
   ESP_LOGCONFIG(TAG, "  Alert triggers: %u  sync: %u  eom: %u  preamble: %u",
                 (unsigned) this->alert_triggers_.size(), (unsigned) this->sync_triggers_.size(),
                 (unsigned) this->eom_triggers_.size(), (unsigned) this->preamble_triggers_.size());
@@ -1195,27 +1197,36 @@ void SAMEDecoder::vote_and_emit_(bool from_timeout, bool fallback_synced) {
   }
 
   uint32_t now = millis();
+  uint32_t resend_win = this->resend_suppress_ms_.load(std::memory_order_relaxed);
 
   if (!this->session_emitted_header_.empty()) {
     if (this->session_emitted_header_ == header) {
-      ESP_LOGD(TAG, "Session duplicate suppressed.");
+      uint32_t age = (uint32_t) (now - this->last_global_ms_);
+      ESP_LOGD(TAG, "Session duplicate suppressed (in-transmission; %" PRIu32 " ms since emit).", age);
       this->decode_active_ = false;
       this->fire_eom_();
       return;
     }
     ESP_LOGI(TAG, "Session consensus changed; reissuing.");
   } else {
+    uint32_t age = (uint32_t) (now - this->last_global_ms_);
+    bool within_window = (resend_win > 0) && (age <= resend_win);
     bool immediate_same = (!this->last_global_header_.empty()) &&
                           (this->last_global_header_ == header) &&
-                          ((uint32_t) (now - this->last_global_ms_) <= IMMEDIATE_DUP_MS);
+                          within_window;
     if (immediate_same) {
-      ESP_LOGD(TAG, "Immediate duplicate suppressed.");
+      ESP_LOGD(TAG, "Cross-session duplicate suppressed (%" PRIu32 " ms since emit, window %" PRIu32 " ms).",
+               age, resend_win);
       this->session_emitted_header_ = header;
       this->last_global_header_ = header;
       this->last_global_ms_ = now;
       this->decode_active_ = false;
       this->fire_eom_();
       return;
+    }
+    if ((!this->last_global_header_.empty()) && (this->last_global_header_ == header)) {
+      ESP_LOGI(TAG, "Identical header past re-emit window (%" PRIu32 " ms > %" PRIu32 " ms); re-emitting.",
+               age, resend_win);
     }
   }
 
