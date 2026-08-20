@@ -1,8 +1,7 @@
 # =============================================================================
 #  NOAA Weather Radio SAME Decoder - AI-Thinker ESP32-Audio-Kit (ESP32-A1S / ES8388)
-#  Redesign: preamble-locked fixed-phase sampler (primary) + automatic
-#  confidence-triggered closed-loop tracker (fallback). Timing locks on the
-#  0xAB preamble ("set asynchronous decoder clocking cycles", 47 CFR 11.31).
+#  Get NOAA Weather Radio SAME alerts in Home Assistant via ESPHome
+#  Source, disclaimers, and more: https://github.com/infinitytec/ESPHome-SAME-Decoder
 # =============================================================================
 
 substitutions:
