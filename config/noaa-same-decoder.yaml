@@ -319,7 +319,7 @@ same_decoder:
   # --- EOM / watchdog ---
   eom_require_context: true
   eom_context_ms: 120000
-  decode_watchdog_ms: 10000
+  decode_watchdog_ms: 7500
   decode_count_sensor: same_decode_count
   last_raw_sensor: same_last_raw
   on_sync:
