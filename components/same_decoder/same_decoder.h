@@ -155,6 +155,8 @@ class SAMEDecoder : public Component {
   uint32_t get_timeout_ms() const { return this->timeout_ms_.load(std::memory_order_relaxed); }
   void set_single_burst_min_ms(uint32_t v) { this->single_burst_min_ms_ = v; }
   void set_post_emit_dead_ms(uint32_t v) { this->post_emit_dead_ms_ = v; }
+  void set_resend_suppress_ms(uint32_t v) { this->resend_suppress_ms_.store(v, std::memory_order_relaxed); }
+  uint32_t get_resend_suppress_ms() const { return this->resend_suppress_ms_.load(std::memory_order_relaxed); }
 
   // --- Preamble-lock parameter setters ---
   void set_preamble_lock_bits(int v) { this->preamble_lock_bits_ = v; }
@@ -265,7 +267,11 @@ class SAMEDecoder : public Component {
   std::string session_emitted_header_;
   std::string last_global_header_;
   uint32_t last_global_ms_{0};
-  static constexpr uint32_t IMMEDIATE_DUP_MS = 3000;
+  // Cross-session re-emit window. Replaces the fixed IMMEDIATE_DUP_MS. Tunable
+  // at runtime from Home Assistant (0 .. 900000 ms). 0 => never suppress
+  // cross-session repeats. In-transmission repeats are always collapsed by the
+  // (untimed) session_emitted_header_ key, independent of this value.
+  std::atomic<uint32_t> resend_suppress_ms_{3000};
 
   std::atomic<uint32_t> last_feed_ms_{0};
   static constexpr uint32_t FEED_GAP_MS = 250;
