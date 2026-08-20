@@ -7,6 +7,13 @@
 //    performs a ONE-SHOT phase snap: it aligns phase_ to bit-center using a
 //    sub-bit offset search over recent preamble bit-periods. It still NEVER
 //    touches w_off_ (frequency remains bumpless); only phase_ is adjusted, once.
+//    PREAMBLE QUALIFIER (v5): the bit-centered one-bit Goertzel makes each clean
+//    preamble bit a SINGLE tone, so per-bit mark/space "balance" is ~0.99 (NOT
+//    balanced). The old balanced<max gate therefore never qualified and lock
+//    never fired. The qualifier is now tone-present + high per-bit confidence +
+//    alternation (bits mostly toggle, tolerating 0xAB's occasional double). The
+//    preamble_balance_max_ setting is retained for config compatibility but is
+//    no longer used as a hard gate.
 //  * TRACKING: a signed early-late timing loop stays alive for the entire
 //    session (gated by a soft, low-threshold confidence gate, with the update
 //    weighted by confidence) so the sampler is never open-loop between lock and
@@ -103,6 +110,7 @@ class SAMEDecoder : public Component {
   // --- Preamble-lock parameter setters ---
   void set_preamble_lock_bits(int v) { this->preamble_lock_bits_ = v; }
   void set_preamble_energy_mult(float v) { this->preamble_energy_mult_.store(v, std::memory_order_relaxed); }
+  // Retained for config compatibility; no longer a hard gate (see v5 note).
   void set_preamble_balance_max(float v) { this->preamble_balance_max_ = v; }
   void set_lock_confidence_min(float v) { this->lock_confidence_min_ = v; }
   void set_residual_drift_ppm(float v) { this->residual_drift_ppm_ = v; }
@@ -155,7 +163,8 @@ class SAMEDecoder : public Component {
   // Update the preamble correlator with the current bit-period tone energies and
   // the just-decided bit; declares/refreshes lock. On the transition into lock
   // it arms a ONE-SHOT sub-bit phase snap (see request_phase_snap_); it never
-  // touches w_off_ (frequency remains bumpless).
+  // touches w_off_ (frequency remains bumpless). v5: qualifier is tone-present +
+  // high per-bit confidence + alternation (not per-bit mark/space balance).
   void update_preamble_lock_(float mark_e, float space_e, bool bit, float llr);
   // Full teardown: clears timing state AND last_lock_ms_ (message boundaries).
   void reset_preamble_lock_();
@@ -269,11 +278,11 @@ class SAMEDecoder : public Component {
   static constexpr float AGC_RELEASE = 0.0002f;
 
   // Hysteretic + dwell gate for the always-on timing loop. Raised thresholds
-  // (item 5) so intermittent voice formants cannot chatter the gate open on
-  // non-signal audio: a clean SAME preamble/header sits at conf ~0.8-0.99 and
-  // clears these easily, while continuous NWR voice rarely sustains conf above
-  // TR_CONF_ENGAGE for TR_GATE_DWELL consecutive bits. The per-update magnitude
-  // is also weighted by confidence in feed_sample_(); the integral path uses a
+  // so intermittent voice formants cannot chatter the gate open on non-signal
+  // audio: a clean SAME preamble/header sits at conf ~0.8-0.99 and clears these
+  // easily, while continuous NWR voice rarely sustains conf above TR_CONF_ENGAGE
+  // for TR_GATE_DWELL consecutive bits. The per-update magnitude is also
+  // weighted by confidence in feed_sample_(); the integral path uses a
   // confidence FLOOR (on-signal) so it never freezes during real payload runs.
   static constexpr float TR_CONF_ENGAGE = 0.35f;   // open gate above this
   static constexpr float TR_CONF_RELEASE = 0.25f;  // close gate below this
@@ -289,7 +298,7 @@ class SAMEDecoder : public Component {
   bool tr_gate_open_{false};   // gate currently open (timing loop active)
   int  tr_gate_run_{0};        // consecutive high-conf bits toward opening
 
-  // --- Idle / off-signal hardening (items 1-5) ---
+  // --- Idle / off-signal hardening ---
   // The INTEGRAL (w_off_) update runs ONLY when a real burst is in progress
   // (lock effective OR CAPTURE). Off-signal it never integrates and instead
   // DRAINS toward 0 with the stronger unlocked leak, held inside a tighter
@@ -313,68 +322,59 @@ class SAMEDecoder : public Component {
   uint32_t samples_seen_{0};
 
   float last_bit_llr_{0.0f};
-  SoftBurst soft_bursts_[3];
+  SoftBurst soft_bursts_;
   SoftBurst soft_cur_;
   static constexpr float LLR_EPS = 1.0f;
   int bad_char_run_{0};
 
   // ---------------- Debug telemetry (read-only; does NOT affect timing) -------
-  // Per-bit lines are emitted at VERBOSE; a rolling summary at DEBUG every
-  // DBG_SUMMARY_EVERY bits (DBG_SUMMARY_EVERY is a file-scope constant in the
-  // .cpp). All accumulators are fixed-size (no allocation).
+  // A rolling summary is emitted at DEBUG every DBG_SUMMARY_EVERY bits (file-
+  // scope constant in the .cpp). Fixed-size accumulators (no allocation).
   uint32_t dbg_bit_count_{0};
   float    dbg_conf_accum_{0.0f};
   uint16_t dbg_conf_n_{0};
   float    dbg_last_conf_{0.0f};
 
-  // Per-bit VERBOSE telemetry decimation: only 1 in DBG_DECIM_K updated bits is
-  // logged, capping the line rate (~520/8 ~= 65 lines/sec) so VERBOSE cannot
-  // flood the transport and starve mic_task (which previously faulted the MCU).
-  static constexpr uint32_t DBG_DECIM_K = 8;
-  uint32_t dbg_decim_{0};
-
-  // ---------------- Sample-rate self-measurement (read-only diagnostic) -------
-  // Confirms the effective audio rate the decoder is actually receiving. Raw
-  // samples are counted in feed_bytes (NOT feed_sample_, which can early-return
-  // during post-emit dead-time). Once per ~second we log the measured Hz; if it
-  // is far from the configured sample_rate_ (e.g. ~44100 vs 48000), the bit
-  // clock is fundamentally mis-scaled and NO w_off_ correction can compensate.
-  uint32_t sr_meas_samples_{0};   // raw samples fed since last measurement
-  uint32_t sr_meas_last_ms_{0};   // millis() of last measurement (0 = uninit)
-
   // ---------------- Preamble-lock diagnostic (read-only; throttled) -----------
-  // Logs WHICH gate (tone / balance / confidence) is blocking preamble lock.
-  // Throttled to reason-changes + every PRE_DIAG_EVERY calls so it cannot flood
-  // at 520 Hz. Purely observational; touches no DSP or lock state. Expected
-  // finding with bit-centered detection: each clean preamble bit is a single
-  // tone, so balance = |m-s|/(m+s) ~ 0.99 FAILS the 'balanced' gate.
-  static constexpr int PRE_DIAG_EVERY = 32;
+  // Logs the preamble qualifier state while HUNTING so lock behaviour is
+  // observable. Emitted before the CAPTURE early-return so it is reliably
+  // reached; throttled to reason-changes + every PRE_DIAG_EVERY hunting bits.
+  static constexpr int PRE_DIAG_EVERY = 64;
   int  pre_diag_bits_{0};
   bool pre_diag_last_qual_{false};
-  bool pre_diag_last_bal_{false};
   bool pre_diag_last_tone_{false};
-  int  pre_diag_last_run_{0};
+  bool pre_diag_last_alt_{false};
 
-  // ---------------- Preamble lock state (redesign) ----------------
-  // The preamble is 0xAB = 10101011 repeated; LSB-first that is a regular
-  // alternating-ish transition pattern. We qualify each bit-period as a valid
-  // preamble bit-period when: (a) tone energy exceeds preamble_energy_mult_ over
-  // the adaptive noise floor, and (b) mark/space are sufficiently balanced
-  // across the alternation (|m-s|/(m+s) < preamble_balance_max_). When a run of
-  // >= preamble_lock_bits_ qualifying bit-periods is seen at mean |LLR| >=
-  // lock_confidence_min_, we declare LOCK and arm a ONE-SHOT phase snap that
-  // aligns phase_ to bit-center (frequency/w_off_ untouched -- still bumpless).
-  // The lock is CARRIED across the ~1s inter-burst gap (see LOCK_HOLD_MS); it is
-  // fully torn down on emit/EOM/watchdog/feed-gap.
-  //
-  // NOTE (diagnostic in progress): the 'balanced' gate above is suspected to be
-  // incompatible with bit-centered detection (clean preamble bits are single
-  // tones => high imbalance). The PRE diag logging confirms this before any fix.
+  // ---------------- Preamble lock state (redesign, v5 qualifier) --------------
+  // The preamble is 0xAB = 10101011 repeated. With bit-centered detection each
+  // clean preamble bit is a SINGLE tone, so we qualify a bit-period when:
+  //   (a) tone energy exceeds preamble_energy_mult_ over the adaptive floor,
+  //   (b) per-bit confidence |LLR| is high (clean tone), and
+  //   (c) the bit stream is ALTERNATING (a running score that rises on toggles
+  //       and decays on repeats, tolerant of 0xAB's occasional double-bit).
+  // When a run of >= preamble_lock_bits_ qualifying bit-periods is seen at mean
+  // |LLR| >= lock_confidence_min_, we declare LOCK and arm a ONE-SHOT phase snap
+  // (frequency/w_off_ untouched -- still bumpless). Lock is CARRIED across the
+  // ~1s inter-burst gap (LOCK_HOLD_MS); torn down on emit/EOM/watchdog/feed-gap.
   int preamble_lock_bits_{32};
   std::atomic<float> preamble_energy_mult_{8.0f};
-  float preamble_balance_max_{0.40f};
+  float preamble_balance_max_{0.40f};   // retained for config compat; not gated
   float lock_confidence_min_{0.5f};
   float residual_drift_ppm_{2000.0f};
+
+  // v5 qualifier tuning.
+  //  PRE_CONF_MIN     : per-bit conf |m-s|/(m+s) required for a "clean tone" bit
+  //                     (a real preamble bit is ~0.9-1.0; voice rarely sustains).
+  //  PRE_ALT_UP/DOWN  : alternation score step on toggle / on repeat.
+  //  PRE_ALT_MAX      : alternation score clamp.
+  //  PRE_ALT_OK       : alternation score above which the stream is "alternating".
+  static constexpr float PRE_CONF_MIN = 0.60f;
+  static constexpr int   PRE_ALT_UP = 3;
+  static constexpr int   PRE_ALT_DOWN = 2;
+  static constexpr int   PRE_ALT_MAX = 30;
+  static constexpr int   PRE_ALT_OK = 12;
+  int  pre_alt_score_{0};      // running alternation score (0..PRE_ALT_MAX)
+  int  pre_last_bit_{-1};      // previous decided bit (-1 = none yet)
 
   float pre_noise_floor_{1.0f};
   static constexpr float PRE_FLOOR_ALPHA = 0.01f;
@@ -386,9 +386,6 @@ class SAMEDecoder : public Component {
   int byte_phase_{0};           // reserved/diagnostic; not used by the payload path
 
   // --- Phase-snap state (one-shot bit-center alignment) ---
-  // last_centers_ holds the ring index of recent decided bit-centers (absolute
-  // sample index of the bit instant). A small history is enough for the snap
-  // search; RINGLEN=256 safely covers the last two centers plus GWIN/TR_DELTA.
   static constexpr int SNAP_CENTERS = 4;      // capacity of the recent-center log
   static constexpr int SNAP_USE = 2;          // centers actually used in the search
   static constexpr int SNAP_THETA_MAX = HALF_BEFORE;  // +/- search span in samples
@@ -458,12 +455,12 @@ class SAMEDecoder : public Component {
   // locked. Such a capture can never emit on its own and must pass strict
   // structural validation + 2-of-3 corroboration before it counts.
   bool cur_low_trust_{false};                     // current in-progress capture
-  bool burst_low_trust_[3]{false, false, false};  // per-collected-burst flag
+  bool burst_low_trust_{false, false, false};  // per-collected-burst flag
 
   uint8_t cur_byte_{0};
   int cur_nbits_{0};
   std::string cur_burst_;
-  std::string bursts_[3];
+  std::string bursts_;
   int burst_idx_{0};
   static constexpr int MAX_HEADER_BYTES = 268;
 
