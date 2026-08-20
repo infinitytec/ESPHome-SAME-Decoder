@@ -8,11 +8,13 @@
 // never run open-loop between lock and ZCZC. The early-late discriminator is
 // DECISION-DIRECTED (symbol-invariant): it is multiplied by the decided-bit
 // sign so the timing gradient points the same way on mark and space bits and
-// cannot cancel on mixed payload. The Goertzel window is one full bit long and
-// centered on the bit instant via a fixed decision delay, maximizing mark/space
-// discrimination. w_off_ is reset only on true session boundaries
-// (emit/EOM/watchdog/feed-gap), preserving the converged timing correction that
-// keeps the sampler on bit-center through the payload.
+// cannot cancel on mixed payload. The INTEGRAL (rate) term runs only while a
+// real burst is in progress (lock effective or CAPTURE); off-signal it drains
+// toward zero with anti-windup so voice/noise cannot rail w_off_. The Goertzel
+// window is one full bit long and centered on the bit instant via a fixed
+// decision delay, maximizing mark/space discrimination. w_off_ is reset only on
+// true session boundaries (emit/EOM/watchdog/feed-gap), preserving the converged
+// timing correction that keeps the sampler on bit-center through the payload.
 
 #include "same_decoder.h"
 #include "same_soft.h"
@@ -196,6 +198,8 @@ void SAMEDecoder::dump_config() {
   ESP_LOGCONFIG(TAG, "  Residual-drift trim: %.0f ppm of bit period", this->residual_drift_ppm_);
   ESP_LOGCONFIG(TAG, "  Timing gate: engage conf>=%.2f, release conf<%.2f, dwell %d (confidence-weighted, KI floor %.2f, leak %.0e)",
                 TR_CONF_ENGAGE, TR_CONF_RELEASE, TR_GATE_DWELL, TR_CONF_FLOOR, (double) TR_WOFF_LEAK);
+  ESP_LOGCONFIG(TAG, "    Integral gated on lock/CAPTURE; off-signal drain leak %.0e, clamp frac %.2f, anti-windup beta %.2f",
+                (double) TR_WOFF_LEAK_UNLOCKED, TR_WOFF_CLAMP_UNLOCKED_FRAC, TR_ANTI_WINDUP_BETA);
   ESP_LOGCONFIG(TAG, "  Timing loop: decision-directed early-late; acq Kp=%.4f Ki=%.5f -> track Kp=%.4f Ki=%.5f after %d bits",
                 ACQ_KP, ACQ_KI, this->fallback_kp_, this->fallback_ki_, N_GOOD_TO_TRACK);
   ESP_LOGCONFIG(TAG, "    Telemetry: per-bit at VERBOSE (updates only, 1-in-%" PRIu32 " decimated), summary every %" PRIu32 " bits at DEBUG.",
@@ -574,11 +578,9 @@ void SAMEDecoder::feed_sample_(int16_t s) {
     this->fallback_active_ = false;
   }
 
-  // Hysteretic + dwell confidence gate for the ALWAYS-ON timing loop. Engages
-  // early (low thresholds) but, once open, holds through low-confidence payload
-  // runs via a lower release threshold + multi-bit dwell so the loop never runs
-  // open-loop between lock and ZCZC or through payload. This keeps the sampler
-  // tracked while preventing idle noise from walking the phase.
+  // Hysteretic + dwell confidence gate for the ALWAYS-ON timing loop. Raised
+  // thresholds resist voice-formant chatter on non-signal audio; a real SAME
+  // preamble/header (conf ~0.8-0.99) clears them easily.
   if (!this->tr_gate_open_) {
     if (conf >= TR_CONF_ENGAGE) {
       if (++this->tr_gate_run_ >= TR_GATE_DWELL)
@@ -599,6 +601,18 @@ void SAMEDecoder::feed_sample_(int16_t s) {
   bool dbg_acquiring = (this->good_bits_since_lock_ < N_GOOD_TO_TRACK);
   bool dbg_clamp_hit = false;
   bool dbg_updated = false;
+
+  // A real SAME burst is in progress when we hold an effective preamble lock OR
+  // are already capturing the payload. The INTEGRAL (rate) term only runs in
+  // that window; off-signal (voice/noise hunting) it must NOT integrate, or the
+  // loop winds w_off_ to the rail chasing formants. lock precedes ZCZC and
+  // CAPTURE covers the payload, so a genuine burst is still fully tracked.
+  const bool locked_or_capture =
+      this->lock_is_effective_() || (this->phase_state_ == CAPTURE);
+  // Effective rate clamp: full range on-signal, tighter off-signal (item 3).
+  const float eff_clamp = locked_or_capture
+                              ? this->tr_woff_clamp_
+                              : this->tr_woff_clamp_ * TR_WOFF_CLAMP_UNLOCKED_FRAC;
 
   if (primed && this->tr_gate_open_) {
     float em_e = goertzel_ring_end(this->ring_, RINGLEN, t_early, GWIN, this->coeff_mark_);
@@ -630,24 +644,45 @@ void SAMEDecoder::feed_sample_(int16_t s) {
     float kp = acquiring ? ACQ_KP : this->fallback_kp_;
     float ki = acquiring ? ACQ_KI : this->fallback_ki_;
 
+    // PROPORTIONAL (phase) update is UNGATED w.r.t. lock/capture: it is bounded
+    // per-bit (TR_DPHI_CLAMP) and does NOT accumulate, so running it whenever
+    // the confidence gate is open is harmless and keeps the loop instantly
+    // responsive the moment a real signal appears.
     float dphi = kp * conf * e;
     if (dphi >  TR_DPHI_CLAMP) dphi =  TR_DPHI_CLAMP;
     if (dphi < -TR_DPHI_CLAMP) dphi = -TR_DPHI_CLAMP;
     this->phase_ += dphi;
 
-    // Integral (rate) path uses a FLOORED confidence so w_off_ keeps tracking
-    // slow drift through low-confidence payload runs instead of freezing. A very
-    // slow leak pulls w_off_ toward zero if the loop is starved of good timing
-    // information for a long time, preventing unbounded wander. The update is
-    // computed exactly as: w_off_ += ki*conf_ki*e; then w_off_ -= leak*w_off_;
-    // we only stage it in a temporary to observe clamp saturation for telemetry.
-    float conf_ki = (conf > TR_CONF_FLOOR) ? conf : TR_CONF_FLOOR;
-    float w_tmp = this->w_off_ + ki * conf_ki * e;
-    w_tmp -= TR_WOFF_LEAK * w_tmp;
-    dbg_clamp_hit = (w_tmp > this->tr_woff_clamp_) || (w_tmp < -this->tr_woff_clamp_);
-    this->w_off_ = w_tmp;
-    if (this->w_off_ >  this->tr_woff_clamp_) this->w_off_ =  this->tr_woff_clamp_;
-    if (this->w_off_ < -this->tr_woff_clamp_) this->w_off_ = -this->tr_woff_clamp_;
+    if (locked_or_capture) {
+      // INTEGRAL (rate) path -- ON-SIGNAL ONLY. Floored confidence so w_off_
+      // keeps tracking slow drift through low-confidence payload runs; a very
+      // slow leak prevents long-term wander. Back-calculation anti-windup
+      // (item 2): on saturation we bleed the overshoot by TR_ANTI_WINDUP_BETA
+      // so the integrator sits just inside the rail and recovers instantly when
+      // e reverses, instead of welding to +/-clamp.
+      float conf_ki = (conf > TR_CONF_FLOOR) ? conf : TR_CONF_FLOOR;
+      float w_unclamped = this->w_off_ + ki * conf_ki * e;
+      w_unclamped -= TR_WOFF_LEAK * w_unclamped;
+
+      bool saturated = (w_unclamped > eff_clamp) || (w_unclamped < -eff_clamp);
+      dbg_clamp_hit = saturated;
+      if (saturated) {
+        float w_sat = (w_unclamped > 0.0f) ? eff_clamp : -eff_clamp;
+        this->w_off_ = w_sat - TR_ANTI_WINDUP_BETA * (w_unclamped - w_sat);
+        if (this->w_off_ >  eff_clamp) this->w_off_ =  eff_clamp;
+        if (this->w_off_ < -eff_clamp) this->w_off_ = -eff_clamp;
+      } else {
+        this->w_off_ = w_unclamped;
+      }
+    } else {
+      // OFF-SIGNAL: never integrate. Drain w_off_ toward 0 with the stronger
+      // unlocked leak (item 4) and hold it inside the tighter unlocked clamp
+      // (item 3) so noise-accumulated offset bleeds away quickly.
+      dbg_clamp_hit = (this->w_off_ > eff_clamp) || (this->w_off_ < -eff_clamp);
+      this->w_off_ -= TR_WOFF_LEAK_UNLOCKED * this->w_off_;
+      if (this->w_off_ >  eff_clamp) this->w_off_ =  eff_clamp;
+      if (this->w_off_ < -eff_clamp) this->w_off_ = -eff_clamp;
+    }
 
     if (conf >= TR_CONF_ENGAGE && this->good_bits_since_lock_ < 0x7fffffff)
       this->good_bits_since_lock_++;
@@ -656,9 +691,19 @@ void SAMEDecoder::feed_sample_(int16_t s) {
     dbg_dphi = dphi;
     dbg_acquiring = acquiring;
     dbg_updated = true;
+  } else {
+    // Gate closed (or not primed). On-signal we HOLD w_off_ (bumpless -- the
+    // converged rate correction must persist through low-confidence runs and
+    // the inter-burst gap). Off-signal we keep DRAINING toward 0 so a noise-
+    // accumulated offset cannot linger into the next real burst.
+    if (!locked_or_capture) {
+      this->w_off_ -= TR_WOFF_LEAK_UNLOCKED * this->w_off_;
+      if (this->w_off_ >  eff_clamp) this->w_off_ =  eff_clamp;
+      if (this->w_off_ < -eff_clamp) this->w_off_ = -eff_clamp;
+    }
   }
-  // When the gate is closed we HOLD w_off_ (bumpless) -- no bleed, no reset.
-  // It is only zeroed on true session boundaries (reset_preamble_lock_/feed-gap).
+  // w_off_ is only zeroed on true session boundaries (reset_preamble_lock_/
+  // feed-gap); on-signal gate-closed HOLD keeps it bumpless.
 
   // ---- Per-bit VERBOSE telemetry (read-only). GATED to updated bits only and
   // DECIMATED 1-in-DBG_DECIM_K so it cannot flood the transport at 520 Hz (that
