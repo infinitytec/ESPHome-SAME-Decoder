@@ -285,6 +285,9 @@ class SAMEDecoder : public Component {
   // Very slow leak on w_off_ toward zero WHILE ON-SIGNAL (locked/CAPTURE),
   // preventing unbounded wander if the loop is briefly starved of good timing.
   static constexpr float TR_WOFF_LEAK = 1e-4f;
+  // Runtime state for the hysteretic timing gate (driven in feed_sample_).
+  bool tr_gate_open_{false};   // gate currently open (timing loop active)
+  int  tr_gate_run_{0};        // consecutive high-conf bits toward opening
 
   // --- Idle / off-signal hardening (items 1-5) ---
   // The INTEGRAL (w_off_) update runs ONLY when a real burst is in progress
