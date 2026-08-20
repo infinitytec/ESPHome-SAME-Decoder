@@ -256,6 +256,7 @@ number:
     restore_value: true
     initial_value: 3
     entity_category: diagnostic
+    disabled_by_default: true
     set_action:
       - lambda: 'id(same_dec).set_resend_suppress_ms((uint32_t) (x * 1000.0f));'
 
@@ -288,7 +289,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: EAT (Emergency Action Termination)"
     id: mute_eat
@@ -296,7 +296,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: NIC (National Information Center)"
     id: mute_nic
@@ -304,7 +303,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: NPT (National Periodic Test)"
     id: mute_npt
@@ -312,7 +310,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: NAT (National Audible Test)"
     id: mute_nat
@@ -320,7 +317,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: NST (National Silent Test)"
     id: mute_nst
@@ -328,7 +324,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: BZW (Blizzard Warning)"
     id: mute_bzw
@@ -336,7 +331,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: CFA (Coastal Flood Watch)"
     id: mute_cfa
@@ -344,7 +338,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: CFW (Coastal Flood Warning)"
     id: mute_cfw
@@ -352,7 +345,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: DSW (Dust Storm Warning)"
     id: mute_dsw
@@ -360,7 +352,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: EWW (Extreme Wind Warning)"
     id: mute_eww
@@ -368,7 +359,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: FFA (Flash Flood Watch)"
     id: mute_ffa
@@ -376,7 +366,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: FFW (Flash Flood Warning)"
     id: mute_ffw
@@ -384,7 +373,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: FFS (Flash Flood Statement)"
     id: mute_ffs
@@ -392,7 +380,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: FLA (Flood Watch)"
     id: mute_fla
@@ -400,7 +387,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: FLW (Flood Warning)"
     id: mute_flw
@@ -408,7 +394,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: FLS (Flood Statement)"
     id: mute_fls
@@ -416,7 +401,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: FZW (Freeze Warning)"
     id: mute_fzw
@@ -424,7 +408,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: HWA (High Wind Watch)"
     id: mute_hwa
@@ -432,7 +415,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: HWW (High Wind Warning)"
     id: mute_hww
@@ -440,7 +422,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: HUA (Hurricane Watch)"
     id: mute_hua
@@ -448,7 +429,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: HUW (Hurricane Warning)"
     id: mute_huw
@@ -456,7 +436,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: HLS (Hurricane Statement)"
     id: mute_hls
@@ -464,7 +443,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: HWO (Severe Weather Statement Outlook)"
     id: mute_hwo
@@ -472,7 +450,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: MWS (Marine Weather Statement)"
     id: mute_mws
@@ -480,7 +457,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: SVA (Severe Thunderstorm Watch)"
     id: mute_sva
@@ -488,7 +464,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: SVR (Severe Thunderstorm Warning)"
     id: mute_svr
@@ -496,7 +471,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: SVS (Severe Weather Statement)"
     id: mute_svs
@@ -504,7 +478,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: SQW (Snow Squall Warning)"
     id: mute_sqw
@@ -512,7 +485,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: SMW (Special Marine Warning)"
     id: mute_smw
@@ -520,7 +492,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: SPS (Special Weather Statement)"
     id: mute_sps
@@ -528,7 +499,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: SSA (Storm Surge Watch)"
     id: mute_ssa
@@ -536,7 +506,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: SSW (Storm Surge Warning)"
     id: mute_ssw
@@ -544,7 +513,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: TOA (Tornado Watch)"
     id: mute_toa
@@ -552,7 +520,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: TOR (Tornado Warning)"
     id: mute_tor
@@ -560,7 +527,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: TRA (Tropical Storm Watch)"
     id: mute_tra
@@ -568,7 +534,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: TRW (Tropical Storm Warning)"
     id: mute_trw
@@ -576,7 +541,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: TSA (Tsunami Watch)"
     id: mute_tsa
@@ -584,7 +548,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: TSW (Tsunami Warning)"
     id: mute_tsw
@@ -592,7 +555,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: WSA (Winter Storm Watch)"
     id: mute_wsa
@@ -600,7 +562,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: WSW (Winter Storm Warning)"
     id: mute_wsw
@@ -608,7 +569,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: AVA (Avalanche Watch)"
     id: mute_ava
@@ -616,7 +576,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: AVW (Avalanche Warning)"
     id: mute_avw
@@ -624,7 +583,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: BLU (Blue Alert)"
     id: mute_blu
@@ -632,7 +590,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: CAE (Child Abduction Emergency)"
     id: mute_cae
@@ -640,7 +597,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: CDW (Civil Danger Warning)"
     id: mute_cdw
@@ -648,7 +604,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: CEM (Civil Emergency Message)"
     id: mute_cem
@@ -656,7 +611,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: EQW (Earthquake Warning)"
     id: mute_eqw
@@ -664,7 +618,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: EVI (Evacuation Immediate)"
     id: mute_evi
@@ -672,7 +625,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: FRW (Fire Warning)"
     id: mute_frw
@@ -680,7 +632,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: HMW (Hazardous Materials Warning)"
     id: mute_hmw
@@ -688,7 +639,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: LEW (Law Enforcement Warning)"
     id: mute_lew
@@ -696,7 +646,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: LAE (Local Area Emergency)"
     id: mute_lae
@@ -704,7 +653,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: TOE (911 Telephone Outage Emergency)"
     id: mute_toe
@@ -712,7 +660,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: NMN (Network Message Notification)"
     id: mute_nmn
@@ -720,7 +667,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: NUW (Nuclear Power Plant Warning)"
     id: mute_nuw
@@ -728,7 +674,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: RHW (Radiological Hazard Warning)"
     id: mute_rhw
@@ -736,7 +681,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: SPW (Shelter in Place Warning)"
     id: mute_spw
@@ -744,7 +688,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: VOW (Volcano Warning)"
     id: mute_vow
@@ -752,7 +695,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: NEM (National Emergency Message)"
     id: mute_nem
@@ -760,7 +702,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: ADR (Administrative Message)"
     id: mute_adr
@@ -768,7 +709,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: DMO (Practice/Demo Warning)"
     id: mute_dmo
@@ -776,7 +716,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: RMT (Required Monthly Test)"
     id: mute_rmt
@@ -784,7 +723,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
   - platform: template
     name: "SAME Allow: RWT (Required Weekly Test)"
     id: mute_rwt
@@ -792,7 +730,6 @@ switch:
     entity_category: config
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
-    disabled_by_default: true
 
 sensor:
   - platform: template
@@ -850,6 +787,7 @@ text_sensor:
     name: "SAME Last Preamble Time"
     device_class: timestamp
     entity_category: diagnostic
+    disabled_by_default: true
 
 same_decoder:
   id: same_dec
@@ -1050,8 +988,6 @@ same_decoder:
             // Publish the filtered "last raw header".
             id(same_last_raw).publish_state(id(same_dec).last_raw_header());
             // Fire the Home Assistant event for delivered alerts only.
-            auto call = id(ha_time);  // (no-op ref to keep scope clear)
-            esphome::api::HomeassistantServiceResponse resp;  // placeholder guard
           }
       # Fire the HA event ONLY when filters pass. Implemented via a condition on
       # a global set by the lambda above would be cleaner, but to keep this fully
