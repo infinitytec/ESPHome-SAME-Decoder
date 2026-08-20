@@ -225,6 +225,22 @@ number:
     set_action:
       - lambda: 'id(same_dec).set_decode_watchdog_ms((uint32_t) (x * 1000.0f));'
 
+  - platform: template
+    name: "SAME Re-emit Suppress Window"
+    id: same_resend_suppress_number
+    icon: "mdi:timer-refresh"
+    unit_of_measurement: "s"
+    min_value: 0
+    max_value: 900
+    step: 1
+    mode: slider
+    optimistic: true
+    restore_value: true
+    initial_value: 3
+    entity_category: diagnostic
+    set_action:
+      - lambda: 'id(same_dec).set_resend_suppress_ms((uint32_t) (x * 1000.0f));'
+
   # --- Preamble-lock tuning (redesign) ---
   - platform: template
     name: "SAME Preamble Energy Mult"
@@ -302,6 +318,10 @@ same_decoder:
   single_burst_min_ms: 3000
   post_emit_dead_ms: 500
   sample_rate: 48000
+  # Cross-session re-emit window (ms). 0 = never suppress cross-session repeats;
+  # max 900000 (15 min). In-transmission (3-burst) repeats are always collapsed.
+  # Tunable at runtime via the "SAME Re-emit Suppress Window" number entity.
+  resend_suppress_ms: 3000
   # --- Preamble lock (primary timing path) ---
   # Minimum consecutive good preamble bit-periods to declare lock. This is a
   # floor for reliable convergence, NOT a requirement to decode all 16 preamble
