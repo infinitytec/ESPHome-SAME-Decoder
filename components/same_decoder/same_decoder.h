@@ -322,7 +322,7 @@ class SAMEDecoder : public Component {
   uint32_t samples_seen_{0};
 
   float last_bit_llr_{0.0f};
-  SoftBurst soft_bursts_;
+  SoftBurst soft_bursts_[3];
   SoftBurst soft_cur_;
   static constexpr float LLR_EPS = 1.0f;
   int bad_char_run_{0};
@@ -455,12 +455,12 @@ class SAMEDecoder : public Component {
   // locked. Such a capture can never emit on its own and must pass strict
   // structural validation + 2-of-3 corroboration before it counts.
   bool cur_low_trust_{false};                     // current in-progress capture
-  bool burst_low_trust_{false, false, false};  // per-collected-burst flag
+  bool burst_low_trust_[3]{false, false, false};  // per-collected-burst flag
 
   uint8_t cur_byte_{0};
   int cur_nbits_{0};
   std::string cur_burst_;
-  std::string bursts_;
+  std::string bursts_[3];
   int burst_idx_{0};
   static constexpr int MAX_HEADER_BYTES = 268;
 
