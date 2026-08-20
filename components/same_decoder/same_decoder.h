@@ -15,7 +15,9 @@
 //    reset ONLY on true session boundaries (emit/EOM/watchdog/feed-gap).
 //    The early-late discriminator is DECISION-DIRECTED (symbol-invariant): it
 //    is multiplied by the decided-bit sign so the timing gradient points the
-//    same way on mark and space bits and does not cancel on mixed payload.
+//    same way on mark and space bits and does not cancel on mixed payload. The
+//    INTEGRAL (rate) term runs only while a real burst is in progress (lock
+//    effective or CAPTURE); off-signal it drains toward zero (no noise windup).
 //  * DETECTION: the Goertzel analysis window is one full bit long (GWIN=92) and
 //    is CENTERED on the bit instant via a fixed decision delay (DEC_DELAY), so
 //    the decision variable is symmetric about the bit and mark/space
@@ -266,26 +268,33 @@ class SAMEDecoder : public Component {
   static constexpr float AGC_ATTACK = 0.002f;
   static constexpr float AGC_RELEASE = 0.0002f;
 
-  // Hysteretic + dwell gate for the always-on timing loop. Softened for early
-  // acquisition: low thresholds so the loop can start pulling the sampler toward
-  // bit-center even at modest confidence, instead of deadlocking when the
-  // initial phase is off-center. Once engaged, a LOWER release threshold plus a
-  // multi-bit dwell keep the loop closed through low-confidence payload runs
-  // (avoiding open-loop slip). The per-update magnitude is also weighted by
-  // confidence in feed_sample_(), so weak bits contribute little; the integral
-  // path additionally uses a confidence FLOOR so it never freezes entirely.
-  static constexpr float TR_CONF_ENGAGE = 0.15f;   // open gate above this
-  static constexpr float TR_CONF_RELEASE = 0.07f;  // close gate below this
+  // Hysteretic + dwell gate for the always-on timing loop. Raised thresholds
+  // (item 5) so intermittent voice formants cannot chatter the gate open on
+  // non-signal audio: a clean SAME preamble/header sits at conf ~0.8-0.99 and
+  // clears these easily, while continuous NWR voice rarely sustains conf above
+  // TR_CONF_ENGAGE for TR_GATE_DWELL consecutive bits. The per-update magnitude
+  // is also weighted by confidence in feed_sample_(); the integral path uses a
+  // confidence FLOOR (on-signal) so it never freezes during real payload runs.
+  static constexpr float TR_CONF_ENGAGE = 0.35f;   // open gate above this
+  static constexpr float TR_CONF_RELEASE = 0.25f;  // close gate below this
   static constexpr int   TR_GATE_DWELL = 8;        // consecutive good bits to open
   static constexpr float TR_DPHI_CLAMP = 0.125f;
-  // Confidence floor for the integral (rate) update so w_off_ keeps tracking
-  // slow drift through low-confidence stretches instead of freezing.
+  // Confidence floor for the ON-SIGNAL integral (rate) update so w_off_ keeps
+  // tracking slow drift through low-confidence payload runs instead of freezing.
   static constexpr float TR_CONF_FLOOR = 0.04f;
-  // Very slow leak on w_off_ toward zero, preventing unbounded wander if the
-  // loop is starved of good timing information for a long time.
+  // Very slow leak on w_off_ toward zero WHILE ON-SIGNAL (locked/CAPTURE),
+  // preventing unbounded wander if the loop is briefly starved of good timing.
   static constexpr float TR_WOFF_LEAK = 1e-4f;
-  bool tr_gate_open_{false};   // hysteretic timing-loop gate state
-  int  tr_gate_run_{0};        // consecutive qualifying decisions toward opening
+
+  // --- Idle / off-signal hardening (items 1-5) ---
+  // The INTEGRAL (w_off_) update runs ONLY when a real burst is in progress
+  // (lock effective OR CAPTURE). Off-signal it never integrates and instead
+  // DRAINS toward 0 with the stronger unlocked leak, held inside a tighter
+  // unlocked clamp. Back-calculation anti-windup keeps w_off_ from welding to
+  // the rail even under on-signal transients.
+  static constexpr float TR_WOFF_LEAK_UNLOCKED = 1e-3f;        // stronger drain off-signal (10x)
+  static constexpr float TR_WOFF_CLAMP_UNLOCKED_FRAC = 0.25f;  // tighter clamp when not locked/capture
+  static constexpr float TR_ANTI_WINDUP_BETA = 0.10f;          // back-calculation bleed (0 < beta <= 1)
 
   // Two-stage timing-loop gains. Acquisition gains are higher so the loop pulls
   // in quickly right after lock; once N_GOOD_TO_TRACK good bits have elapsed we
