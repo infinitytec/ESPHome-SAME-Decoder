@@ -792,7 +792,7 @@ bool SAMEDecoder::fuzzy_equal_(const std::string &a, const std::string &b) {
 
 bool SAMEDecoder::same_message_as_current_(const std::string &new_burst) {
   if (this->burst_idx_ == 0) return true;
-  const std::string &ref = this->bursts_;
+  const std::string &ref = this->bursts_[0];
   SameAlert ra, rb;
   bool pa = this->parse_header_(ref, ra);
   bool pb = this->parse_header_(new_burst, rb);
@@ -827,14 +827,14 @@ void SAMEDecoder::finish_burst_() {
   if (this->burst_idx_ >= 1 && !this->same_message_as_current_(this_burst)) {
     ESP_LOGD(TAG, "Differing burst mid-collection: finalising old, starting new.");
     this->reset_capture_();
-    this->bursts_ = this_burst;
-    this->soft_bursts_ = this_soft;
-    this->burst_low_trust_ = this_low_trust;
+    this->bursts_[0] = this_burst;
+    this->soft_bursts_[0] = this_soft;
+    this->burst_low_trust_[0] = this_low_trust;
     this->burst_idx_ = 1;
     this->last_burst_ms_ = millis();
 
     if (!this->early_emitted_ && !this_low_trust &&
-        this->header_is_complete_(this->bursts_)) {
+        this->header_is_complete_(this->bursts_[0])) {
       ESP_LOGD(TAG, "Immediate emit on promoted COMPLETE differing burst.");
       this->vote_and_emit_(false, this->fallback_sync_used_);
       this->early_emitted_ = true;
