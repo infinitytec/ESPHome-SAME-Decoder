@@ -4,7 +4,7 @@
 // v5.1: preamble qualifier keys on tone-presence + SUSTAINED ALTERNATION (an
 // unaligned bit-centered window on the alternating preamble reads moderate
 // per-bit conf, so requiring high conf deadlocked lock). Diagnostics trimmed to
-// a low-rate TL summary plus essential event logs.
+// essential event logs only (Preamble LOCK, Sync, Burst, Decoded, EOM).
 
 #include "same_decoder.h"
 #include "same_soft.h"
@@ -82,6 +82,10 @@ void SAMEDecoder::compute_coeffs_() {
   this->samples_per_bit_ = sr / baud;
   this->phase_inc_ = 1.0f / this->samples_per_bit_;
   this->tr_woff_clamp_ = (this->residual_drift_ppm_ * 1e-6f) * this->phase_inc_;
+
+  ESP_LOGCONFIG(TAG, "Coeffs: sr=%" PRIu32 " mark=%.6f space=%.6f spb=%.3f",
+                this->sample_rate_, this->coeff_mark_, this->coeff_space_, this->samples_per_bit_);
+}
 
 void SAMEDecoder::set_sample_rate(uint32_t rate) {
   this->sample_rate_ = rate;
@@ -183,7 +187,6 @@ void SAMEDecoder::dump_config() {
                 (double) TR_WOFF_LEAK_UNLOCKED, TR_WOFF_CLAMP_UNLOCKED_FRAC, TR_ANTI_WINDUP_BETA);
   ESP_LOGCONFIG(TAG, "  Timing loop: decision-directed early-late; acq Kp=%.4f Ki=%.5f -> track Kp=%.4f Ki=%.5f after %d bits",
                 ACQ_KP, ACQ_KI, this->fallback_kp_, this->fallback_ki_, N_GOOD_TO_TRACK);
-  ESP_LOGCONFIG(TAG, "    TL summary every %" PRIu32 " bits at DEBUG.", (uint32_t) DBG_SUMMARY_EVERY);
   ESP_LOGCONFIG(TAG, "    ZCZC hamming: strict<=%d", SYNC_MAX_HAMMING);
   ESP_LOGCONFIG(TAG, "    Unlocked ZCZC starts allowed but LOW-TRUST (strict-valid + 2-of-3 only).");
   ESP_LOGCONFIG(TAG, "  EOM requires context: %s (%" PRIu32 " ms)",
