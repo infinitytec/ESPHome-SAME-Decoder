@@ -6,22 +6,13 @@
 #    1. A shared rest_command (nws_alerts_get) used by the NOAA SAME Alerts
 #       blueprint to query api.weather.gov. Defined ONCE; reused by every location.
 #    2. A single trigger-based template block hosting ONE card-facing sensor per
-#       location (home + cabin shown as examples). Each maintains an
-#       nws_alerts-style "Alerts" attribute the card reads; state = alert count.
+#       location (home shown). It maintains an nws_alerts-style "Alerts"
+#       attribute the card reads; state = alert count.
 #
-#  MINIMAL-COPY MODEL:
-#    - This file is the ONLY YAML you copy. To add a location, paste one more
-#      sensor entry below and change 3 things: name, unique_id, and location_key.
-#    - The NOAA SAME Alerts blueprint is IMPORTED ONCE, then instantiated per
-#      location in the UI (no YAML copying). Each instance sets its own
-#      location_key to route its enriched alerts to the matching sensor.
-#
-#  ROUTING (same helper vs separate helpers):
-#    - SEPARATE: give each blueprint instance a distinct location_key and keep a
-#      matching sensor entry (e.g. home -> sensor.same_alerts_home).
-#    - COMBINED: give two instances the SAME location_key and keep a single
-#      sensor entry with that key; both locations feed one sensor. De-dup is by
-#      alert id within a sensor, and SAME ids differ by county, so it's safe.
+#  ROUTING:
+#    - The blueprint fires event `same.alert_enriched` with a location_key.
+#      Keep the blueprint instance's location_key set to "home" (its default) to
+#      match the sensor below.
 #
 #  WHY A TEMPLATE SENSOR IS STILL REQUIRED:
 #    - The ESPHome device integration exposes text/status sensors (last raw
@@ -35,9 +26,9 @@
 #           packages: !include_dir_named packages
 #    2. Save as <config>/packages/same-alerts-package.yaml
 #    3. Restart Home Assistant (or reload Template Entities + REST Commands).
-#    4. Import the NOAA SAME Alerts blueprint once; create one automation per
-#       location, setting location_key to "home" / "cabin" to match the sensors.
-#    5. Point weather_alerts_card at sensor.same_alerts_home / _cabin.
+#    4. Import the NOAA SAME Alerts blueprint once; create one automation,
+#       leaving location_key at "home" to match the sensor.
+#    5. Point weather_alerts_card at sensor.same_alerts_home.
 #
 #  DOCS:
 #    - rest_command:              https://www.home-assistant.io/integrations/rest_command/
@@ -68,26 +59,18 @@ rest_command:
       Accept: "application/geo+json"
 
 # -----------------------------------------------------------------------------
-#  Card-facing sensors (one per location, all under ONE trigger block)
+#  Card-facing sensor (home)
 #
-#  Behavior for every sensor entry:
+#  Behavior:
 #    - Trigger `enriched`: the blueprint fires event `same.alert_enriched` with
 #        { location_key, action: add|update|remove, alert: {...} }.
-#        A sensor only acts on events whose location_key matches ITS location_key.
+#        The sensor only acts on events whose location_key matches its own.
 #        add/update -> insert or replace the alert by its id (dedup)
 #        remove      -> drop the alert by its id (cancel / T+recheck clear)
 #    - Trigger `tick` (every minute): prune any alert whose expiry has passed,
 #        so the card drops it automatically at expiration.
 #    - state = number of currently-active alerts
 #    - attribute Alerts = the list of alert dicts (nws_alerts-style)
-#
-#  Every same.alert_enriched event fans out to ALL sensors; non-matching
-#  location_keys simply re-render and prune (no cross-contamination).
-#
-#  TO ADD A LOCATION: copy one sensor entry, then change:
-#    - name:        (friendly name)
-#    - unique_id:   (must be unique)
-#    - location_key (under variables:)  <-- must match the blueprint instance
 # -----------------------------------------------------------------------------
 template:
   - trigger:
@@ -132,7 +115,7 @@ template:
             {% set ns = namespace(keep=[]) %}
             {% for a in current %}
               {% set exp = a.expires | default(a.ends | default('')) %}
-              {% set exp_ts = (exp is string and exp != '') | ternary(as_timestamp(exp, 0), 0) %}
+              {% set exp_ts = as_timestamp(exp, 0) if (exp is string and exp != '') else 0 %}
               {% if exp_ts == 0 or exp_ts > now_ts %}
                 {% set _ = ns.keep.append(a) %}
               {% endif %}
@@ -143,50 +126,4 @@ template:
         attributes:
           Alerts: "{{ next_alerts }}"
           friendly_name: "SAME Alerts (Home)"
-          icon: "mdi:alert"
-
-      # ===== Location: cabin =====
-      - name: "SAME Alerts (Cabin)"
-        unique_id: same_alerts_cabin
-        icon: "mdi:alert"
-        variables:
-          location_key: "cabin"
-          now_ts: "{{ as_timestamp(now()) }}"
-          next_alerts: >-
-            {% set current = state_attr(this.entity_id, 'Alerts') | default([], true) | list %}
-
-            {# 1) Apply the event action, but only for OUR location_key #}
-            {% if trigger.id == 'enriched' and trigger.event.data.location_key == location_key %}
-              {% set ev = trigger.event.data %}
-              {% set action = ev.action | default('add') %}
-              {% set alert = ev.alert | default({}) %}
-              {% set rid = alert.id | default('') %}
-              {% set filtered = [] %}
-              {% for a in current %}
-                {% if a.id | default('') != rid %}
-                  {% set _ = filtered.append(a) %}
-                {% endif %}
-              {% endfor %}
-              {% if action in ['add', 'update'] and rid != '' %}
-                {% set _ = filtered.append(alert) %}
-              {% endif %}
-              {% set current = filtered %}
-            {% endif %}
-
-            {# 2) Prune expired (on BOTH the event and the minute tick).
-                  Keep an alert with no parseable expiry, or expiry > now. #}
-            {% set ns = namespace(keep=[]) %}
-            {% for a in current %}
-              {% set exp = a.expires | default(a.ends | default('')) %}
-              {% set exp_ts = (exp is string and exp != '') | ternary(as_timestamp(exp, 0), 0) %}
-              {% if exp_ts == 0 or exp_ts > now_ts %}
-                {% set _ = ns.keep.append(a) %}
-              {% endif %}
-            {% endfor %}
-
-            {{ ns.keep }}
-        state: "{{ next_alerts | count }}"
-        attributes:
-          Alerts: "{{ next_alerts }}"
-          friendly_name: "SAME Alerts (Cabin)"
           icon: "mdi:alert"
