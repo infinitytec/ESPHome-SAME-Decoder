@@ -4,10 +4,10 @@
 #  (or copy to <config>/blueprints/automation/same_decoder/noaa_same_alerts.yaml)
 #
 #  ONE blueprint does everything for a single location:
-#    - Listens for the ESPHome decoder's `esphome.same_alert` event.
+#    - Listens for the ESPHome decoder's SAME alert event (configurable name).
 #    - FIPS-filters, suppresses silent test codes.
 #    - Validates/enriches against api.weather.gov (point-first, county fallback).
-#    - Emits `same.alert_enriched` for the per-location template sensor (card).
+#    - Emits the output event for the per-location template sensor (card).
 #    - SENDS NOTIFICATIONS inline at each decision point (new / confirmed / clear).
 #
 #  Run this blueprint ONCE PER LOCATION. This REPLACES the old
@@ -49,8 +49,11 @@ blueprint:
     and sends notifications inline. Replaces the separate notify blueprint.
   domain: automation
   input:
+    # =========================================================================
+    #  REQUIRED INPUTS
+    # =========================================================================
     location_key:
-      name: Location key
+      name: (Required) Location key
       description: >
         Short tag identifying this location. MUST match the location_key set on
         the per-location template sensor (e.g. "home", "cabin").
@@ -58,8 +61,27 @@ blueprint:
       selector:
         text:
 
+    trigger_event:
+      name: (Required) Trigger event type
+      description: >
+        The event fired by your ESPHome SAME decoder that starts this automation.
+        Leave the default unless your decoder fires a differently-named event.
+      default: esphome.same_alert
+      selector:
+        text:
+
+    output_event:
+      name: (Required) Output event (to the alert-card sensor)
+      description: >
+        The event this blueprint fires with the enriched/validated alert data.
+        Your per-location template sensor that feeds the alert cards must listen
+        for THIS event. Leave the default unless you renamed the sensor's event.
+      default: same.alert_enriched
+      selector:
+        text:
+
     fips_code:
-      name: FIPS / SAME county code
+      name: (Required) FIPS / SAME county code
       description: >
         The county code for this location, as SSCCC (5-digit) or PSSCCC
         (6-digit). Only the last 5 digits are compared, so the P (partial-county)
@@ -68,41 +90,17 @@ blueprint:
         text:
 
     state_code:
-      name: State (2-letter)
+      name: (Required) State (2-letter)
       description: >
         Two-letter USPS state code (e.g. IN, OK, TX). Used for the county
         existence check via api.weather.gov ?area=<STATE>.
       selector:
         text:
 
-    online_sensor:
-      name: Online / Internet binary sensor
-      description: >
-        A binary_sensor that is ON when Internet/NWS API is reachable. When OFF
-        or unavailable, the alert is fired as a SAME fallback without any API call.
-      selector:
-        entity:
-          domain: binary_sensor
-
-    user_agent:
-      name: NWS User-Agent header
-      description: >
-        Required by api.weather.gov. Provide something identifying with contact
-        info, e.g. "MyHomeAssistant/1.0 (you@example.com)".
-      selector:
-        text:
-
-    use_home_location:
-      name: Use Home Assistant location (zone.home) for coordinates
-      description: >
-        When ON, the point check uses zone.home latitude/longitude. Turn OFF to
-        enter explicit coordinates below (they should fall inside the FIPS county).
-      default: true
-      selector:
-        boolean:
-
     latitude:
-      name: Latitude (only if not using zone.home)
+      name: (Required) Latitude
+      description: >
+        Latitude of this location. Should fall inside the FIPS county above.
       default: 0
       selector:
         number:
@@ -112,7 +110,9 @@ blueprint:
           mode: box
 
     longitude:
-      name: Longitude (only if not using zone.home)
+      name: (Required) Longitude
+      description: >
+        Longitude of this location. Should fall inside the FIPS county above.
       default: 0
       selector:
         number:
@@ -121,8 +121,33 @@ blueprint:
           step: any
           mode: box
 
+    online_sensor:
+      name: (Required) Online / Internet indicator
+      description: >
+        Any binary_sensor, input_boolean (toggle helper), or switch that is ON
+        when Internet/NWS API is reachable. When OFF or unavailable, the alert is
+        fired as a SAME fallback without any API call.
+      selector:
+        entity:
+          domain:
+            - binary_sensor
+            - input_boolean
+            - switch
+
+    contact_email:
+      name: (Required) Contact email (for NWS User-Agent)
+      description: >
+        api.weather.gov requires a contact in the User-Agent header. Enter an
+        email address; a Firefox-style User-Agent with this contact is built
+        automatically.
+      selector:
+        text:
+
+    # =========================================================================
+    #  OPTIONAL INPUTS
+    # =========================================================================
     match_tolerance_seconds:
-      name: Time match tolerance (seconds)
+      name: (Optional) Time match tolerance (seconds)
       description: >
         A NWS alert matches the SAME alert if the event type matches AND their
         expiration times are within this many seconds (and onset times too, when
@@ -137,7 +162,7 @@ blueprint:
           mode: box
 
     suppress_test_codes:
-      name: Silent test codes
+      name: (Optional) Silent test codes
       description: >
         Comma-separated SAME event codes to silently ignore (tests).
       default: "RWT,RMT,NPT,DMO,NAT,NST"
@@ -145,7 +170,7 @@ blueprint:
         text:
 
     enable_recheck:
-      name: Enable T+recheck
+      name: (Optional) Enable T+recheck
       description: >
         When ON, if we fired a low-confidence SAME fallback (API had not caught
         up), re-check once after the delay below to upgrade to enriched or clear
@@ -155,7 +180,7 @@ blueprint:
         boolean:
 
     recheck_delay_seconds:
-      name: Recheck delay (seconds)
+      name: (Optional) Recheck delay (seconds)
       default: 60
       selector:
         number:
@@ -165,9 +190,9 @@ blueprint:
           unit_of_measurement: s
           mode: box
 
-    # ---- Notification inputs ----
+    # ---- Notification inputs (all optional) ----
     notify_service:
-      name: Notify service (optional)
+      name: (Optional) Notify service
       description: >
         Notify service to call, e.g. notify.mobile_app_your_phone. Leave blank
         to skip the mobile/push notification (persistent notifications still work
@@ -177,13 +202,13 @@ blueprint:
         text:
 
     create_persistent:
-      name: Also create a persistent notification
+      name: (Optional) Also create a persistent notification
       default: false
       selector:
         boolean:
 
     notify_on_clear:
-      name: Notify when an alert clears
+      name: (Optional) Notify when an alert clears
       description: >
         Notify on a SAME Cancel or a T+recheck "not for your location" clear.
       default: false
@@ -191,7 +216,7 @@ blueprint:
         boolean:
 
     notify_on_update_confirmation:
-      name: Notify again when an alert is confirmed by NWS
+      name: (Optional) Notify again when an alert is confirmed by NWS
       description: >
         Re-notify if a radio/pending alert later becomes NWS-confirmed at the
         T+recheck.
@@ -200,7 +225,7 @@ blueprint:
         boolean:
 
     severity_allowlist:
-      name: Notify only for these severities
+      name: (Optional) Notify only for these severities
       description: Leave empty to notify for all severities.
       default: []
       selector:
@@ -215,7 +240,7 @@ blueprint:
             - Unknown
 
     title_prefix:
-      name: Notification title prefix (optional)
+      name: (Optional) Notification title prefix
       description: Prepended to the notification title (e.g. "Home").
       default: ""
       selector:
@@ -227,16 +252,16 @@ max: 10
 
 trigger:
   - platform: event
-    event_type: esphome.same_alert
+    event_type: !input trigger_event
 
 variables:
   # ---- Blueprint inputs pulled into variables ----
   location_key: !input location_key
+  output_event: !input output_event
   fips_input: !input fips_code
   state_code: !input state_code
-  user_agent: !input user_agent
+  contact_email: !input contact_email
   online_sensor: !input online_sensor
-  use_home_location: !input use_home_location
   in_latitude: !input latitude
   in_longitude: !input longitude
   tol: !input match_tolerance_seconds
@@ -250,6 +275,10 @@ variables:
   severity_allowlist: !input severity_allowlist
   title_prefix: !input title_prefix
 
+  # ---- Firefox-style User-Agent built from the contact email ----
+  user_agent: >-
+    Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0 (contact: {{ contact_email }})
+
   # ---- SAME event payload (from the ESPHome decoder) ----
   ev: "{{ trigger.event.data }}"
   same_id: "{{ ev.id | default('') }}"
@@ -258,8 +287,8 @@ variables:
   same_status: "{{ ev.status | default('') }}"
   same_onset: "{{ ev.onset | default('') }}"
   same_expires: "{{ ev.expires | default('') }}"
-  same_onset_ts: "{{ (same_onset is string and same_onset != '') | ternary(as_timestamp(same_onset, 0), 0) }}"
-  same_expires_ts: "{{ (same_expires is string and same_expires != '') | ternary(as_timestamp(same_expires, 0), 0) }}"
+  same_onset_ts: "{{ as_timestamp(same_onset, 0) if (same_onset is string and same_onset != '') else 0 }}"
+  same_expires_ts: "{{ as_timestamp(same_expires, 0) if (same_expires is string and same_expires != '') else 0 }}"
 
   # ---- County normalization: last 5 digits (SSCCC), ignoring P-digit ----
   ssccc: >-
@@ -282,9 +311,9 @@ variables:
        | reject('equalto', '') | map('upper') | list }}
   is_test_code: "{{ same_event_code in suppress_set }}"
 
-  # ---- Coordinates: zone.home or explicit inputs ----
-  lat: "{{ state_attr('zone.home', 'latitude') if use_home_location else in_latitude }}"
-  lon: "{{ state_attr('zone.home', 'longitude') if use_home_location else in_longitude }}"
+  # ---- Coordinates (explicit inputs only) ----
+  lat: "{{ in_latitude }}"
+  lon: "{{ in_longitude }}"
 
   # ---- SAME event_code -> NWS event-name map (common codes) ----
   event_name_map: >-
@@ -363,7 +392,7 @@ action:
           - condition: template
             value_template: "{{ same_status | lower == 'cancel' }}"
         sequence:
-          - event: same.alert_enriched
+          - event: "{{ output_event }}"
             event_data:
               location_key: "{{ location_key }}"
               action: remove
@@ -447,7 +476,7 @@ action:
                 validated_by: "offline"
                 point_relevant: "unknown"
                 confidence: "same_pending"
-          - event: same.alert_enriched
+          - event: "{{ output_event }}"
             event_data:
               location_key: "{{ location_key }}"
               action: add
@@ -522,11 +551,11 @@ action:
           {%- endfor -%}
           {%- if (fevent in acceptable_events) and cns.county -%}
             {%- set pend = p.expires | default(p.ends | default('')) -%}
-            {%- set pend_ts = (pend is string and pend != '') | ternary(as_timestamp(pend, 0), 0) -%}
-            {%- set exp_delta = (pend_ts > 0 and same_expires_ts > 0) | ternary((pend_ts - same_expires_ts) | abs, 0) -%}
+            {%- set pend_ts = as_timestamp(pend, 0) if (pend is string and pend != '') else 0 -%}
+            {%- set exp_delta = ((pend_ts - same_expires_ts) | abs) if (pend_ts > 0 and same_expires_ts > 0) else 0 -%}
             {%- set onset_api = p.onset | default(p.effective | default('')) -%}
-            {%- set onset_ts = (onset_api is string and onset_api != '') | ternary(as_timestamp(onset_api, 0), 0) -%}
-            {%- set on_delta = (onset_ts > 0 and same_onset_ts > 0) | ternary((onset_ts - same_onset_ts) | abs, 0) -%}
+            {%- set onset_ts = as_timestamp(onset_api, 0) if (onset_api is string and onset_api != '') else 0 -%}
+            {%- set on_delta = ((onset_ts - same_onset_ts) | abs) if (onset_ts > 0 and same_onset_ts > 0) else 0 -%}
             {%- set onset_ok = (same_onset_ts == 0 or onset_ts == 0 or on_delta <= tol) -%}
             {%- if (exp_delta <= tol) and onset_ok -%}
               {%- if (exp_delta < ns.best_exp) or (exp_delta == ns.best_exp and on_delta < ns.best_on) -%}
@@ -593,7 +622,7 @@ action:
                 validated_by: "api_point"
                 point_relevant: true
                 confidence: "validated"
-          - event: same.alert_enriched
+          - event: "{{ output_event }}"
             event_data:
               location_key: "{{ location_key }}"
               action: add
@@ -672,11 +701,11 @@ action:
               {%- endfor -%}
               {%- if cns.county -%}
                 {%- set pend = p.expires | default(p.ends | default('')) -%}
-                {%- set pend_ts = (pend is string and pend != '') | ternary(as_timestamp(pend, 0), 0) -%}
-                {%- set exp_delta = (pend_ts > 0 and same_expires_ts > 0) | ternary((pend_ts - same_expires_ts) | abs, 0) -%}
+                {%- set pend_ts = as_timestamp(pend, 0) if (pend is string and pend != '') else 0 -%}
+                {%- set exp_delta = ((pend_ts - same_expires_ts) | abs) if (pend_ts > 0 and same_expires_ts > 0) else 0 -%}
                 {%- set onset_api = p.onset | default(p.effective | default('')) -%}
-                {%- set onset_ts = (onset_api is string and onset_api != '') | ternary(as_timestamp(onset_api, 0), 0) -%}
-                {%- set on_delta = (onset_ts > 0 and same_onset_ts > 0) | ternary((onset_ts - same_onset_ts) | abs, 0) -%}
+                {%- set onset_ts = as_timestamp(onset_api, 0) if (onset_api is string and onset_api != '') else 0 -%}
+                {%- set on_delta = ((onset_ts - same_onset_ts) | abs) if (onset_ts > 0 and same_onset_ts > 0) else 0 -%}
                 {%- set onset_ok = (same_onset_ts == 0 or onset_ts == 0 or on_delta <= tol) -%}
                 {%- if (exp_delta <= tol) and onset_ok -%}{%- set ns.found = true -%}{%- endif -%}
               {%- endif -%}
@@ -729,7 +758,7 @@ action:
         point_relevant: "unknown"
         confidence: "same_pending"
 
-  - event: same.alert_enriched
+  - event: "{{ output_event }}"
     event_data:
       location_key: "{{ location_key }}"
       action: add
@@ -810,11 +839,11 @@ action:
               {%- endfor -%}
               {%- if (fevent in acceptable_events) and cns.county -%}
                 {%- set pend = p.expires | default(p.ends | default('')) -%}
-                {%- set pend_ts = (pend is string and pend != '') | ternary(as_timestamp(pend, 0), 0) -%}
-                {%- set exp_delta = (pend_ts > 0 and same_expires_ts > 0) | ternary((pend_ts - same_expires_ts) | abs, 0) -%}
+                {%- set pend_ts = as_timestamp(pend, 0) if (pend is string and pend != '') else 0 -%}
+                {%- set exp_delta = ((pend_ts - same_expires_ts) | abs) if (pend_ts > 0 and same_expires_ts > 0) else 0 -%}
                 {%- set onset_api = p.onset | default(p.effective | default('')) -%}
-                {%- set onset_ts = (onset_api is string and onset_api != '') | ternary(as_timestamp(onset_api, 0), 0) -%}
-                {%- set on_delta = (onset_ts > 0 and same_onset_ts > 0) | ternary((onset_ts - same_onset_ts) | abs, 0) -%}
+                {%- set onset_ts = as_timestamp(onset_api, 0) if (onset_api is string and onset_api != '') else 0 -%}
+                {%- set on_delta = ((onset_ts - same_onset_ts) | abs) if (onset_ts > 0 and same_onset_ts > 0) else 0 -%}
                 {%- set onset_ok = (same_onset_ts == 0 or onset_ts == 0 or on_delta <= tol) -%}
                 {%- if (exp_delta <= tol) and onset_ok -%}
                   {%- if (exp_delta < ns.best_exp) or (exp_delta == ns.best_exp and on_delta < ns.best_on) -%}
@@ -881,7 +910,7 @@ action:
                     validated_by: "api_point"
                     point_relevant: true
                     confidence: "validated"
-              - event: same.alert_enriched
+              - event: "{{ output_event }}"
                 event_data:
                   location_key: "{{ location_key }}"
                   action: update
@@ -963,7 +992,7 @@ action:
                   - condition: template
                     value_template: "{{ r2_county_found }}"
                 then:
-                  - event: same.alert_enriched
+                  - event: "{{ output_event }}"
                     event_data:
                       location_key: "{{ location_key }}"
                       action: remove
