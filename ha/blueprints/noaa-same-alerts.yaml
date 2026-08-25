@@ -307,7 +307,7 @@ variables:
 
   # ---- Silent test-code set ----
   suppress_set: >-
-    {{ suppress_test_codes | string | replace(' ', '') | split(',')
+    {{ (suppress_test_codes | string | replace(' ', '')).split(',')
        | reject('equalto', '') | map('upper') | list }}
   is_test_code: "{{ same_event_code in suppress_set }}"
 
