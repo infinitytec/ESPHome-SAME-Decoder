@@ -303,7 +303,7 @@ variables:
     {% for a in areas %}
       {% if (a | string)[-5:] == ssccc %}{% set ns.ok = true %}{% endif %}
     {% endfor %}
-    {{ ns.ok }}
+    {{ ns.ok | bool }}
 
   # ---- Silent test-code set ----
   suppress_set: >-
@@ -426,7 +426,7 @@ action:
       # (b) Alert not for our county (safety net; device already FIPS-filters).
       - conditions:
           - condition: template
-            value_template: "{{ not areas_contains_ssccc }}"
+            value_template: "{{ areas_contains_ssccc | bool == false }}"
         sequence:
           - stop: "Not for this location (SSCCC mismatch)."
 
