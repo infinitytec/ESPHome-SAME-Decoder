@@ -295,13 +295,20 @@ variables:
     {% set s = fips_input | string %}
     {{ s[-5:] if s | length >= 5 else s }}
 
-  # ---- SAME 'areas' list, and whether it includes our county ----
+  # ---- SAME 'areas' list (kept for downstream use) ----
   areas: >-
     {{ (ev.areas | default('') | string).split(',') | map('trim') | reject('equalto', '') | list }}
+
+  # ---- Whether the SAME areas include our county (SELF-CONTAINED) ----
+  #  Computed directly from fips_input + ev.areas so it never depends on the
+  #  sibling 'areas'/'ssccc' variables being resolved first.
   areas_contains_ssccc: >-
+    {% set s = fips_input | string %}
+    {% set my5 = s[-5:] if s | length >= 5 else s %}
+    {% set alist = (ev.areas | default('') | string).split(',') | map('trim') | reject('equalto', '') | list %}
     {% set ns = namespace(ok=false) %}
-    {% for a in areas %}
-      {% if (a | string)[-5:] == ssccc %}{% set ns.ok = true %}{% endif %}
+    {% for a in alist %}
+      {% if (a | string)[-5:] == my5 %}{% set ns.ok = true %}{% endif %}
     {% endfor %}
     {{ ns.ok | bool }}
 
