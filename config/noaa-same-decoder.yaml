@@ -29,7 +29,7 @@ esphome:
           ESP_LOGI("es8388", "ADCControl1 wrote 0x77, readback=0x%02X", readback);
       # --- Line-in -> LEFT speaker (LOUT2) analog-bypass init (disabled at boot) ---
       # Route LIN1 into the LEFT output mixer, enable LOUT2 (the left 3W amp),
-      # but leave the LIN->left-mixer path DISABLED until KEY1 is pressed.
+      # but leave the LIN->left-mixer path DISABLED until KEY1 / HA toggle enables it.
       - lambda: |-
           auto es_write = [](uint8_t reg, uint8_t val) {
             uint8_t buf[2] = { reg, val };
@@ -159,9 +159,15 @@ button:
     icon: "mdi:restart"
 
 # KEY1 on the ESP32-Audio-Kit is IO36 (no external pull-up).
-# Press  -> enable LIN1 -> left mixer (LI2LO), passing Line-In to the left speaker.
-# Release -> disable the LIN -> left mixer path again.
+# Press  -> turn the "Line-In Passthrough" switch ON.
+# Release -> turn it OFF. The switch does the actual ES8388 register write,
+# so the physical button and the HA toggle stay in sync.
 binary_sensor:
+  - platform: template
+    id: decode_in_progress
+    name: "SAME Decode In Progress"
+    icon: "mdi:access-point"
+
   - platform: gpio
     id: key1_button
     name: "KEY1 (Line-In Passthrough)"
@@ -172,26 +178,10 @@ binary_sensor:
       inverted: true
     on_press:
       then:
-        - lambda: |-
-            // Enable LIN -> left mixer: Reg 39 (DAC Control 17), keep staged
-            // LI2LOVOL in bits[5:3], set LI2LO (bit6) = 1.
-            uint8_t reg = 0x27, cur = 0x00;
-            id(bus_a).write(0x10, &reg, 1, false);
-            id(bus_a).read(0x10, &cur, 1);
-            cur |= (1 << 6);   // LI2LO enable
-            uint8_t buf[2] = { 0x27, cur };
-            id(bus_a).write(0x10, buf, 2);
-            ESP_LOGI("es8388", "KEY1: Line-In -> LEFT speaker ENABLED (Reg39=0x%02X).", cur);
+        - switch.turn_on: linein_passthrough
     on_release:
       then:
-        - lambda: |-
-            uint8_t reg = 0x27, cur = 0x00;
-            id(bus_a).write(0x10, &reg, 1, false);
-            id(bus_a).read(0x10, &cur, 1);
-            cur &= ~(1 << 6);  // LI2LO disable
-            uint8_t buf[2] = { 0x27, cur };
-            id(bus_a).write(0x10, buf, 2);
-            ESP_LOGI("es8388", "KEY1: Line-In -> LEFT speaker DISABLED (Reg39=0x%02X).", cur);
+        - switch.turn_off: linein_passthrough
 
 interval:
   - interval: 2s
@@ -357,6 +347,34 @@ number:
 # on-device (the alert will NOT publish to the filtered header sensor nor fire
 # the Home Assistant event). Unknown/unlisted codes are always allowed.
 switch:
+  # Home Assistant / web-UI toggle for the Line-In -> LEFT speaker passthrough.
+  # This is the single source of truth: KEY1 turns it on/off, and it performs
+  # the actual ES8388 Reg 39 (LI2LO) enable/disable.
+  - platform: template
+    name: "Line-In Passthrough (Line-In to Left Speaker)"
+    id: linein_passthrough
+    icon: "mdi:speaker"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: |-
+          uint8_t reg = 0x27, cur = 0x00;
+          id(bus_a).write(0x10, &reg, 1, false);
+          id(bus_a).read(0x10, &cur, 1);
+          cur |= (1 << 6);   // LI2LO enable
+          uint8_t buf[2] = { 0x27, cur };
+          id(bus_a).write(0x10, buf, 2);
+          ESP_LOGI("es8388", "Line-In -> LEFT speaker ENABLED (Reg39=0x%02X).", cur);
+    turn_off_action:
+      - lambda: |-
+          uint8_t reg = 0x27, cur = 0x00;
+          id(bus_a).write(0x10, &reg, 1, false);
+          id(bus_a).read(0x10, &cur, 1);
+          cur &= ~(1 << 6);  // LI2LO disable
+          uint8_t buf[2] = { 0x27, cur };
+          id(bus_a).write(0x10, buf, 2);
+          ESP_LOGI("es8388", "Line-In -> LEFT speaker DISABLED (Reg39=0x%02X).", cur);
+
   - platform: template
     name: "SAME Allow: EAN (Emergency Action Notification)"
     id: mute_ean
@@ -785,7 +803,7 @@ switch:
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
   - platform: template
-    name: "SAME Allow: DMO (Practice/Demo Warning)"
+    name: "SAME Allow: DMO (Practice-Demo Warning)"
     id: mute_dmo
     icon: "mdi:bell-cancel"
     entity_category: config
