@@ -14,7 +14,6 @@ esphome:
     priority: -100
     then:
       - lambda: 'ESP_LOGI("same", "Boot complete; SAME decoder starting.");'
-      - output.turn_off: led_decode_output
       - lambda: 'id(decode_in_progress).publish_state(false);'
       - delay: 200ms
       - lambda: |-
@@ -27,27 +26,45 @@ esphome:
           id(bus_a).write(0x10, &reg, 1, false);
           id(bus_a).read(0x10, &readback, 1);
           ESP_LOGI("es8388", "ADCControl1 wrote 0x77, readback=0x%02X", readback);
-      # --- Line-in -> LEFT speaker (LOUT2) analog-bypass init (disabled at boot) ---
-      # Route LIN1 into the LEFT output mixer, enable LOUT2 (the left 3W amp),
-      # but leave the LIN->left-mixer path DISABLED until KEY1 / HA toggle enables it.
+      # --- Line-in -> LEFT speaker (LOUT2) analog-bypass init (path enabled but LI2LO gated) ---
       - lambda: |-
           auto es_write = [](uint8_t reg, uint8_t val) {
-            uint8_t buf[2] = { reg, val };
-            id(bus_a).write(0x10, buf, 2);
+            uint8_t b[2] = { reg, val };
+            id(bus_a).write(0x10, b, 2);
           };
-          // Reg 38 (DAC Control 16): LMIXSEL=000 (LIN1) for the left mixer.
-          es_write(0x26, 0x00);
-          // Reg 4 (DAC Power Mgmt): enable LOUT2 (bit3) so the left speaker amp is powered.
-          // Read-modify-write to avoid disturbing other bits.
-          {
-            uint8_t reg = 0x04, cur = 0x00;
+          auto es_read = [](uint8_t reg) -> uint8_t {
+            uint8_t cur = 0x00;
             id(bus_a).write(0x10, &reg, 1, false);
             id(bus_a).read(0x10, &cur, 1);
-            cur |= (1 << 3);           // LOUT2 enable
-            es_write(0x04, cur);
+            return cur;
+          };
+          // Reg 2 (Chip Power Mgmt): power up DAC digital + DAC analog reference.
+          {
+            uint8_t v = es_read(0x02);
+            v &= ~(1 << 6);   // dac_DigPDN -> normal
+            v &= ~(1 << 0);   // dacVref_PDN -> power up
+            es_write(0x02, v);
           }
-          // Reg 39 (DAC Control 17): LI2LO disabled (bit6=0), LI2LOVOL=000 (+6 dB) staged.
+          // Reg 4 (DAC Power Mgmt): power up left DAC, enable LOUT2 (bit3).
+          {
+            uint8_t v = es_read(0x04);
+            v &= ~(1 << 7);   // PdnDACL -> left DAC power up
+            v |=  (1 << 3);   // LOUT2 enable
+            es_write(0x04, v);
+          }
+          // Reg 25 (DAC Control 3): ensure DAC analog output NOT muted (clear DACMute bit2).
+          {
+            uint8_t v = es_read(0x19);
+            v &= ~(1 << 2);   // DACMute -> normal (un-muted)
+            es_write(0x19, v);
+          }
+          // Reg 38 (DAC Control 16): LMIXSEL=000 (LIN1) for the left mixer.
+          es_write(0x26, 0x00);
+          // Reg 39 (DAC Control 17): LI2LO disabled (bit6=0), LI2LOVOL=000 staged.
           es_write(0x27, 0x00);
+          // Reg 52 (DAC Control 30): known-good LOUT2/mixer reference bits (default 0xAA).
+          es_write(0x34, 0xAA);
+          ESP_LOGI("es8388", "Speaker (LOUT2) path initialized; LI2LO gated off.");
       - microphone.capture: same_mic
 
 esp32:
@@ -86,9 +103,6 @@ ota:
     password: !secret ota_password
   - platform: web_server
 
-# Local device UI reachable by IP address (or <node_name>.local/).
-# Version 3 = Home Assistant-style UI. Digest auth keeps the password off the
-# network. local: true embeds the JS/CSS so it works without internet access.
 web_server:
   port: 80
   version: 3
@@ -152,16 +166,125 @@ microphone:
         - lambda: |-
             id(same_dec).feed_bytes(x);
 
+# --- SPI bus for the ST7735S 1.8" 128x160 TFT ---
+spi:
+  clk_pin: GPIO23     # SCL
+  mosi_pin: GPIO19    # SDA (display is write-only, no MISO)
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 12
+  - file: "gfonts://Roboto"
+    id: font_large
+    size: 22
+
+color:
+  - id: c_minor
+    red: 20%
+    green: 80%
+    blue: 20%
+  - id: c_moderate
+    red: 95%
+    green: 85%
+    blue: 10%
+  - id: c_severe
+    red: 95%
+    green: 50%
+    blue: 10%
+  - id: c_extreme
+    red: 90%
+    green: 10%
+    blue: 10%
+  - id: c_none
+    red: 30%
+    green: 30%
+    blue: 30%
+  - id: c_text
+    red: 100%
+    green: 100%
+    blue: 100%
+  - id: c_decode
+    red: 10%
+    green: 90%
+    blue: 90%
+
+output:
+  # Software-controlled TFT backlight (BLK).
+  - platform: ledc
+    id: tft_backlight
+    pin: GPIO22
+
+light:
+  - platform: monochromatic
+    id: display_backlight
+    output: tft_backlight
+    name: "Display Backlight"
+    restore_mode: RESTORE_DEFAULT_ON
+
+display:
+  - platform: mipi_spi
+    id: tft
+    model: ST7735
+    cs_pin: GPIO5
+    dc_pin: GPIO18
+    reset_pin: GPIO21
+    dimensions:
+      width: 128
+      height: 160
+      offset_width: 0
+      offset_height: 0
+    color_order: bgr        # switch to rgb if colors look swapped
+    invert_colors: false    # set true if colors look inverted
+    rotation: 0
+    update_interval: 1s
+    lambda: |-
+      // ---- Clear background FIRST (prevents leftover white) ----
+      it.fill(Color::BLACK);
+
+      // ---- Severity bar (top solid bar; color = highest active alert) ----
+      Color bar = id(c_none);
+      std::string sev = id(active_severity);
+      if      (sev == "Extreme")  bar = id(c_extreme);
+      else if (sev == "Severe")   bar = id(c_severe);
+      else if (sev == "Moderate") bar = id(c_moderate);
+      else if (sev == "Minor")    bar = id(c_minor);
+      it.filled_rectangle(0, 0, it.get_width(), 16, bar);
+
+      // ---- Decode-in-progress indicator (top-right dot) ----
+      if (id(decode_in_progress).state) {
+        it.filled_circle(it.get_width() - 8, 8, 4, id(c_decode));
+      }
+
+      // ---- Current time ----
+      auto t = id(ha_time).now();
+      if (t.is_valid()) {
+        std::string ts = t.strftime("%H:%M:%S");
+        it.print(4, 22, id(font_large), id(c_text), ts.c_str());
+      } else {
+        it.print(4, 22, id(font_small), id(c_text), "Time syncing...");
+      }
+
+      // ---- Active alerts: scroll through the list, show name + end time ----
+      int n = id(active_count);
+      if (n <= 0) {
+        it.print(4, 52, id(font_small), id(c_text), "No active alerts");
+      } else {
+        int idx = id(active_scroll_idx) % n;
+        it.printf(4, 52, id(font_small), id(c_text), "(%d/%d) %s",
+                  idx + 1, n, id(active_name)[idx].c_str());
+        it.printf(4, 68, id(font_small), id(c_text), "ends %s",
+                  id(active_end)[idx].c_str());
+      }
+
 button:
   - platform: restart
     name: "Restart"
     id: same_restart
     icon: "mdi:restart"
 
-# KEY1 on the ESP32-Audio-Kit is IO36 (no external pull-up).
-# Press  -> turn the "Line-In Passthrough" switch ON.
-# Release -> turn it OFF. The switch does the actual ES8388 register write,
-# so the physical button and the HA toggle stay in sync.
+# KEY1 (IO36): toggle Line-In -> LEFT speaker passthrough.
+# KEY2 (IO13): toggle the display backlight on/off.
 binary_sensor:
   - platform: template
     id: decode_in_progress
@@ -178,10 +301,19 @@ binary_sensor:
       inverted: true
     on_press:
       then:
-        - switch.turn_on: linein_passthrough
-    on_release:
+        - switch.toggle: linein_passthrough
+
+  - platform: gpio
+    id: key2_button
+    name: "KEY2 (Display Toggle)"
+    pin:
+      number: GPIO13
+      mode:
+        input: true
+      inverted: true
+    on_press:
       then:
-        - switch.turn_off: linein_passthrough
+        - light.toggle: display_backlight
 
 interval:
   - interval: 2s
@@ -194,24 +326,80 @@ interval:
           else:
             - lambda: 'id(same_dec).set_api_connected(false);'
 
-output:
-  - platform: gpio
-    id: led_decode_output
-    pin:
-      number: GPIO22
-      inverted: true
+  # Active-alert expiry sweep + scroll advance (runs every second).
+  - interval: 1s
+    then:
+      - lambda: |-
+          uint32_t now = 0;
+          auto t = id(ha_time).now();
+          bool valid = t.is_valid();
+          if (valid) now = (uint32_t) t.timestamp;
+
+          if (valid) {
+            int w = 0;
+            for (int r = 0; r < id(active_count); r++) {
+              if (id(active_expiry_ts)[r] > now) {
+                id(active_name)[w]       = id(active_name)[r];
+                id(active_end)[w]        = id(active_end)[r];
+                id(active_severity_l)[w] = id(active_severity_l)[r];
+                id(active_expiry_ts)[w]  = id(active_expiry_ts)[r];
+                w++;
+              }
+            }
+            id(active_count) = w;
+          }
+
+          int best = 0;  // 0 none,1 Minor,2 Moderate,3 Severe,4 Extreme
+          for (int i = 0; i < id(active_count); i++) {
+            const std::string &s = id(active_severity_l)[i];
+            int rank = 0;
+            if      (s == "Extreme")  rank = 4;
+            else if (s == "Severe")   rank = 3;
+            else if (s == "Moderate") rank = 2;
+            else if (s == "Minor")    rank = 1;
+            if (rank > best) best = rank;
+          }
+          id(active_severity) = (best == 4) ? "Extreme"
+                              : (best == 3) ? "Severe"
+                              : (best == 2) ? "Moderate"
+                              : (best == 1) ? "Minor" : "";
+
+          if (id(active_count) > 0)
+            id(active_scroll_idx) = (id(active_scroll_idx) + 1) % id(active_count);
+          else
+            id(active_scroll_idx) = 0;
+
+          if (id(display_autoon_alert).state && id(active_count) > 0) {
+            auto call = id(display_backlight).turn_on();
+            call.perform();
+          }
 
 globals:
-  - id: led_on_since
-    type: uint32_t
+  - id: active_name
+    type: std::vector<std::string>
+    restore_value: no
+  - id: active_end
+    type: std::vector<std::string>
+    restore_value: no
+  - id: active_severity_l
+    type: std::vector<std::string>
+    restore_value: no
+  - id: active_expiry_ts
+    type: std::vector<uint32_t>
+    restore_value: no
+  - id: active_count
+    type: int
     restore_value: no
     initial_value: '0'
+  - id: active_scroll_idx
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: active_severity
+    type: std::string
+    restore_value: no
+    initial_value: '""'
 
-# Runtime-editable list of allowed county (SAME/FIPS) codes.
-# Enter one or more 6-digit codes (PSSCCC), comma-separated, e.g. "020173,020177".
-# Partial-county (P-digit) is ignored: matching is done on the last 5 digits (SSCCC),
-# so a code like 120173 (P=1) still matches an entered 020173 for the same county.
-# An EMPTY list means "no location filter" (all areas pass).
 text:
   - platform: template
     name: "SAME County Codes"
@@ -224,19 +412,6 @@ text:
     entity_category: config
     min_length: 0
     max_length: 255
-
-script:
-  - id: led_indicate_on
-    then:
-      - output.turn_on: led_decode_output
-      - lambda: 'id(decode_in_progress).publish_state(true); id(led_on_since) = millis();'
-
-  - id: led_indicate_off
-    mode: restart
-    then:
-      - delay: !lambda 'uint32_t e = millis() - id(led_on_since); return (e < 2000) ? (2000 - e) : 0;'
-      - output.turn_off: led_decode_output
-      - lambda: 'id(decode_in_progress).publish_state(false);'
 
 number:
   - platform: template
@@ -254,8 +429,7 @@ number:
     set_action:
       - lambda: 'id(same_dec).set_gain(x);'
 
-  # Speaker (LOUT2) volume for the Line-In -> LEFT speaker passthrough.
-  # Writes ES8388 Reg 48 (LOUT2VOL[5:0]): 0=-45dB ... 30=0dB ... 33=+4.5dB.
+  # Speaker (LOUT2) volume: ES8388 Reg 48 (LOUT2VOL): 0=-45dB ... 30=0dB ... 33=+4.5dB.
   - platform: template
     name: "Speaker Volume"
     id: speaker_volume_number
@@ -271,8 +445,8 @@ number:
       - lambda: |-
           uint8_t v = (uint8_t) x;
           if (v > 33) v = 33;
-          uint8_t buf[2] = { 0x30, v };   // Reg 48 = 0x30, LOUT2VOL
-          id(bus_a).write(0x10, buf, 2);
+          uint8_t b[2] = { 0x30, v };   // Reg 48 = 0x30, LOUT2VOL
+          id(bus_a).write(0x10, b, 2);
           ESP_LOGI("es8388", "Speaker Volume: LOUT2VOL=%u (Reg48=0x%02X).", v, v);
 
   - platform: template
@@ -325,7 +499,6 @@ number:
     set_action:
       - lambda: 'id(same_dec).set_resend_suppress_ms((uint32_t) (x * 1000.0f));'
 
-  # --- Preamble-lock tuning (redesign) ---
   - platform: template
     name: "SAME Preamble Energy Mult"
     id: same_pre_energy_number
@@ -343,13 +516,8 @@ number:
       - lambda: 'id(same_dec).set_preamble_energy_mult(x);'
 
 # --- Per-event-code allow/mute toggles ---
-# Semantics: switch ON = allow this event code (default). Switch OFF = mute it
-# on-device (the alert will NOT publish to the filtered header sensor nor fire
-# the Home Assistant event). Unknown/unlisted codes are always allowed.
 switch:
-  # Home Assistant / web-UI toggle for the Line-In -> LEFT speaker passthrough.
-  # This is the single source of truth: KEY1 turns it on/off, and it performs
-  # the actual ES8388 Reg 39 (LI2LO) enable/disable.
+  # Line-In -> LEFT speaker passthrough (single source of truth; KEY1 toggles it).
   - platform: template
     name: "Line-In Passthrough (Line-In to Left Speaker)"
     id: linein_passthrough
@@ -362,8 +530,8 @@ switch:
           id(bus_a).write(0x10, &reg, 1, false);
           id(bus_a).read(0x10, &cur, 1);
           cur |= (1 << 6);   // LI2LO enable
-          uint8_t buf[2] = { 0x27, cur };
-          id(bus_a).write(0x10, buf, 2);
+          uint8_t b[2] = { 0x27, cur };
+          id(bus_a).write(0x10, b, 2);
           ESP_LOGI("es8388", "Line-In -> LEFT speaker ENABLED (Reg39=0x%02X).", cur);
     turn_off_action:
       - lambda: |-
@@ -371,9 +539,17 @@ switch:
           id(bus_a).write(0x10, &reg, 1, false);
           id(bus_a).read(0x10, &cur, 1);
           cur &= ~(1 << 6);  // LI2LO disable
-          uint8_t buf[2] = { 0x27, cur };
-          id(bus_a).write(0x10, buf, 2);
+          uint8_t b[2] = { 0x27, cur };
+          id(bus_a).write(0x10, b, 2);
           ESP_LOGI("es8388", "Line-In -> LEFT speaker DISABLED (Reg39=0x%02X).", cur);
+
+  - platform: template
+    name: "Display: Auto-on for Active Alert"
+    id: display_autoon_alert
+    icon: "mdi:monitor-eye"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
 
   - platform: template
     name: "SAME Allow: EAN (Emergency Action Notification)"
@@ -856,14 +1032,10 @@ sensor:
             return x / total * 100.0;
 
 text_sensor:
-  # Filtered "last raw header": only alerts that pass BOTH the county filter and
-  # the per-code allow switch are published here (driven from on_alert lambda).
   - platform: template
     id: same_last_raw
     name: "SAME Last Raw Header"
 
-  # Unfiltered "show all" header: every decoded header is published here.
-  # Disabled by default.
   - platform: template
     id: same_last_raw_all
     name: "SAME Last Raw Header (All)"
@@ -893,66 +1065,46 @@ same_decoder:
   single_burst_min_ms: 3000
   post_emit_dead_ms: 500
   sample_rate: 48000
-  # Cross-session re-emit window (ms). 0 = never suppress cross-session repeats;
-  # max 900000 (15 min). In-transmission (3-burst) repeats are always collapsed.
-  # Tunable at runtime via the "SAME Re-emit Suppress Window" number entity.
   resend_suppress_ms: 3000
-  # --- Preamble lock (primary timing path) ---
-  # Minimum consecutive good preamble bit-periods to declare lock. This is a
-  # floor for reliable convergence, NOT a requirement to decode all 16 preamble
-  # bytes; a partial-but-sufficient run locks the clock. 32 bits (~4 bytes) is
-  # comfortably below the full 128-bit preamble.
   preamble_lock_bits: 32
   preamble_energy_mult: 8.0
   preamble_balance_max: 0.40
   lock_confidence_min: 0.5
   residual_drift_ppm: 12000.0
-  # --- Automatic closed-loop fallback (engages only on low confidence) ---
   fallback_conf_thresh: 0.20
   fallback_kp: 0.06
   fallback_ki: 0.0015
-  # --- EOM / watchdog ---
   eom_require_context: true
   eom_context_ms: 120000
   decode_watchdog_ms: 7500
   decode_count_sensor: same_decode_count
-  # NOTE: last_raw_sensor is intentionally UNBOUND from the C++ component so that
-  # the "SAME Last Raw Header" entity can be driven (filtered) from on_alert below.
-  # The unfiltered header is published to same_last_raw_all instead.
   on_sync:
     then:
-      - script.execute: led_indicate_on
+      - lambda: 'id(decode_in_progress).publish_state(true);'
   on_preamble:
     then:
       - lambda: |-
           auto t = id(ha_time).now();
           if (t.is_valid()) {
-            char buf[40];
-            t.strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z");
-            id(same_last_preamble_time).publish_state(buf);
+            std::string ts = t.strftime("%Y-%m-%dT%H:%M:%S%z");
+            id(same_last_preamble_time).publish_state(ts);
           } else {
             ESP_LOGW("same", "Preamble heard but time not synced yet; timestamp not published.");
           }
   on_alert:
     then:
-      - script.execute: led_indicate_off
-      # Timestamp is UNFILTERED: reflects decode activity regardless of filters.
+      - lambda: 'id(decode_in_progress).publish_state(false);'
       - lambda: |-
           auto t = id(ha_time).now();
           if (t.is_valid()) {
-            char buf[40];
-            t.strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z");
-            id(same_last_alert_time).publish_state(buf);
+            std::string ts = t.strftime("%Y-%m-%dT%H:%M:%S%z");
+            id(same_last_alert_time).publish_state(ts);
           } else {
             ESP_LOGW("same", "Alert decoded but time not synced yet; timestamp not published.");
           }
-      # Always publish the unfiltered "show all" header.
       - lambda: |-
           id(same_last_raw_all).publish_state(id(same_dec).last_raw_header());
-      # Apply county + per-code filters. If both pass: publish filtered header
-      # AND fire the Home Assistant event. Otherwise, suppress delivery to HA.
       - lambda: |-
-          // ---- Per-code allow switch lookup (ON = allow, OFF = mute) ----
           auto allow_code = [](const std::string &code) -> bool {
             if (code == "EAN") return id(mute_ean).state;
             if (code == "EAT") return id(mute_eat).state;
@@ -1018,13 +1170,10 @@ same_decoder:
             if (code == "DMO") return id(mute_dmo).state;
             if (code == "RMT") return id(mute_rmt).state;
             if (code == "RWT") return id(mute_rwt).state;
-            return true;  // unknown/unlisted code -> allow by default
+            return true;
           };
-
-          // ---- County filter (compare last 5 digits, ignore P-digit) ----
-          // Returns the last-5 "SSCCC" of a 6-digit code; passes shorter codes through.
           auto tail5 = [](const std::string &s) -> std::string {
-            if (s.size() >= 6) return s.substr(1);   // drop leading P-digit
+            if (s.size() >= 6) return s.substr(1);
             return s;
           };
 
@@ -1032,22 +1181,17 @@ same_decoder:
           std::string areas_raw = id(same_dec).last_areas_csv();
           std::string code = id(same_dec).last_event_code();
 
-          // Build allowed-county tail5 set from the comma-separated text entity.
           std::vector<std::string> allowed;
           {
             std::string cur;
             for (char ch : counties_raw) {
               if (ch == ',' || ch == ' ') {
                 if (!cur.empty()) { allowed.push_back(tail5(cur)); cur.clear(); }
-              } else {
-                cur += ch;
-              }
+              } else { cur += ch; }
             }
             if (!cur.empty()) allowed.push_back(tail5(cur));
           }
 
-          // County passes if the allowed list is empty (no filter) OR any of the
-          // header's area codes matches (by last-5 digits) an allowed county.
           bool county_ok = allowed.empty();
           if (!county_ok) {
             std::string cur;
@@ -1055,12 +1199,9 @@ same_decoder:
             for (char ch : areas_raw) {
               if (ch == ',' || ch == ' ') {
                 if (!cur.empty()) { area_tails.push_back(tail5(cur)); cur.clear(); }
-              } else {
-                cur += ch;
-              }
+              } else { cur += ch; }
             }
             if (!cur.empty()) area_tails.push_back(tail5(cur));
-
             for (auto &at : area_tails) {
               for (auto &al : allowed) {
                 if (at == al) { county_ok = true; break; }
@@ -1077,17 +1218,65 @@ same_decoder:
                    pass ? "DELIVER" : "SUPPRESS");
 
           if (pass) {
-            // Publish the filtered "last raw header".
             id(same_last_raw).publish_state(id(same_dec).last_raw_header());
-            // Fire the Home Assistant event for delivered alerts only.
+
+            // Compute expiry from the SAME "+TTTT" purge duration in the raw header.
+            std::string timing = id(same_dec).last_raw_header();
+            uint32_t dur_sec = 30 * 60;
+            {
+              size_t p = timing.find('+');
+              if (p != std::string::npos && timing.size() >= p + 5) {
+                std::string tttt = timing.substr(p + 1, 4);
+                if (tttt.size() == 4 &&
+                    isdigit((unsigned char)tttt[0]) && isdigit((unsigned char)tttt[1]) &&
+                    isdigit((unsigned char)tttt[2]) && isdigit((unsigned char)tttt[3])) {
+                  int hh = (tttt[0]-'0')*10 + (tttt[1]-'0');
+                  int mm = (tttt[2]-'0')*10 + (tttt[3]-'0');
+                  dur_sec = (uint32_t)(hh * 3600 + mm * 60);
+                  if (dur_sec == 0) dur_sec = 30 * 60;
+                }
+              }
+            }
+
+            uint32_t now = 0;
+            auto tt = id(ha_time).now();
+            if (tt.is_valid()) now = (uint32_t) tt.timestamp;
+            uint32_t expiry = now + dur_sec;
+
+            std::string name = id(same_dec).last_event_name();
+            std::string sev  = id(same_dec).last_severity();
+
+            std::string end_str = "?";
+            if (tt.is_valid()) {
+              int total_min = tt.hour * 60 + tt.minute + (int)(dur_sec / 60);
+              total_min %= (24 * 60);
+              if (total_min < 0) total_min += (24 * 60);
+              int eh = total_min / 60;
+              int em = total_min % 60;
+              char eb[8];
+              snprintf(eb, sizeof(eb), "%02d:%02d", eh, em);
+              end_str = std::string(eb);
+            }
+
+            int found = -1;
+            for (int i = 0; i < id(active_count); i++) {
+              if (id(active_name)[i] == name) { found = i; break; }
+            }
+            if (found >= 0) {
+              id(active_end)[found]        = end_str;
+              id(active_severity_l)[found] = sev;
+              id(active_expiry_ts)[found]  = expiry;
+            } else if (id(active_count) < 8) {
+              id(active_name).push_back(name);
+              id(active_end).push_back(end_str);
+              id(active_severity_l).push_back(sev);
+              id(active_expiry_ts).push_back(expiry);
+              id(active_count) = id(active_count) + 1;
+            }
           }
-      # Fire the HA event ONLY when filters pass. Implemented via a condition on
-      # a global set by the lambda above would be cleaner, but to keep this fully
-      # self-contained we re-evaluate the pass flag using an if/condition below.
       - if:
           condition:
             lambda: |-
-              // Re-evaluate pass compactly for the HA event gate.
               auto allow_code = [](const std::string &code) -> bool {
                 if (code == "EAN") return id(mute_ean).state;
                 if (code == "EAT") return id(mute_eat).state;
@@ -1207,5 +1396,4 @@ same_decoder:
                   raw: !lambda 'return id(same_dec).last_raw_header();'
   on_eom:
     then:
-      - script.execute: led_indicate_off
-      - lambda: 'ESP_LOGI("same", "EOM/indicator cleared.");'
+      - lambda: 'id(decode_in_progress).publish_state(false); ESP_LOGI("same", "EOM/indicator cleared.");'
