@@ -15,6 +15,7 @@ esphome:
     then:
       - lambda: 'ESP_LOGI("same", "Boot complete; SAME decoder starting.");'
       - lambda: 'id(decode_in_progress).publish_state(false);'
+      - output.turn_off: d4_led
       - delay: 200ms
       - lambda: |-
           std::vector<uint8_t> buf;
@@ -101,7 +102,6 @@ api:
 ota:
   - platform: esphome
     password: !secret ota_password
-  - platform: web_server
 
 web_server:
   port: 80
@@ -121,6 +121,7 @@ wifi:
     ssid: "${device_name} Fallback"
     password: !secret fallback_password
 
+  use_address: 192.168.90.27
 captive_portal:
 
 debug:
@@ -166,116 +167,13 @@ microphone:
         - lambda: |-
             id(same_dec).feed_bytes(x);
 
-# --- SPI bus for the ST7735S 1.8" 128x160 TFT ---
-spi:
-  clk_pin: GPIO23     # SCL
-  mosi_pin: GPIO19    # SDA (display is write-only, no MISO)
-
-font:
-  - file: "gfonts://Roboto"
-    id: font_small
-    size: 12
-  - file: "gfonts://Roboto"
-    id: font_large
-    size: 22
-
-color:
-  - id: c_minor
-    red: 20%
-    green: 80%
-    blue: 20%
-  - id: c_moderate
-    red: 95%
-    green: 85%
-    blue: 10%
-  - id: c_severe
-    red: 95%
-    green: 50%
-    blue: 10%
-  - id: c_extreme
-    red: 90%
-    green: 10%
-    blue: 10%
-  - id: c_none
-    red: 30%
-    green: 30%
-    blue: 30%
-  - id: c_text
-    red: 100%
-    green: 100%
-    blue: 100%
-  - id: c_decode
-    red: 10%
-    green: 90%
-    blue: 90%
-
 output:
-  # Software-controlled TFT backlight (BLK).
-  - platform: ledc
-    id: tft_backlight
-    pin: GPIO22
-
-light:
-  - platform: monochromatic
-    id: display_backlight
-    output: tft_backlight
-    name: "Display Backlight"
-    restore_mode: RESTORE_DEFAULT_ON
-
-display:
-  - platform: mipi_spi
-    id: tft
-    model: ST7735
-    cs_pin: GPIO5
-    dc_pin: GPIO18
-    reset_pin: GPIO21
-    dimensions:
-      width: 128
-      height: 160
-      offset_width: 0
-      offset_height: 0
-    color_order: bgr        # switch to rgb if colors look swapped
-    invert_colors: false    # set true if colors look inverted
-    rotation: 0
-    update_interval: 1s
-    lambda: |-
-      // ---- Clear background FIRST (prevents leftover white) ----
-      it.fill(Color::BLACK);
-
-      // ---- Severity bar (top solid bar; color = highest active alert) ----
-      Color bar = id(c_none);
-      std::string sev = id(active_severity);
-      if      (sev == "Extreme")  bar = id(c_extreme);
-      else if (sev == "Severe")   bar = id(c_severe);
-      else if (sev == "Moderate") bar = id(c_moderate);
-      else if (sev == "Minor")    bar = id(c_minor);
-      it.filled_rectangle(0, 0, it.get_width(), 16, bar);
-
-      // ---- Decode-in-progress indicator (top-right dot) ----
-      if (id(decode_in_progress).state) {
-        it.filled_circle(it.get_width() - 8, 8, 4, id(c_decode));
-      }
-
-      // ---- Current time ----
-      auto t = id(ha_time).now();
-      if (t.is_valid()) {
-        std::string ts = t.strftime("%H:%M:%S");
-        it.print(4, 22, id(font_large), id(c_text), ts.c_str());
-      } else {
-        it.print(4, 22, id(font_small), id(c_text), "Time syncing...");
-      }
-
-      // ---- Active alerts: scroll through the list, show name + end time ----
-      int n = id(active_count);
-      if (n <= 0) {
-        it.print(4, 52, id(font_small), id(c_text), "No active alerts");
-      } else {
-        int idx = id(active_scroll_idx) % n;
-        it.printf(4, 52, id(font_small), id(c_text), "(%d/%d) %s",
-                  idx + 1, n, id(active_name)[idx].c_str());
-        it.printf(4, 68, id(font_small), id(c_text), "ends %s",
-                  id(active_end)[idx].c_str());
-      }
+  # D4 LED indicator (on at ZCZC sync, off at EOM). Active-low on this board.
+  - platform: gpio
+    id: d4_led
+    pin:
+      number: GPIO22
+      inverted: true
 
 button:
   - platform: restart
@@ -284,7 +182,6 @@ button:
     icon: "mdi:restart"
 
 # KEY1 (IO36): toggle Line-In -> LEFT speaker passthrough.
-# KEY2 (IO13): toggle the display backlight on/off.
 binary_sensor:
   - platform: template
     id: decode_in_progress
@@ -302,18 +199,6 @@ binary_sensor:
     on_press:
       then:
         - switch.toggle: linein_passthrough
-
-  - platform: gpio
-    id: key2_button
-    name: "KEY2 (Display Toggle)"
-    pin:
-      number: GPIO13
-      mode:
-        input: true
-      inverted: true
-    on_press:
-      then:
-        - light.toggle: display_backlight
 
 interval:
   - interval: 2s
@@ -368,11 +253,6 @@ interval:
             id(active_scroll_idx) = (id(active_scroll_idx) + 1) % id(active_count);
           else
             id(active_scroll_idx) = 0;
-
-          if (id(display_autoon_alert).state && id(active_count) > 0) {
-            auto call = id(display_backlight).turn_on();
-            call.perform();
-          }
 
 globals:
   - id: active_name
@@ -542,14 +422,6 @@ switch:
           uint8_t b[2] = { 0x27, cur };
           id(bus_a).write(0x10, b, 2);
           ESP_LOGI("es8388", "Line-In -> LEFT speaker DISABLED (Reg39=0x%02X).", cur);
-
-  - platform: template
-    name: "Display: Auto-on for Active Alert"
-    id: display_autoon_alert
-    icon: "mdi:monitor-eye"
-    entity_category: config
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_ON
 
   - platform: template
     name: "SAME Allow: EAN (Emergency Action Notification)"
@@ -1081,6 +953,7 @@ same_decoder:
   on_sync:
     then:
       - lambda: 'id(decode_in_progress).publish_state(true);'
+      - output.turn_on: d4_led
   on_preamble:
     then:
       - lambda: |-
@@ -1397,3 +1270,4 @@ same_decoder:
   on_eom:
     then:
       - lambda: 'id(decode_in_progress).publish_state(false); ESP_LOGI("same", "EOM/indicator cleared.");'
+      - output.turn_off: d4_led
