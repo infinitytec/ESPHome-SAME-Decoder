@@ -399,7 +399,7 @@ number:
 switch:
   # Line-In -> LEFT speaker passthrough (single source of truth; KEY1 toggles it).
   - platform: template
-    name: "Line-In Passthrough (Line-In to Left Speaker)"
+    name: "Enable Speaker"
     id: linein_passthrough
     icon: "mdi:speaker"
     optimistic: true
