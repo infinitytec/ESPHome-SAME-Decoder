@@ -54,6 +54,7 @@ rest_command:
     method: GET
     timeout: 15
     verify_ssl: true
+    content_type: "application/geo+json"
     headers:
       User-Agent: "{{ user_agent }}"
       Accept: "application/geo+json"
@@ -74,10 +75,10 @@ rest_command:
 # -----------------------------------------------------------------------------
 template:
   - trigger:
-      - platform: event
+      - trigger: event
         event_type: same.alert_enriched
         id: enriched
-      - platform: time_pattern
+      - trigger: time_pattern
         minutes: "/1"
         id: tick
 
@@ -86,10 +87,45 @@ template:
       - name: "SAME Alerts (Home)"
         unique_id: same_alerts_home
         icon: "mdi:alert"
-        variables:
-          location_key: "home"
-          now_ts: "{{ as_timestamp(now()) }}"
-          next_alerts: >-
+        state: >-
+          {% set location_key = 'home' %}
+          {% set now_ts = as_timestamp(now()) %}
+          {% set current = state_attr(this.entity_id, 'Alerts') | default([], true) | list %}
+
+          {# 1) Apply the event action, but only for OUR location_key #}
+          {% if trigger.id == 'enriched' and trigger.event.data.location_key == location_key %}
+            {% set ev = trigger.event.data %}
+            {% set action = ev.action | default('add') %}
+            {% set alert = ev.alert | default({}) %}
+            {% set rid = alert.id | default('') %}
+            {% set filtered = [] %}
+            {% for a in current %}
+              {% if a.id | default('') != rid %}
+                {% set _ = filtered.append(a) %}
+              {% endif %}
+            {% endfor %}
+            {% if action in ['add', 'update'] and rid != '' %}
+              {% set _ = filtered.append(alert) %}
+            {% endif %}
+            {% set current = filtered %}
+          {% endif %}
+
+          {# 2) Prune expired (on BOTH the event and the minute tick).
+                Keep an alert with no parseable expiry, or expiry > now. #}
+          {% set ns = namespace(keep=[]) %}
+          {% for a in current %}
+            {% set exp = a.expires | default(a.ends | default('')) %}
+            {% set exp_ts = as_timestamp(exp, 0) if (exp is string and exp != '') else 0 %}
+            {% if exp_ts == 0 or exp_ts > now_ts %}
+              {% set _ = ns.keep.append(a) %}
+            {% endif %}
+          {% endfor %}
+
+          {{ ns.keep | count }}
+        attributes:
+          Alerts: >-
+            {% set location_key = 'home' %}
+            {% set now_ts = as_timestamp(now()) %}
             {% set current = state_attr(this.entity_id, 'Alerts') | default([], true) | list %}
 
             {# 1) Apply the event action, but only for OUR location_key #}
@@ -122,8 +158,5 @@ template:
             {% endfor %}
 
             {{ ns.keep }}
-        state: "{{ next_alerts | count }}"
-        attributes:
-          Alerts: "{{ next_alerts }}"
           friendly_name: "SAME Alerts (Home)"
           icon: "mdi:alert"
