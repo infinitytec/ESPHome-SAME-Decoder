@@ -537,7 +537,7 @@ action:
   - service: rest_command.nws_alerts_get
     data:
       url: >-
-        https://api.weather.gov/alerts/active?point={{ lat }},{{ lon }}&status=actual&message_type=Alert,Update
+        https://api.weather.gov/alerts/active?point={{ lat }},{{ lon }}&status=actual&message_type=alert,update
       user_agent: "{{ user_agent }}"
     response_variable: resp_point
 
@@ -685,7 +685,7 @@ action:
   - service: rest_command.nws_alerts_get
     data:
       url: >-
-        https://api.weather.gov/alerts/active?area={{ state_code }}&status=actual&message_type=Alert,Update
+        https://api.weather.gov/alerts/active?area={{ state_code }}&status=actual&message_type=alert,update
       user_agent: "{{ user_agent }}"
     response_variable: resp_area
 
@@ -825,7 +825,7 @@ action:
       - service: rest_command.nws_alerts_get
         data:
           url: >-
-            https://api.weather.gov/alerts/active?point={{ lat }},{{ lon }}&status=actual&message_type=Alert,Update
+            https://api.weather.gov/alerts/active?point={{ lat }},{{ lon }}&status=actual&message_type=alert,update
           user_agent: "{{ user_agent }}"
         response_variable: r2_point
 
@@ -972,7 +972,7 @@ action:
               - service: rest_command.nws_alerts_get
                 data:
                   url: >-
-                    https://api.weather.gov/alerts/active?area={{ state_code }}&status=actual&message_type=Alert,Update
+                    https://api.weather.gov/alerts/active?area={{ state_code }}&status=actual&message_type=alert,update
                   user_agent: "{{ user_agent }}"
                 response_variable: r2_area
               - variables:
