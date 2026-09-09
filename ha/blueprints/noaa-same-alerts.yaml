@@ -15,7 +15,7 @@
 #
 #  DECISION MODEL (point-first short-circuit; SAME trusted while API lags)
 #    Let C = "alert exists somewhere in the county per NWS"
-#        P = "alert covers our precise coordinates per NWS"
+#        P = "alert covers our precise coordinates (or +-0.01 halo) per NWS"
 #      * Offline sensor off/unavailable -> FIRE SAME fallback (validated_by=offline)
 #      * P = true                        -> FIRE + ENRICH  (validated_by=api_point)
 #      * P = false, C = true             -> SUPPRESS (in county, not our point)
@@ -25,6 +25,16 @@
 #                                             - P false, C true -> CLEAR (remove)
 #                                             - still C false  -> keep as fallback
 #      * SAME status "Cancel"            -> CLEAR (remove) immediately
+#
+#  SUPPRESS-UNCONFIRMED MODE (optional; online-only confirm-before-fire)
+#    When suppress_unconfirmed = true:
+#      * Offline                         -> FIRE (no pending note), respect recheck
+#      * API failed/timeout/non-200      -> FIRE (no pending note), respect recheck
+#      * API 200 + P = true              -> FIRE + ENRICH (Confirmed by NWS)
+#      * API 200 + P = false             -> SUPPRESS (do not fire)
+#
+#  POINT MATCHING uses a +-0.01 degree halo: the exact point plus four corner
+#  points are queried; ANY match counts as P = true.
 #
 #  NOTIFICATIONS
 #    - New alert: a notification is sent on every FIRE (offline, same_pending,
@@ -169,6 +179,19 @@ blueprint:
       selector:
         text:
 
+    suppress_unconfirmed:
+      name: (Optional) Suppress unconfirmed alerts (online only)
+      description: >
+        When ON and the Internet is up, wait for a 200 from api.weather.gov
+        confirming the alert covers your location (+-0.01 halo) before sending.
+        If the API affirmatively returns no matching alert, the alert is
+        SUPPRESSED. If offline, or the API errors/times out/returns non-200,
+        the alert is fired anyway (with no pending note) and rechecks are
+        still respected. Default OFF preserves the original behavior.
+      default: false
+      selector:
+        boolean:
+
     enable_recheck:
       name: (Optional) Enable T+recheck
       description: >
@@ -266,6 +289,7 @@ variables:
   in_longitude: !input longitude
   tol: !input match_tolerance_seconds
   suppress_test_codes: !input suppress_test_codes
+  suppress_unconfirmed: !input suppress_unconfirmed
   enable_recheck: !input enable_recheck
   recheck_delay_seconds: !input recheck_delay_seconds
   notify_service: !input notify_service
@@ -321,6 +345,18 @@ variables:
   # ---- Coordinates (explicit inputs only) ----
   lat: "{{ in_latitude }}"
   lon: "{{ in_longitude }}"
+
+  # ---- +-0.01 halo point list: center + four corners (all coordinate lookups) ----
+  halo_points: >-
+    {%- set la = in_latitude | float(0) -%}
+    {%- set lo = in_longitude | float(0) -%}
+    {{ [
+        [la, lo],
+        [la + 0.01, lo + 0.01],
+        [la + 0.01, lo - 0.01],
+        [la - 0.01, lo + 0.01],
+        [la - 0.01, lo - 0.01]
+      ] }}
 
   # ---- SAME event_code -> NWS event-name map (common codes) ----
   event_name_map: >-
@@ -489,17 +525,21 @@ action:
               action: add
               alert: "{{ alert_for_notify }}"
           # ---- notify (new alert) ----
+          #  Offline: when suppress_unconfirmed is ON we omit the "pending" note.
           - variables:
               _event: "{{ alert_for_notify.Event | default('Weather Alert') }}"
               _sev: "{{ (alert_for_notify.Severity | default('Unknown')) | title }}"
               _display: "{{ alert_for_notify.DisplayDesc | default(_event) }}"
-              _expires: "{{ alert_for_notify.Expires | default('') }}"
+              _expires_raw: "{{ alert_for_notify.Expires | default('') }}"
+              _expires: >-
+                {{ as_timestamp(_expires_raw) | timestamp_custom('%A, %B %-d at %-I:%M %p %Z', true)
+                   if _expires_raw != '' else '' }}
               _id: "{{ alert_for_notify.ID | default('unknown') }}"
-              _confidence_note: "Radio-only (no internet)"
+              _confidence_note: "{{ '' if suppress_unconfirmed else 'Radio-only (no internet)' }}"
               _should_notify: "{{ (severity_allowlist | length == 0) or (_sev in severity_allowlist) }}"
               _title: "{{ (title_prefix ~ ' ') if title_prefix | length > 0 else '' }}{{ _event }} ({{ _sev }})"
               _message: >-
-                {{ _display -}}
+                {{ _display }}
                 {% if _confidence_note %}
 
                 {{ _confidence_note }}{% endif %}
@@ -532,49 +572,66 @@ action:
           - stop: "Offline SAME fallback fired + notified."
 
   # ===========================================================================
-  #  Online path - POINT query first (determines P and enrichment)
+  #  Online path - POINT query first (+-0.01 halo; determines P and enrichment)
+  #  Queries center + four corners; first matching feature wins. Also tracks
+  #  whether ALL queries failed (error/timeout/non-200) for suppress mode.
   # ===========================================================================
-  - service: rest_command.nws_alerts_get
-    data:
-      url: >-
-        https://api.weather.gov/alerts/active?point={{ lat }},{{ lon }}&status=actual&message_type=alert,update
-      user_agent: "{{ user_agent }}"
-    response_variable: resp_point
-
   - variables:
-      point_body: >-
-        {% set raw = resp_point.content | default('') %}
-        {{ (raw | from_json) if raw is string and raw != '' else (raw if raw is mapping else {}) }}
-      point_features: "{{ point_body.features | default([], true) | list }}"
-      point_best: >-
-        {%- set ns = namespace(best=none, best_exp=9999999, best_on=9999999) -%}
-        {%- for f in point_features -%}
-          {%- set p = f.properties | default({}) -%}
-          {%- set fevent = (p.event | default('') | lower) -%}
-          {%- set same_list = p.geocode.SAME | default([]) -%}
-          {%- set cns = namespace(county=false) -%}
-          {%- for code in same_list -%}
-            {%- if (code | string)[-5:] == ssccc -%}{%- set cns.county = true -%}{%- endif -%}
-          {%- endfor -%}
-          {%- if (fevent in acceptable_events) and cns.county -%}
-            {%- set pend = p.expires | default(p.ends | default('')) -%}
-            {%- set pend_ts = as_timestamp(pend, 0) if (pend is string and pend != '') else 0 -%}
-            {%- set exp_delta = ((pend_ts - same_expires_ts) | abs) if (pend_ts > 0 and same_expires_ts > 0) else 0 -%}
-            {%- set onset_api = p.onset | default(p.effective | default('')) -%}
-            {%- set onset_ts = as_timestamp(onset_api, 0) if (onset_api is string and onset_api != '') else 0 -%}
-            {%- set on_delta = ((onset_ts - same_onset_ts) | abs) if (onset_ts > 0 and same_onset_ts > 0) else 0 -%}
-            {%- set onset_ok = (same_onset_ts == 0 or onset_ts == 0 or on_delta <= tol) -%}
-            {%- if (exp_delta <= tol) and onset_ok -%}
-              {%- if (exp_delta < ns.best_exp) or (exp_delta == ns.best_exp and on_delta < ns.best_on) -%}
-                {%- set ns.best = f -%}
-                {%- set ns.best_exp = exp_delta -%}
-                {%- set ns.best_on = on_delta -%}
-              {%- endif -%}
-            {%- endif -%}
-          {%- endif -%}
-        {%- endfor -%}
-        {{ ns.best }}
-      p_match: "{{ point_best is not none }}"
+      point_best: none
+      p_match: false
+      any_api_ok: false
+
+  - repeat:
+      for_each: "{{ halo_points }}"
+      sequence:
+        - if:
+            - condition: template
+              value_template: "{{ not p_match }}"
+          then:
+            - service: rest_command.nws_alerts_get
+              data:
+                url: >-
+                  https://api.weather.gov/alerts/active?point={{ repeat.item[0] }},{{ repeat.item[1] }}&status=actual&message_type=alert,update
+                user_agent: "{{ user_agent }}"
+              response_variable: resp_point
+            - variables:
+                api_ok: >-
+                  {{ (resp_point is mapping) and (resp_point.status | default(0) | int(0) == 200) }}
+                any_api_ok: "{{ any_api_ok or api_ok }}"
+                point_body: >-
+                  {% set raw = resp_point.content | default('') %}
+                  {{ (raw | from_json) if raw is string and raw != '' else (raw if raw is mapping else {}) }}
+                point_features: "{{ point_body.features | default([], true) | list }}"
+                this_best: >-
+                  {%- set ns = namespace(best=none, best_exp=9999999, best_on=9999999) -%}
+                  {%- for f in point_features -%}
+                    {%- set p = f.properties | default({}) -%}
+                    {%- set fevent = (p.event | default('') | lower) -%}
+                    {%- set same_list = p.geocode.SAME | default([]) -%}
+                    {%- set cns = namespace(county=false) -%}
+                    {%- for code in same_list -%}
+                      {%- if (code | string)[-5:] == ssccc -%}{%- set cns.county = true -%}{%- endif -%}
+                    {%- endfor -%}
+                    {%- if (fevent in acceptable_events) and cns.county -%}
+                      {%- set pend = p.expires | default(p.ends | default('')) -%}
+                      {%- set pend_ts = as_timestamp(pend, 0) if (pend is string and pend != '') else 0 -%}
+                      {%- set exp_delta = ((pend_ts - same_expires_ts) | abs) if (pend_ts > 0 and same_expires_ts > 0) else 0 -%}
+                      {%- set onset_api = p.onset | default(p.effective | default('')) -%}
+                      {%- set onset_ts = as_timestamp(onset_api, 0) if (onset_api is string and onset_api != '') else 0 -%}
+                      {%- set on_delta = ((onset_ts - same_onset_ts) | abs) if (onset_ts > 0 and same_onset_ts > 0) else 0 -%}
+                      {%- set onset_ok = (same_onset_ts == 0 or onset_ts == 0 or on_delta <= tol) -%}
+                      {%- if (exp_delta <= tol) and onset_ok -%}
+                        {%- if (exp_delta < ns.best_exp) or (exp_delta == ns.best_exp and on_delta < ns.best_on) -%}
+                          {%- set ns.best = f -%}
+                          {%- set ns.best_exp = exp_delta -%}
+                          {%- set ns.best_on = on_delta -%}
+                        {%- endif -%}
+                      {%- endif -%}
+                    {%- endif -%}
+                  {%- endfor -%}
+                  {{ ns.best }}
+                point_best: "{{ this_best if this_best is not none else point_best }}"
+                p_match: "{{ p_match or (this_best is not none) }}"
 
   - choose:
       # P true -> fire enriched + notify, done.
@@ -639,13 +696,16 @@ action:
               _event: "{{ alert_for_notify.Event | default('Weather Alert') }}"
               _sev: "{{ (alert_for_notify.Severity | default('Unknown')) | title }}"
               _display: "{{ alert_for_notify.DisplayDesc | default(_event) }}"
-              _expires: "{{ alert_for_notify.Expires | default('') }}"
+              _expires_raw: "{{ alert_for_notify.Expires | default('') }}"
+              _expires: >-
+                {{ as_timestamp(_expires_raw) | timestamp_custom('%A, %B %-d at %-I:%M %p %Z', true)
+                   if _expires_raw != '' else '' }}
               _url: "{{ alert_for_notify.URL | default('') }}"
               _id: "{{ alert_for_notify.ID | default('unknown') }}"
               _should_notify: "{{ (severity_allowlist | length == 0) or (_sev in severity_allowlist) }}"
               _title: "{{ (title_prefix ~ ' ') if title_prefix | length > 0 else '' }}{{ _event }} ({{ _sev }})"
               _message: >-
-                {{ _display -}}
+                {{ _display }}
 
                 Confirmed by NWS
                 {% if _expires %}
@@ -678,6 +738,18 @@ action:
                       message: "{{ _message }}"
                       notification_id: "same_{{ _id }}"
           - stop: "Point match enriched, fired + notified."
+
+  # ===========================================================================
+  #  Suppress-unconfirmed short-circuit:
+  #  If suppress_unconfirmed is ON and at least one API call succeeded (200) but
+  #  no point match was found, the API affirmatively said "not for us" -> SUPPRESS.
+  #  (If NO call succeeded, we fall through and fire below as API-unavailable.)
+  # ===========================================================================
+  - if:
+      - condition: template
+        value_template: "{{ suppress_unconfirmed and any_api_ok and (not p_match) }}"
+    then:
+      - stop: "Suppressed: online confirm-before-fire, API returned no matching alert."
 
   # ===========================================================================
   #  No point match -> COUNTY existence check via area=STATE (determines C)
@@ -730,7 +802,10 @@ action:
           - stop: "Suppressed: county match exists but our point is not covered."
 
   # ---------------------------------------------------------------------------
-  #  C false & P false -> API is lagging. FIRE SAME fallback + notify.
+  #  C false & P false -> API is lagging OR unavailable. FIRE SAME fallback + notify.
+  #  When suppress_unconfirmed is ON, we only reach here if NO API call succeeded
+  #  (offline was handled earlier; a clean 200-with-no-match was suppressed above).
+  #  In that case we omit the "pending" note.
   # ---------------------------------------------------------------------------
   - variables:
       alert_for_notify:
@@ -771,19 +846,24 @@ action:
       action: add
       alert: "{{ alert_for_notify }}"
 
-  # ---- notify (new, pending confirmation) ----
+  # ---- notify (new; "pending" note omitted when suppress_unconfirmed is ON) ----
   - variables:
       _event: "{{ alert_for_notify.Event | default('Weather Alert') }}"
       _sev: "{{ (alert_for_notify.Severity | default('Unknown')) | title }}"
       _display: "{{ alert_for_notify.DisplayDesc | default(_event) }}"
-      _expires: "{{ alert_for_notify.Expires | default('') }}"
+      _expires_raw: "{{ alert_for_notify.Expires | default('') }}"
+      _expires: >-
+        {{ as_timestamp(_expires_raw) | timestamp_custom('%A, %B %-d at %-I:%M %p %Z', true)
+           if _expires_raw != '' else '' }}
       _id: "{{ alert_for_notify.ID | default('unknown') }}"
+      _pending_note: "{{ '' if suppress_unconfirmed else 'Pending NWS confirmation' }}"
       _should_notify: "{{ (severity_allowlist | length == 0) or (_sev in severity_allowlist) }}"
       _title: "{{ (title_prefix ~ ' ') if title_prefix | length > 0 else '' }}{{ _event }} ({{ _sev }})"
       _message: >-
-        {{ _display -}}
+        {{ _display }}
+        {% if _pending_note %}
 
-        Pending NWS confirmation
+        {{ _pending_note }}{% endif %}
         {% if _expires %}
 
         Expires: {{ _expires }}{% endif %}
@@ -812,7 +892,8 @@ action:
               notification_id: "same_{{ _id }}"
 
   # ---------------------------------------------------------------------------
-  #  Optional single T+recheck for the API-lag case.
+  #  Optional single T+recheck for the API-lag / API-unavailable case.
+  #  Re-runs the +-0.01 halo point query once.
   # ---------------------------------------------------------------------------
   - if:
       - condition: template
@@ -821,48 +902,59 @@ action:
       - delay:
           seconds: "{{ recheck_delay_seconds }}"
 
-      # Re-run the POINT query once.
-      - service: rest_command.nws_alerts_get
-        data:
-          url: >-
-            https://api.weather.gov/alerts/active?point={{ lat }},{{ lon }}&status=actual&message_type=alert,update
-          user_agent: "{{ user_agent }}"
-        response_variable: r2_point
-
       - variables:
-          r2_body: >-
-            {% set raw = r2_point.content | default('') %}
-            {{ (raw | from_json) if raw is string and raw != '' else (raw if raw is mapping else {}) }}
-          r2_features: "{{ r2_body.features | default([], true) | list }}"
-          r2_point_best: >-
-            {%- set ns = namespace(best=none, best_exp=9999999, best_on=9999999) -%}
-            {%- for f in r2_features -%}
-              {%- set p = f.properties | default({}) -%}
-              {%- set fevent = (p.event | default('') | lower) -%}
-              {%- set same_list = p.geocode.SAME | default([]) -%}
-              {%- set cns = namespace(county=false) -%}
-              {%- for code in same_list -%}
-                {%- if (code | string)[-5:] == ssccc -%}{%- set cns.county = true -%}{%- endif -%}
-              {%- endfor -%}
-              {%- if (fevent in acceptable_events) and cns.county -%}
-                {%- set pend = p.expires | default(p.ends | default('')) -%}
-                {%- set pend_ts = as_timestamp(pend, 0) if (pend is string and pend != '') else 0 -%}
-                {%- set exp_delta = ((pend_ts - same_expires_ts) | abs) if (pend_ts > 0 and same_expires_ts > 0) else 0 -%}
-                {%- set onset_api = p.onset | default(p.effective | default('')) -%}
-                {%- set onset_ts = as_timestamp(onset_api, 0) if (onset_api is string and onset_api != '') else 0 -%}
-                {%- set on_delta = ((onset_ts - same_onset_ts) | abs) if (onset_ts > 0 and same_onset_ts > 0) else 0 -%}
-                {%- set onset_ok = (same_onset_ts == 0 or onset_ts == 0 or on_delta <= tol) -%}
-                {%- if (exp_delta <= tol) and onset_ok -%}
-                  {%- if (exp_delta < ns.best_exp) or (exp_delta == ns.best_exp and on_delta < ns.best_on) -%}
-                    {%- set ns.best = f -%}
-                    {%- set ns.best_exp = exp_delta -%}
-                    {%- set ns.best_on = on_delta -%}
-                  {%- endif -%}
-                {%- endif -%}
-              {%- endif -%}
-            {%- endfor -%}
-            {{ ns.best }}
-          r2_p_match: "{{ r2_point_best is not none }}"
+          r2_point_best: none
+          r2_p_match: false
+
+      # Re-run the POINT query once, across the +-0.01 halo.
+      - repeat:
+          for_each: "{{ halo_points }}"
+          sequence:
+            - if:
+                - condition: template
+                  value_template: "{{ not r2_p_match }}"
+              then:
+                - service: rest_command.nws_alerts_get
+                  data:
+                    url: >-
+                      https://api.weather.gov/alerts/active?point={{ repeat.item[0] }},{{ repeat.item[1] }}&status=actual&message_type=alert,update
+                    user_agent: "{{ user_agent }}"
+                  response_variable: r2_point
+                - variables:
+                    r2_body: >-
+                      {% set raw = r2_point.content | default('') %}
+                      {{ (raw | from_json) if raw is string and raw != '' else (raw if raw is mapping else {}) }}
+                    r2_features: "{{ r2_body.features | default([], true) | list }}"
+                    r2_this_best: >-
+                      {%- set ns = namespace(best=none, best_exp=9999999, best_on=9999999) -%}
+                      {%- for f in r2_features -%}
+                        {%- set p = f.properties | default({}) -%}
+                        {%- set fevent = (p.event | default('') | lower) -%}
+                        {%- set same_list = p.geocode.SAME | default([]) -%}
+                        {%- set cns = namespace(county=false) -%}
+                        {%- for code in same_list -%}
+                          {%- if (code | string)[-5:] == ssccc -%}{%- set cns.county = true -%}{%- endif -%}
+                        {%- endfor -%}
+                        {%- if (fevent in acceptable_events) and cns.county -%}
+                          {%- set pend = p.expires | default(p.ends | default('')) -%}
+                          {%- set pend_ts = as_timestamp(pend, 0) if (pend is string and pend != '') else 0 -%}
+                          {%- set exp_delta = ((pend_ts - same_expires_ts) | abs) if (pend_ts > 0 and same_expires_ts > 0) else 0 -%}
+                          {%- set onset_api = p.onset | default(p.effective | default('')) -%}
+                          {%- set onset_ts = as_timestamp(onset_api, 0) if (onset_api is string and onset_api != '') else 0 -%}
+                          {%- set on_delta = ((onset_ts - same_onset_ts) | abs) if (onset_ts > 0 and same_onset_ts > 0) else 0 -%}
+                          {%- set onset_ok = (same_onset_ts == 0 or onset_ts == 0 or on_delta <= tol) -%}
+                          {%- if (exp_delta <= tol) and onset_ok -%}
+                            {%- if (exp_delta < ns.best_exp) or (exp_delta == ns.best_exp and on_delta < ns.best_on) -%}
+                              {%- set ns.best = f -%}
+                              {%- set ns.best_exp = exp_delta -%}
+                              {%- set ns.best_on = on_delta -%}
+                            {%- endif -%}
+                          {%- endif -%}
+                        {%- endif -%}
+                      {%- endfor -%}
+                      {{ ns.best }}
+                    r2_point_best: "{{ r2_this_best if r2_this_best is not none else r2_point_best }}"
+                    r2_p_match: "{{ r2_p_match or (r2_this_best is not none) }}"
 
       - choose:
           # Point now matches -> UPDATE to enriched (+ optional confirmation notify).
@@ -927,13 +1019,16 @@ action:
                   _event: "{{ alert_for_notify.Event | default('Weather Alert') }}"
                   _sev: "{{ (alert_for_notify.Severity | default('Unknown')) | title }}"
                   _display: "{{ alert_for_notify.DisplayDesc | default(_event) }}"
-                  _expires: "{{ alert_for_notify.Expires | default('') }}"
+                  _expires_raw: "{{ alert_for_notify.Expires | default('') }}"
+                  _expires: >-
+                    {{ as_timestamp(_expires_raw) | timestamp_custom('%A, %B %-d at %-I:%M %p %Z', true)
+                       if _expires_raw != '' else '' }}
                   _url: "{{ alert_for_notify.URL | default('') }}"
                   _id: "{{ alert_for_notify.ID | default('unknown') }}"
                   _should_notify: "{{ (severity_allowlist | length == 0) or (_sev in severity_allowlist) }}"
                   _title: "{{ (title_prefix ~ ' ') if title_prefix | length > 0 else '' }}{{ _event }} ({{ _sev }}) - confirmed"
                   _message: >-
-                    {{ _display -}}
+                    {{ _display }}
 
                     Confirmed by NWS
                     {% if _expires %}
