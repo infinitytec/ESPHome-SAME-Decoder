@@ -455,15 +455,14 @@ action:
                       message: "{{ same_event_text | default('Weather alert') }} cleared. ID: {{ same_id }}"
                       data:
                         tag: "same_{{ same_id }}"
-              - if:
-                  - condition: template
-                    value_template: "{{ create_persistent }}"
-                then:
-                  - service: persistent_notification.create
-                    data:
-                      title: "{{ (title_prefix ~ ' ') if title_prefix | length > 0 else '' }}Alert cleared"
-                      message: "{{ same_event_text | default('Weather alert') }} cleared. ID: {{ same_id }}"
-                      notification_id: "same_{{ same_id }}"
+          # Always dismiss the persistent notification when the alert clears.
+          - if:
+              - condition: template
+                value_template: "{{ create_persistent }}"
+            then:
+              - service: persistent_notification.dismiss
+                data:
+                  notification_id: "same_{{ same_id }}"
           - stop: "Handled SAME Cancel (removed)."
 
       # (b) Alert not for our county (safety net; device already FIPS-filters).
@@ -1115,12 +1114,11 @@ action:
                               message: "{{ same_event_text | default('Weather alert') }} determined not for your location. ID: {{ same_id }}"
                               data:
                                 tag: "same_{{ same_id }}"
-                      - if:
-                          - condition: template
-                            value_template: "{{ create_persistent }}"
-                        then:
-                          - service: persistent_notification.create
-                            data:
-                              title: "{{ (title_prefix ~ ' ') if title_prefix | length > 0 else '' }}Alert cleared"
-                              message: "{{ same_event_text | default('Weather alert') }} determined not for your location. ID: {{ same_id }}"
-                              notification_id: "same_{{ same_id }}"
+                  # Always dismiss the persistent notification when the alert clears.
+                  - if:
+                      - condition: template
+                        value_template: "{{ create_persistent }}"
+                    then:
+                      - service: persistent_notification.dismiss
+                        data:
+                          notification_id: "same_{{ same_id }}"
