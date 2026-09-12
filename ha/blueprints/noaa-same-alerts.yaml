@@ -1,15 +1,8 @@
 # =============================================================================
 #  NOAA SAME Alerts (NWS Alerts sensor)
-#  Import via Settings -> Automations & Scenes -> Blueprints -> Import Blueprint
-#  (or copy to <config>/blueprints/automation/same_decoder/noaa_same_alerts.yaml)
-#
-#  ONE blueprint does everything for a single location:
-#    - Listens for the ESPHome decoder's SAME alert event (configurable name).
-#    - FIPS-filters, suppresses silent test codes.
-#    - Validates/enriches against the HACS nws_alerts sensor's `Alerts` attribute
-#      (NO api.weather.gov / REST calls).
-#    - Emits the output event for the per-location template sensor (card).
-#    - SENDS NOTIFICATIONS inline at each decision point (new / confirmed / clear).
+#  Enriches ESPHome SAME alerts for one location by reading the HACS nws_alerts
+#  sensor's `Alerts` attribute (no api.weather.gov calls), maintains the
+#  per-location card sensor, and sends notifications inline.
 #
 #  DECISION MODEL
 #    * online sensor off/unavailable OR NWS Alerts sensor unavailable
@@ -20,17 +13,6 @@
 #    * sensor available + no matching entry
 #                                      -> SUPPRESS (do not fire)
 #    * SAME status "Cancel"            -> CLEAR (remove) immediately
-#
-#  MATCHING
-#    A SAME alert matches an entry in the sensor's `Alerts` list when the event
-#    code (NWSCode) matches (or the event name matches) AND their expiration
-#    times are within match_tolerance_seconds (onset too, when both present).
-#
-#  NOTIFICATIONS
-#    - New alert: a notification is sent on every FIRE (offline/sensor_unavailable
-#      fallback, or enriched), subject to the optional severity allowlist.
-#    - Clear: optional notify on SAME Cancel (notify_on_clear).
-#    - tag / notification_id = same_<id> so updates REPLACE rather than stack.
 #
 #  DOCS
 #    - nws_alerts integration:  https://github.com/finity69x2/nws_alerts
@@ -135,6 +117,15 @@ blueprint:
       selector:
         text:
 
+    map_location:
+      name: (Optional) Map location (lat,lon for weather.gov link)
+      description: >
+        lat,lon used to build a human-readable weather.gov link when the alert
+        URL is missing or is an api.weather.gov link.
+      default: "36.150287220260616,-97.09694066181136"
+      selector:
+        text:
+
     # ---- Notification inputs (all optional) ----
     notify_service:
       name: (Optional) Notify service
@@ -199,11 +190,19 @@ variables:
   nws_alerts_entity: !input nws_alerts_entity
   tol: !input match_tolerance_seconds
   suppress_test_codes: !input suppress_test_codes
+  map_location: !input map_location
   notify_service: !input notify_service
   create_persistent: !input create_persistent
   notify_on_clear: !input notify_on_clear
   severity_allowlist: !input severity_allowlist
   title_prefix: !input title_prefix
+
+  # ---- Human-readable weather.gov link built from map_location (lat,lon) ----
+  friendly_url: >-
+    {%- set parts = (map_location | string).split(',') -%}
+    {%- set la = (parts[0] | float(0)) if parts | length >= 1 else 0 -%}
+    {%- set lo = (parts[1] | float(0)) if parts | length >= 2 else 0 -%}
+    https://forecast.weather.gov/MapClick.php?lat={{ '%.4f' | format(la) }}&lon={{ '%.4f' | format(lo) }}
 
   # ---- SAME event payload (from the ESPHome decoder) ----
   ev: "{{ trigger.event.data }}"
@@ -402,8 +401,8 @@ action:
                 sender: "{{ ev.sender | default('') }}"
                 Raw: "{{ ev.raw | default('') }}"
                 raw: "{{ ev.raw | default('') }}"
-                DisplayDesc: "{{ same_event_text }} for {{ ev.areas | default('your area') }}."
-                SpokenDesc: "{{ same_event_text }} for your area."
+                DisplayDesc: "{{ same_event_text }} for {{ location_key }}."
+                SpokenDesc: "{{ same_event_text }} for {{ location_key }}."
                 validated_by: "{{ validated_by }}"
                 point_relevant: "unknown"
                 confidence: "same_pending"
@@ -421,6 +420,7 @@ action:
               _expires: >-
                 {{ as_timestamp(_expires_raw) | timestamp_custom('%A, %B %-d at %-I:%M %p %Z', true)
                    if _expires_raw != '' else '' }}
+              _url: "{{ friendly_url }}"
               _id: "{{ alert_for_notify.ID | default('unknown') }}"
               _confidence_note: "Radio-only (offline or NWS Alerts sensor unavailable)"
               _should_notify: "{{ (severity_allowlist | length == 0) or (_sev in severity_allowlist) }}"
@@ -433,6 +433,9 @@ action:
                 {% if _expires %}
 
                 Expires: {{ _expires }}{% endif %}
+                {% if _url %}
+
+                {{ _url }}{% endif %}
           - if:
               - condition: template
                 value_template: "{{ _should_notify }}"
@@ -447,6 +450,7 @@ action:
                       message: "{{ _message }}"
                       data:
                         tag: "same_{{ _id }}"
+                        url: "{{ _url }}"
               - if:
                   - condition: template
                     value_template: "{{ create_persistent }}"
@@ -552,7 +556,8 @@ action:
               _expires: >-
                 {{ as_timestamp(_expires_raw) | timestamp_custom('%A, %B %-d at %-I:%M %p %Z', true)
                    if _expires_raw != '' else '' }}
-              _url: "{{ alert_for_notify.URL | default('') }}"
+              _url: >-
+                {{ (alert_for_notify.URL) if (alert_for_notify.URL | length > 0 and 'api.weather.gov' not in alert_for_notify.URL) else friendly_url }}
               _id: "{{ alert_for_notify.ID | default('unknown') }}"
               _should_notify: "{{ (severity_allowlist | length == 0) or (_sev in severity_allowlist) }}"
               _title: "{{ (title_prefix ~ ' ') if title_prefix | length > 0 else '' }}{{ _event }} ({{ _sev }})"
@@ -580,6 +585,7 @@ action:
                       message: "{{ _message }}"
                       data:
                         tag: "same_{{ _id }}"
+                        url: "{{ _url }}"
               - if:
                   - condition: template
                     value_template: "{{ create_persistent }}"
