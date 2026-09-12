@@ -14,6 +14,10 @@
 #                                      -> SUPPRESS (do not fire)
 #    * SAME status "Cancel"            -> CLEAR (remove) immediately
 #
+#  NOTE: The output event is fired as the literal `same.alert_enriched`. The
+#  output_event input is retained for reference/labeling only; the emitted event
+#  type is hardcoded so it reliably reaches the template sensor.
+#
 #  DOCS
 #    - nws_alerts integration:  https://github.com/finity69x2/nws_alerts
 #    - Blueprints:              https://www.home-assistant.io/docs/blueprint/
@@ -28,9 +32,6 @@ blueprint:
     per-location card sensor, and sends notifications inline.
   domain: automation
   input:
-    # =========================================================================
-    #  REQUIRED INPUTS
-    # =========================================================================
     location_key:
       name: (Required) Location key
       description: >
@@ -39,7 +40,6 @@ blueprint:
       default: home
       selector:
         text:
-
     trigger_event:
       name: (Required) Trigger event type
       description: >
@@ -48,17 +48,15 @@ blueprint:
       default: esphome.same_alert
       selector:
         text:
-
     output_event:
-      name: (Required) Output event (to the alert-card sensor)
+      name: (Reference only) Output event label
       description: >
-        The event this blueprint fires with the enriched/validated alert data.
-        Your per-location template sensor that feeds the alert cards must listen
-        for THIS event. Leave the default unless you renamed the sensor's event.
+        For reference only. The blueprint fires the literal event
+        `same.alert_enriched`, which your per-location template sensor listens
+        for.
       default: same.alert_enriched
       selector:
         text:
-
     fips_code:
       name: (Required) FIPS / SAME county code
       description: >
@@ -67,7 +65,6 @@ blueprint:
         digit is ignored.
       selector:
         text:
-
     online_sensor:
       name: (Required) Online / Internet indicator
       description: >
@@ -80,7 +77,6 @@ blueprint:
             - binary_sensor
             - input_boolean
             - switch
-
     nws_alerts_entity:
       name: (Required) NWS Alerts sensor entity
       description: >
@@ -90,10 +86,6 @@ blueprint:
       selector:
         entity:
           domain: sensor
-
-    # =========================================================================
-    #  OPTIONAL INPUTS
-    # =========================================================================
     match_tolerance_seconds:
       name: (Optional) Time match tolerance (seconds)
       description: >
@@ -108,7 +100,6 @@ blueprint:
           step: 5
           unit_of_measurement: s
           mode: box
-
     suppress_test_codes:
       name: (Optional) Silent test codes
       description: >
@@ -116,7 +107,6 @@ blueprint:
       default: "RWT,RMT,NPT,DMO,NAT,NST"
       selector:
         text:
-
     map_location:
       name: (Optional) Map location (lat,lon for weather.gov link)
       description: >
@@ -125,8 +115,6 @@ blueprint:
       default: "36.150287220260616,-97.09694066181136"
       selector:
         text:
-
-    # ---- Notification inputs (all optional) ----
     notify_service:
       name: (Optional) Notify service
       description: >
@@ -136,13 +124,11 @@ blueprint:
       default: ""
       selector:
         text:
-
     create_persistent:
       name: (Optional) Also create a persistent notification
       default: false
       selector:
         boolean:
-
     notify_on_clear:
       name: (Optional) Notify when an alert clears
       description: >
@@ -150,7 +136,6 @@ blueprint:
       default: false
       selector:
         boolean:
-
     severity_allowlist:
       name: (Optional) Notify only for these severities
       description: Leave empty to notify for all severities.
@@ -165,24 +150,18 @@ blueprint:
             - Moderate
             - Minor
             - Unknown
-
     title_prefix:
       name: (Optional) Notification title prefix
       description: Prepended to the notification title (e.g. "Home").
       default: ""
       selector:
         text:
-
-# Parallel so overlapping alerts never block each other.
 mode: parallel
 max: 10
-
 trigger:
   - platform: event
     event_type: !input trigger_event
-
 variables:
-  # ---- Blueprint inputs pulled into variables ----
   location_key: !input location_key
   output_event: !input output_event
   fips_input: !input fips_code
@@ -196,15 +175,11 @@ variables:
   notify_on_clear: !input notify_on_clear
   severity_allowlist: !input severity_allowlist
   title_prefix: !input title_prefix
-
-  # ---- Human-readable weather.gov link built from map_location (lat,lon) ----
   friendly_url: >-
     {%- set parts = (map_location | string).split(',') -%}
     {%- set la = (parts[0] | float(0)) if parts | length >= 1 else 0 -%}
     {%- set lo = (parts[1] | float(0)) if parts | length >= 2 else 0 -%}
     https://forecast.weather.gov/MapClick.php?lat={{ '%.4f' | format(la) }}&lon={{ '%.4f' | format(lo) }}
-
-  # ---- SAME event payload (from the ESPHome decoder) ----
   ev: "{{ trigger.event.data }}"
   same_id: "{{ ev.id | default('') }}"
   same_event_code: "{{ ev.event_code | default('') | upper }}"
@@ -214,17 +189,11 @@ variables:
   same_expires: "{{ ev.expires | default('') }}"
   same_onset_ts: "{{ as_timestamp(same_onset, 0) if (same_onset is string and same_onset != '') else 0 }}"
   same_expires_ts: "{{ as_timestamp(same_expires, 0) if (same_expires is string and same_expires != '') else 0 }}"
-
-  # ---- County normalization: last 5 digits (SSCCC), ignoring P-digit ----
   ssccc: >-
     {% set s = fips_input | string %}
     {{ s[-5:] if s | length >= 5 else s }}
-
-  # ---- SAME 'areas' list (kept for downstream use) ----
   areas: >-
     {{ (ev.areas | default('') | string).split(',') | map('trim') | reject('equalto', '') | list }}
-
-  # ---- Whether the SAME areas include our county (SELF-CONTAINED) ----
   areas_contains_ssccc: >-
     {% set s = fips_input | string %}
     {% set my5 = s[-5:] if s | length >= 5 else s %}
@@ -234,20 +203,14 @@ variables:
       {% if (a | string)[-5:] == my5 %}{% set ns.ok = true %}{% endif %}
     {% endfor %}
     {{ ns.ok | bool }}
-
-  # ---- Silent test-code set ----
   suppress_set: >-
     {{ (suppress_test_codes | string | replace(' ', '')).split(',')
        | reject('equalto', '') | map('upper') | list }}
   is_test_code: "{{ same_event_code in suppress_set }}"
-
-  # ---- NWS Alerts sensor read (replaces api.weather.gov) ----
   nws_sensor_state: "{{ states(nws_alerts_entity) }}"
   nws_sensor_available: "{{ nws_sensor_state not in ['unknown', 'unavailable', '', 'none'] }}"
   nws_alerts_list: "{{ state_attr(nws_alerts_entity, 'Alerts') | default([], true) | list }}"
   online_ok: "{{ is_state(online_sensor, 'on') }}"
-
-  # ---- SAME event_code -> NWS event-name map (common codes) ----
   event_name_map: >-
     {{
       {
@@ -305,26 +268,18 @@ variables:
         'BLU': 'Blue Alert'
       }
     }}
-
-  # ---- Acceptable NWS event names (lowercased): mapped name + SAME text ----
   acceptable_events: >-
     {% set mapped = event_name_map.get(same_event_code) %}
     {{ [mapped, same_event_text] | reject('equalto', none) | reject('equalto', '')
        | map('string') | map('lower') | unique | list }}
-
 condition: []
-
 action:
-  # ===========================================================================
-  #  Early exits: cancel, wrong county, silent test codes, fallback
-  # ===========================================================================
   - choose:
-      # (a) SAME Cancel -> remove immediately (+ optional cleared notification).
       - conditions:
           - condition: template
             value_template: "{{ same_status | lower == 'cancel' }}"
         sequence:
-          - event: "{{ output_event }}"
+          - event: same.alert_enriched
             event_data:
               location_key: "{{ location_key }}"
               action: remove
@@ -344,7 +299,6 @@ action:
                       message: "{{ same_event_text | default('Weather alert') }} cleared. ID: {{ same_id }}"
                       data:
                         tag: "same_{{ same_id }}"
-          # Always dismiss the persistent notification when the alert clears.
           - if:
               - condition: template
                 value_template: "{{ create_persistent }}"
@@ -353,22 +307,16 @@ action:
                 data:
                   notification_id: "same_{{ same_id }}"
           - stop: "Handled SAME Cancel (removed)."
-
-      # (b) Alert not for our county (safety net; device already FIPS-filters).
       - conditions:
           - condition: template
             value_template: "{{ areas_contains_ssccc | bool == false }}"
         sequence:
           - stop: "Not for this location (SSCCC mismatch)."
-
-      # (c) Silent test code.
       - conditions:
           - condition: template
             value_template: "{{ is_test_code }}"
         sequence:
           - stop: "Suppressed silent test code."
-
-      # (d) Offline OR NWS Alerts sensor unavailable -> fire SAME fallback, notify.
       - conditions:
           - condition: template
             value_template: "{{ (not online_ok) or (not nws_sensor_available) }}"
@@ -406,12 +354,11 @@ action:
                 validated_by: "{{ validated_by }}"
                 point_relevant: "unknown"
                 confidence: "same_pending"
-          - event: "{{ output_event }}"
+          - event: same.alert_enriched
             event_data:
               location_key: "{{ location_key }}"
               action: add
               alert: "{{ alert_for_notify }}"
-          # ---- notify (new alert) ----
           - variables:
               _event: "{{ alert_for_notify.Event | default('Weather Alert') }}"
               _sev: "{{ (alert_for_notify.Severity | default('Unknown')) | title }}"
@@ -461,11 +408,6 @@ action:
                       message: "{{ _message }}"
                       notification_id: "same_{{ _id }}"
           - stop: "Offline/sensor-unavailable SAME fallback fired + notified."
-
-  # ===========================================================================
-  #  Online + sensor available -> match against the sensor's Alerts list
-  #  (event code OR event name) AND expires within tolerance (onset too if both).
-  # ===========================================================================
   - variables:
       match: >-
         {%- set ns = namespace(best=none, best_exp=9999999, best_on=9999999) -%}
@@ -489,9 +431,7 @@ action:
         {%- endfor -%}
         {{ ns.best }}
       p_match: "{{ match is not none }}"
-
   - choose:
-      # P true -> fire enriched + notify, done.
       - conditions:
           - condition: template
             value_template: "{{ p_match }}"
@@ -542,12 +482,11 @@ action:
                 validated_by: "nws_sensor"
                 point_relevant: true
                 confidence: "validated"
-          - event: "{{ output_event }}"
+          - event: same.alert_enriched
             event_data:
               location_key: "{{ location_key }}"
               action: add
               alert: "{{ alert_for_notify }}"
-          # ---- notify (new, NWS-confirmed alert) ----
           - variables:
               _event: "{{ alert_for_notify.Event | default('Weather Alert') }}"
               _sev: "{{ (alert_for_notify.Severity | default('Unknown')) | title }}"
@@ -596,8 +535,4 @@ action:
                       message: "{{ _message }}"
                       notification_id: "same_{{ _id }}"
           - stop: "NWS sensor match enriched, fired + notified."
-
-  # ===========================================================================
-  #  Online + sensor available + NO matching entry -> SUPPRESS (fire nothing).
-  # ===========================================================================
   - stop: "Suppressed: NWS Alerts sensor available but does not list this alert (not for us)."
