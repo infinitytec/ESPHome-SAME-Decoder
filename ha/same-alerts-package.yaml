@@ -2,77 +2,42 @@
 #  SAME Alerts - Consolidated Package
 #  For the ESPHome SAME Decoder + weather_alerts_card (seevee/weather_alerts_card)
 #
-#  This ONE file provides everything Home Assistant needs on its side:
-#    1. A shared rest_command (nws_alerts_get) used by the NOAA SAME Alerts
-#       blueprint to query api.weather.gov. Defined ONCE; reused by every location.
-#    2. A single trigger-based template block hosting ONE card-facing sensor per
-#       location (home shown). It maintains an nws_alerts-style "Alerts"
-#       attribute the card reads; state = alert count.
+#  This package hosts ONE card-facing trigger-based template sensor per location
+#  that consumes the blueprint's `same.alert_enriched` events and maintains a
+#  weather_alerts_card / nws_alerts-style "Alerts" attribute (state = count),
+#  with add/update/remove handling and minute-tick expiry pruning.
+#
+#  HARDENED against `unavailable`:
+#    - The blueprint emits `alert` as a JSON string (| to_json). This sensor
+#      parses it back with from_json, so timestamp strings are never upcast to
+#      datetime objects (which would break attribute JSON serialization).
+#    - Accepts either a JSON string or a real mapping for `alert`.
+#    - `trigger is defined` guard so the minute tick never touches trigger.event
+#    - `a is mapping` checks so a non-dict element can never throw
+#    - prior-state coerced safely (iterable and not string) before | list
+#    - dedup/prune read both id/ID and expires/Expires/ends/Ends
+#    - namespace-based list building in both state and Alerts templates
 #
 #  ROUTING:
 #    - The blueprint fires event `same.alert_enriched` with a location_key.
 #      Keep the blueprint instance's location_key set to "home" (its default) to
 #      match the sensor below.
 #
-#  WHY A TEMPLATE SENSOR IS STILL REQUIRED:
-#    - The ESPHome device integration exposes text/status sensors (last raw
-#      header, decode count, etc.), NOT an nws_alerts-style "Alerts" list.
-#    - A blueprint cannot create a sensor entity, so the card-facing entity must
-#      be a template sensor. This file provides it.
-#
 #  INSTALL:
 #    1. configuration.yaml must have:
 #         homeassistant:
 #           packages: !include_dir_named packages
 #    2. Save as <config>/packages/same-alerts-package.yaml
-#    3. Restart Home Assistant (or reload Template Entities + REST Commands).
+#    3. Restart Home Assistant (or reload Template Entities).
 #    4. Import the NOAA SAME Alerts blueprint once; create one automation,
 #       leaving location_key at "home" to match the sensor.
 #    5. Point weather_alerts_card at sensor.same_alerts_home.
 #
 #  DOCS:
-#    - rest_command:              https://www.home-assistant.io/integrations/rest_command/
 #    - Trigger-based templates:   https://www.home-assistant.io/integrations/template/#trigger-based-template-entities
-#    - NWS API (alerts):          https://www.weather.gov/documentation/services-web-api
 #    - weather_alerts_card:       https://github.com/seevee/weather_alerts_card
 #    - nws_alerts (format ref):   https://github.com/finity69x2/nws_alerts
 # =============================================================================
-
-# -----------------------------------------------------------------------------
-#  Shared REST command (defined ONCE; used by every blueprint instance)
-#
-#  The blueprint calls this with a fully-built `url` and a `user_agent` string.
-#  api.weather.gov REQUIRES a descriptive User-Agent that identifies your
-#  application with contact info, per NWS API policy.
-#
-#  NOTE ON TIMEOUT: a rest_command's response window is fixed here (not settable
-#  per call). Edit `timeout` if you want a different window (default 15 seconds).
-# -----------------------------------------------------------------------------
-rest_command:
-  nws_alerts_get:
-    url: "{{ url }}"
-    method: GET
-    timeout: 15
-    verify_ssl: true
-    content_type: "application/geo+json"
-    headers:
-      User-Agent: "{{ user_agent }}"
-      Accept: "application/geo+json"
-
-# -----------------------------------------------------------------------------
-#  Card-facing sensor (home)
-#
-#  Behavior:
-#    - Trigger `enriched`: the blueprint fires event `same.alert_enriched` with
-#        { location_key, action: add|update|remove, alert: {...} }.
-#        The sensor only acts on events whose location_key matches its own.
-#        add/update -> insert or replace the alert by its id (dedup)
-#        remove      -> drop the alert by its id (cancel / T+recheck clear)
-#    - Trigger `tick` (every minute): prune any alert whose expiry has passed,
-#        so the card drops it automatically at expiration.
-#    - state = number of currently-active alerts
-#    - attribute Alerts = the list of alert dicts (nws_alerts-style)
-# -----------------------------------------------------------------------------
 template:
   - trigger:
       - trigger: event
@@ -81,7 +46,6 @@ template:
       - trigger: time_pattern
         minutes: "/1"
         id: tick
-
     sensor:
       # ===== Location: home =====
       - name: "SAME Alerts (Home)"
@@ -90,73 +54,73 @@ template:
         state: >-
           {% set location_key = 'home' %}
           {% set now_ts = as_timestamp(now()) %}
-          {% set current = state_attr(this.entity_id, 'Alerts') | default([], true) | list %}
-
-          {# 1) Apply the event action, but only for OUR location_key #}
-          {% if trigger.id == 'enriched' and trigger.event.data.location_key == location_key %}
-            {% set ev = trigger.event.data %}
-            {% set action = ev.action | default('add') %}
-            {% set alert = ev.alert | default({}) %}
-            {% set rid = alert.id | default('') %}
-            {% set filtered = [] %}
-            {% for a in current %}
-              {% if a.id | default('') != rid %}
-                {% set _ = filtered.append(a) %}
+          {% set prior = state_attr(this.entity_id, 'Alerts') %}
+          {% set current = (prior if prior is iterable and prior is not string else []) | list %}
+          {% if trigger is defined and trigger.id == 'enriched' %}
+            {% set data = trigger.event.data | default({}, true) %}
+            {% if (data.location_key | default('')) == location_key %}
+              {% set action = data.action | default('add') %}
+              {% set raw = data.alert | default({}, true) %}
+              {% set alert = (raw | from_json) if raw is string else raw %}
+              {% set rid = (alert.id | default(alert.ID | default('')) | string) if alert is mapping else '' %}
+              {% set ns = namespace(keep=[]) %}
+              {% for a in current %}
+                {% if a is mapping and (a.id | default(a.ID | default('')) | string) != rid %}
+                  {% set ns.keep = ns.keep + [a] %}
+                {% endif %}
+              {% endfor %}
+              {% if action in ['add', 'update'] and rid != '' and alert is mapping %}
+                {% set ns.keep = ns.keep + [alert] %}
               {% endif %}
-            {% endfor %}
-            {% if action in ['add', 'update'] and rid != '' %}
-              {% set _ = filtered.append(alert) %}
+              {% set current = ns.keep %}
             {% endif %}
-            {% set current = filtered %}
           {% endif %}
-
-          {# 2) Prune expired (on BOTH the event and the minute tick).
-                Keep an alert with no parseable expiry, or expiry > now. #}
-          {% set ns = namespace(keep=[]) %}
+          {% set ns2 = namespace(keep=[]) %}
           {% for a in current %}
-            {% set exp = a.expires | default(a.ends | default('')) %}
-            {% set exp_ts = as_timestamp(exp, 0) if (exp is string and exp != '') else 0 %}
-            {% if exp_ts == 0 or exp_ts > now_ts %}
-              {% set _ = ns.keep.append(a) %}
+            {% if a is mapping %}
+              {% set exp = a.expires | default(a.Expires | default(a.ends | default(a.Ends | default('')))) %}
+              {% set exp_ts = as_timestamp(exp, 0) %}
+              {% if exp_ts == 0 or exp_ts > now_ts %}
+                {% set ns2.keep = ns2.keep + [a] %}
+              {% endif %}
             {% endif %}
           {% endfor %}
-
-          {{ ns.keep | count }}
+          {{ ns2.keep | count }}
         attributes:
           Alerts: >-
             {% set location_key = 'home' %}
             {% set now_ts = as_timestamp(now()) %}
-            {% set current = state_attr(this.entity_id, 'Alerts') | default([], true) | list %}
-
-            {# 1) Apply the event action, but only for OUR location_key #}
-            {% if trigger.id == 'enriched' and trigger.event.data.location_key == location_key %}
-              {% set ev = trigger.event.data %}
-              {% set action = ev.action | default('add') %}
-              {% set alert = ev.alert | default({}) %}
-              {% set rid = alert.id | default('') %}
-              {% set filtered = [] %}
-              {% for a in current %}
-                {% if a.id | default('') != rid %}
-                  {% set _ = filtered.append(a) %}
+            {% set prior = state_attr(this.entity_id, 'Alerts') %}
+            {% set current = (prior if prior is iterable and prior is not string else []) | list %}
+            {% if trigger is defined and trigger.id == 'enriched' %}
+              {% set data = trigger.event.data | default({}, true) %}
+              {% if (data.location_key | default('')) == location_key %}
+                {% set action = data.action | default('add') %}
+                {% set raw = data.alert | default({}, true) %}
+                {% set alert = (raw | from_json) if raw is string else raw %}
+                {% set rid = (alert.id | default(alert.ID | default('')) | string) if alert is mapping else '' %}
+                {% set ns = namespace(keep=[]) %}
+                {% for a in current %}
+                  {% if a is mapping and (a.id | default(a.ID | default('')) | string) != rid %}
+                    {% set ns.keep = ns.keep + [a] %}
+                  {% endif %}
+                {% endfor %}
+                {% if action in ['add', 'update'] and rid != '' and alert is mapping %}
+                  {% set ns.keep = ns.keep + [alert] %}
                 {% endif %}
-              {% endfor %}
-              {% if action in ['add', 'update'] and rid != '' %}
-                {% set _ = filtered.append(alert) %}
+                {% set current = ns.keep %}
               {% endif %}
-              {% set current = filtered %}
             {% endif %}
-
-            {# 2) Prune expired (on BOTH the event and the minute tick).
-                  Keep an alert with no parseable expiry, or expiry > now. #}
-            {% set ns = namespace(keep=[]) %}
+            {% set ns2 = namespace(keep=[]) %}
             {% for a in current %}
-              {% set exp = a.expires | default(a.ends | default('')) %}
-              {% set exp_ts = as_timestamp(exp, 0) if (exp is string and exp != '') else 0 %}
-              {% if exp_ts == 0 or exp_ts > now_ts %}
-                {% set _ = ns.keep.append(a) %}
+              {% if a is mapping %}
+                {% set exp = a.expires | default(a.Expires | default(a.ends | default(a.Ends | default('')))) %}
+                {% set exp_ts = as_timestamp(exp, 0) %}
+                {% if exp_ts == 0 or exp_ts > now_ts %}
+                  {% set ns2.keep = ns2.keep + [a] %}
+                {% endif %}
               {% endif %}
             {% endfor %}
-
-            {{ ns.keep }}
+            {{ ns2.keep }}
           friendly_name: "SAME Alerts (Home)"
           icon: "mdi:alert"
