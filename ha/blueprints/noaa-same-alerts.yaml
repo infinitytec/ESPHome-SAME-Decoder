@@ -14,9 +14,10 @@
 #                                      -> SUPPRESS (do not fire)
 #    * SAME status "Cancel"            -> CLEAR (remove) immediately
 #
-#  NOTE: The output event is fired as the literal `same.alert_enriched`. The
-#  output_event input is retained for reference/labeling only; the emitted event
-#  type is hardcoded so it reliably reaches the template sensor.
+#  NOTE: The output event is fired as the literal `same.alert_enriched`, and the
+#  alert object is emitted as JSON (| to_json) so timestamp strings are never
+#  upcast to datetime objects (which would break attribute serialization).
+#  The output_event input is retained for reference/labeling only.
 #
 #  DOCS
 #    - nws_alerts integration:  https://github.com/finity69x2/nws_alerts
@@ -358,7 +359,7 @@ action:
             event_data:
               location_key: "{{ location_key }}"
               action: add
-              alert: "{{ alert_for_notify }}"
+              alert: "{{ alert_for_notify | to_json }}"
           - variables:
               _event: "{{ alert_for_notify.Event | default('Weather Alert') }}"
               _sev: "{{ (alert_for_notify.Severity | default('Unknown')) | title }}"
@@ -486,7 +487,7 @@ action:
             event_data:
               location_key: "{{ location_key }}"
               action: add
-              alert: "{{ alert_for_notify }}"
+              alert: "{{ alert_for_notify | to_json }}"
           - variables:
               _event: "{{ alert_for_notify.Event | default('Weather Alert') }}"
               _sev: "{{ (alert_for_notify.Severity | default('Unknown')) | title }}"
