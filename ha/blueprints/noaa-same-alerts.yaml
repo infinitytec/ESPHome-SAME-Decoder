@@ -8,10 +8,10 @@
 #    * online sensor off/unavailable OR NWS Alerts sensor unavailable
 #                                      -> FIRE SAME fallback (validated_by=offline
 #                                         or sensor_unavailable)
-#    * sensor available + matching entry in Alerts list
-#                                      -> FIRE + ENRICH (validated_by=nws_sensor)
-#    * sensor available + no matching entry
-#                                      -> SUPPRESS (do not fire)
+#    * online: refresh nws_alerts (update_entity) + wait up to 20s
+#        - still unavailable after wait -> FIRE SAME fallback (sensor_unavailable)
+#        - available + matching entry   -> FIRE + ENRICH (validated_by=nws_sensor)
+#        - available + no matching entry-> SUPPRESS (do not fire)
 #    * SAME status "Cancel"            -> CLEAR (remove) immediately
 #
 #  NOTE: The output event is fired as the literal `same.alert_enriched`, and the
@@ -19,9 +19,16 @@
 #  upcast to datetime objects (which would break attribute serialization).
 #  The output_event input is retained for reference/labeling only.
 #
+#  REFRESH: Before reading the NWS Alerts sensor (online path), the blueprint
+#  calls homeassistant.update_entity on it and waits up to 20s, so a freshly
+#  issued alert that the sensor has not polled yet can still be matched. If the
+#  refresh does not complete in time, the alert is fired as a SAME fallback so
+#  its details are never lost.
+#
 #  DOCS
 #    - nws_alerts integration:  https://github.com/finity69x2/nws_alerts
 #    - Blueprints:              https://www.home-assistant.io/docs/blueprint/
+#    - update_entity service:   https://www.home-assistant.io/integrations/homeassistant/#action-homeassistantupdate_entity
 #    - Template sensor:         https://www.home-assistant.io/integrations/template/#sensor
 #    - mobile notifications:    https://www.home-assistant.io/integrations/notify/
 # =============================================================================
@@ -210,7 +217,6 @@ variables:
   is_test_code: "{{ same_event_code in suppress_set }}"
   nws_sensor_state: "{{ states(nws_alerts_entity) }}"
   nws_sensor_available: "{{ nws_sensor_state not in ['unknown', 'unavailable', '', 'none'] }}"
-  nws_alerts_list: "{{ state_attr(nws_alerts_entity, 'Alerts') | default([], true) | list }}"
   online_ok: "{{ is_state(online_sensor, 'on') }}"
   event_name_map: >-
     {{
@@ -320,10 +326,10 @@ action:
           - stop: "Suppressed silent test code."
       - conditions:
           - condition: template
-            value_template: "{{ (not online_ok) or (not nws_sensor_available) }}"
+            value_template: "{{ not online_ok }}"
         sequence:
           - variables:
-              validated_by: "{{ 'offline' if not online_ok else 'sensor_unavailable' }}"
+              validated_by: "offline"
               alert_for_notify:
                 id: "{{ same_id }}"
                 ID: "{{ same_id }}"
@@ -371,7 +377,7 @@ action:
                    if _expires_raw != '' else '' }}
               _url: "{{ friendly_url }}"
               _id: "{{ alert_for_notify.ID | default('unknown') }}"
-              _confidence_note: "Radio-only (offline or NWS Alerts sensor unavailable)"
+              _confidence_note: "Radio-only (offline)"
               _should_notify: "{{ (severity_allowlist | length == 0) or (_sev in severity_allowlist) }}"
               _title: "{{ (title_prefix ~ ' ') if title_prefix | length > 0 else '' }}{{ _event }} ({{ _sev }})"
               _message: >-
@@ -409,11 +415,111 @@ action:
                       title: "{{ _title }}"
                       message: "{{ _message }}"
                       notification_id: "same_{{ _id }}"
-          - stop: "Offline/sensor-unavailable SAME fallback fired + notified."
+          - stop: "Offline SAME fallback fired + notified."
+  - service: homeassistant.update_entity
+    target:
+      entity_id: "{{ nws_alerts_entity }}"
+  - wait_template: "{{ states(nws_alerts_entity) not in ['unknown', 'unavailable', '', 'none'] }}"
+    timeout: "00:00:20"
+    continue_on_timeout: true
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ states(nws_alerts_entity) in ['unknown', 'unavailable', '', 'none'] }}"
+        sequence:
+          - variables:
+              validated_by: "sensor_unavailable"
+              alert_for_notify:
+                id: "{{ same_id }}"
+                ID: "{{ same_id }}"
+                same_id: "{{ same_id }}"
+                Event: "{{ same_event_text }}"
+                event: "{{ same_event_text }}"
+                NWSCode: "{{ same_event_code }}"
+                event_code: "{{ same_event_code }}"
+                Severity: "{{ ev.severity | default('Unknown') }}"
+                severity: "{{ ev.severity | default('Unknown') }}"
+                Status: "{{ ev.status | default('Actual') }}"
+                status: "{{ same_status }}"
+                Originator: "{{ ev.originator | default('') }}"
+                originator: "{{ ev.originator | default('') }}"
+                Onset: "{{ same_onset }}"
+                onset: "{{ same_onset }}"
+                Expires: "{{ same_expires }}"
+                expires: "{{ same_expires }}"
+                Ends: "{{ same_expires }}"
+                ends: "{{ same_expires }}"
+                AreasAffected: "{{ location_key }}"
+                areas: "{{ location_key }}"
+                AreasFips: "{{ ev.areas | default('') }}"
+                Sender: "{{ ev.sender | default('') }}"
+                sender: "{{ ev.sender | default('') }}"
+                Raw: "{{ ev.raw | default('') }}"
+                raw: "{{ ev.raw | default('') }}"
+                DisplayDesc: "{{ same_event_text }} for {{ location_key }}."
+                SpokenDesc: "{{ same_event_text }} for {{ location_key }}."
+                validated_by: "{{ validated_by }}"
+                point_relevant: "unknown"
+                confidence: "same_pending"
+          - event: same.alert_enriched
+            event_data:
+              location_key: "{{ location_key }}"
+              action: add
+              alert: "{{ alert_for_notify | to_json }}"
+          - variables:
+              _event: "{{ alert_for_notify.Event | default('Weather Alert') }}"
+              _sev: "{{ (alert_for_notify.Severity | default('Unknown')) | title }}"
+              _display: "{{ alert_for_notify.DisplayDesc | default(_event) }}"
+              _expires_raw: "{{ alert_for_notify.Expires | default('') }}"
+              _expires: >-
+                {{ as_timestamp(_expires_raw) | timestamp_custom('%A, %B %-d at %-I:%M %p %Z', true)
+                   if _expires_raw != '' else '' }}
+              _url: "{{ friendly_url }}"
+              _id: "{{ alert_for_notify.ID | default('unknown') }}"
+              _confidence_note: "Radio-only (NWS Alerts sensor did not refresh in time)"
+              _should_notify: "{{ (severity_allowlist | length == 0) or (_sev in severity_allowlist) }}"
+              _title: "{{ (title_prefix ~ ' ') if title_prefix | length > 0 else '' }}{{ _event }} ({{ _sev }})"
+              _message: >-
+                {{ _display }}
+                {% if _confidence_note %}
+
+                {{ _confidence_note }}{% endif %}
+                {% if _expires %}
+
+                Expires: {{ _expires }}{% endif %}
+                {% if _url %}
+
+                {{ _url }}{% endif %}
+          - if:
+              - condition: template
+                value_template: "{{ _should_notify }}"
+            then:
+              - if:
+                  - condition: template
+                    value_template: "{{ notify_service | length > 0 }}"
+                then:
+                  - service: "{{ notify_service }}"
+                    data:
+                      title: "{{ _title }}"
+                      message: "{{ _message }}"
+                      data:
+                        tag: "same_{{ _id }}"
+                        url: "{{ _url }}"
+              - if:
+                  - condition: template
+                    value_template: "{{ create_persistent }}"
+                then:
+                  - service: persistent_notification.create
+                    data:
+                      title: "{{ _title }}"
+                      message: "{{ _message }}"
+                      notification_id: "same_{{ _id }}"
+          - stop: "Refresh timed out / sensor unavailable -> SAME fallback fired."
   - variables:
+      nws_alerts_list_fresh: "{{ state_attr(nws_alerts_entity, 'Alerts') | default([], true) | list }}"
       match: >-
         {%- set ns = namespace(best=none, best_exp=9999999, best_on=9999999) -%}
-        {%- for a in nws_alerts_list -%}
+        {%- for a in nws_alerts_list_fresh -%}
           {%- set a_code = (a.NWSCode | default('') | upper) -%}
           {%- set a_event_name = (a.Event | default('') | lower) -%}
           {%- set a_expires = a.Expires | default(a.Ends | default('')) -%}
