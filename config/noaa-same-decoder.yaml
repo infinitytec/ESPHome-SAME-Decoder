@@ -59,8 +59,8 @@ esphome:
             v &= ~(1 << 2);   // DACMute -> normal (un-muted)
             es_write(0x19, v);
           }
-          // Reg 38 (DAC Control 16): LMIXSEL=000 (LIN1) for the left mixer.
-          es_write(0x26, 0x00);
+          // Reg 38 (DAC Control 16): LMIXSEL=001 (LIN2) for the left mixer.
+          es_write(0x26, 0x08);
           // Reg 39 (DAC Control 17): LI2LO disabled (bit6=0), LI2LOVOL=000 staged.
           es_write(0x27, 0x00);
           // Reg 52 (DAC Control 30): known-good LOUT2/mixer reference bits (default 0xAA).
