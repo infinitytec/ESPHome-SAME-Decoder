@@ -16,9 +16,6 @@ esphome:
       - lambda: 'ESP_LOGI("same", "Boot complete; SAME decoder starting.");'
       - lambda: 'id(decode_in_progress).publish_state(false);'
       - output.turn_off: d4_led
-      # Enable the onboard speaker amplifiers (U4/U5) via their shutdown/enable
-      # control on GPIO21. Active-high enable on this board; if speakers stay
-      # silent, invert the pin (see the 'pin.inverted' note in the output block).
       - delay: 200ms
       - lambda: |-
           std::vector<uint8_t> buf;
@@ -32,7 +29,7 @@ esphome:
           ESP_LOGI("es8388", "ADCControl1 wrote 0x77, readback=0x%02X", readback);
       - microphone.capture: same_mic
       # Give the es8388/microphone components time to finish their own init,
-      # then apply our output-path setup so it wins over their register writes.
+      # then apply our codec-path setup so it wins over their register writes.
       - delay: 1500ms
       - script.execute: apply_speaker_path
       # Re-apply a few more times over the next few seconds (guarded read-before-write
@@ -41,6 +38,7 @@ esphome:
       - script.execute: apply_speaker_path
       - delay: 1000ms
       - script.execute: apply_speaker_path
+      - lambda: 'ESP_LOGI("same", "Software gain now: %.2f", id(same_dec).get_gain());'
 
 esp32:
   board: esp-wrover-kit
@@ -141,11 +139,18 @@ microphone:
         - lambda: |-
             id(same_dec).feed_bytes(x);
 
-# --- ES8388 output-path setup, as a re-runnable script ---
-# Pure ANALOG passthrough: stereo line-in (LIN2/RIN2) -> left/right output mixers
-# -> ALL FOUR codec outputs (LOUT1/ROUT1 = 3.5mm headphone jack; LOUT2/ROUT2 =
-# onboard speaker amplifiers). Uses read-before-write guards so re-applying is
-# cheap and pop-free.
+# --- ES8388 codec-path setup, as re-runnable scripts ---
+# To protect ADC/decode SNR, the OUTPUT path (drivers + analog mixer routes) is
+# fully powered DOWN during decode and only brought up when the "Enable Speaker"
+# passthrough switch is ON. The DAC is never used (analog line-in passthrough)
+# and stays powered down at all times.
+#
+# apply_speaker_path: puts the codec in decode-friendly state (analog on, RIGHT
+#   input buffer on, LEFT input buffer off, DAC off, output drivers off). If the
+#   passthrough switch is ON, it defers to output_path_on to bring up the outputs.
+#
+# All register touches use read-before-write so we only modify DAC/output bits
+# and leave the ADC bits (managed by the microphone/i2s component) untouched.
 script:
   - id: apply_speaker_path
     then:
@@ -163,123 +168,221 @@ script:
 
           bool changed = false;
 
-          // Reg 1 (Chip Control 2): power up the analog section (clear PdnAna bit3).
+          // Reg 1 (Chip Control 2): keep analog section powered (clear PdnAna bit3).
           {
             uint8_t v = es_read(0x01);
-            uint8_t nv = v;
-            nv &= ~(1 << 3);   // PdnAna -> normal (analog powered up)
+            uint8_t nv = v & ~(1 << 3);   // PdnAna -> normal
             if (nv != v) { es_write(0x01, nv); changed = true; }
           }
-          // Reg 3 (ADC Power Mgmt): power up BOTH analog input buffers so LIN2 and
-          // RIN2 can reach the output mixers (clear PdnAINL bit7, PdnAINR bit6).
+          // Reg 3 (ADC Power Mgmt): RIGHT input buffer ON (decode), LEFT input
+          // buffer OFF (fewer active analog blocks -> less loading/noise).
+          // Clear PdnAINR (bit6), set PdnAINL (bit7).
           {
             uint8_t v = es_read(0x03);
             uint8_t nv = v;
-            nv &= ~(1 << 7);   // PdnAINL -> left analog input power up
             nv &= ~(1 << 6);   // PdnAINR -> right analog input power up
+            nv |=  (1 << 7);   // PdnAINL -> left analog input power DOWN
             if (nv != v) { es_write(0x03, nv); changed = true; }
           }
-          // Reg 4 (DAC Power Mgmt): enable ALL FOUR output drivers.
+          // Reg 2 (Chip Power Mgmt): keep the DAC powered DOWN (not used for the
+          // analog passthrough). Touch ONLY DAC bits; leave ADC bits alone.
+          // Set dac_DigPDN (bit6) and dacVref_PDN (bit0).
+          {
+            uint8_t v = es_read(0x02);
+            uint8_t nv = v | (1 << 6) | (1 << 0);   // DAC digital + DAC vref power down
+            if (nv != v) { es_write(0x02, nv); changed = true; }
+          }
+          // Reg 4 (DAC Power Mgmt): output drivers OFF during decode
+          // (clear LOUT1 bit5, ROUT1 bit4, LOUT2 bit3, ROUT2 bit2).
+          {
+            uint8_t v = es_read(0x04);
+            uint8_t nv = v & ~((1 << 5) | (1 << 4) | (1 << 3) | (1 << 2));
+            if (nv != v) { es_write(0x04, nv); changed = true; }
+          }
+          // Reg 39/42/41 (0x27/0x2A/0x29): all analog line-in -> mixer routes OFF
+          // during decode (clear LI2LO, RI2RO, RI2LO bit6 each).
+          {
+            uint8_t v = es_read(0x27);
+            uint8_t nv = v & ~(1 << 6);   // LI2LO off
+            if (nv != v) { es_write(0x27, nv); changed = true; }
+          }
+          {
+            uint8_t v = es_read(0x2A);
+            uint8_t nv = v & ~(1 << 6);   // RI2RO off
+            if (nv != v) { es_write(0x2A, nv); changed = true; }
+          }
+          {
+            uint8_t v = es_read(0x29);
+            uint8_t nv = v & ~(1 << 6);   // RI2LO off
+            if (nv != v) { es_write(0x29, nv); changed = true; }
+          }
+
+          ESP_LOGI("es8388", "apply_speaker_path: decode-friendly state (outputs+DAC off, R-input on, changed=%d).", (int) changed);
+      # If the passthrough switch is ON, bring the output path back up.
+      - if:
+          condition:
+            switch.is_on: linein_passthrough
+          then:
+            - script.execute: output_path_on
+
+  # Bring UP the full analog output path: power output drivers, set mixer source
+  # and volumes, enable the line-in routes, then enable the speaker amps.
+  - id: output_path_on
+    then:
+      - lambda: |-
+          auto es_write = [](uint8_t reg, uint8_t val) {
+            uint8_t b[2] = { reg, val };
+            id(bus_a).write(0x10, b, 2);
+          };
+          auto es_read = [](uint8_t reg) -> uint8_t {
+            uint8_t cur = 0x00;
+            id(bus_a).write(0x10, &reg, 1, false);
+            id(bus_a).read(0x10, &cur, 1);
+            return cur;
+          };
+
+          // Left input buffer ON only when passthrough is up (needed for stereo /
+          // the LEFT mixer path). Clear PdnAINL (bit7).
+          {
+            uint8_t v = es_read(0x03);
+            uint8_t nv = v & ~(1 << 7);   // PdnAINL -> left analog input power up
+            if (nv != v) es_write(0x03, nv);
+          }
+          // Reg 4: enable ALL FOUR output drivers.
           //   LOUT1 (bit5) + ROUT1 (bit4) = 3.5mm headphone jack.
           //   LOUT2 (bit3) + ROUT2 (bit2) = onboard speaker amplifiers.
           {
             uint8_t v = es_read(0x04);
-            uint8_t nv = v;
-            nv |= (1 << 5);    // LOUT1 enable
-            nv |= (1 << 4);    // ROUT1 enable
-            nv |= (1 << 3);    // LOUT2 enable
-            nv |= (1 << 2);    // ROUT2 enable
-            if (nv != v) { es_write(0x04, nv); changed = true; }
+            uint8_t nv = v | (1 << 5) | (1 << 4) | (1 << 3) | (1 << 2);
+            if (nv != v) es_write(0x04, nv);
           }
           // Reg 5 (Chip Low Power 1): output drivers NOT low-power
           // (clear LPLOUT1 bit5, LPLOUT2 bit3).
           {
             uint8_t v = es_read(0x05);
-            uint8_t nv = v;
-            nv &= ~(1 << 5);   // LPLOUT1 -> normal
-            nv &= ~(1 << 3);   // LPLOUT2 -> normal
-            if (nv != v) { es_write(0x05, nv); changed = true; }
+            uint8_t nv = v & ~((1 << 5) | (1 << 3));
+            if (nv != v) es_write(0x05, nv);
           }
           // Reg 6 (Chip Low Power 2): left mixer NOT low-power (clear LPLMIX bit6).
           {
             uint8_t v = es_read(0x06);
-            uint8_t nv = v;
-            nv &= ~(1 << 6);   // LPLMIX -> normal
-            if (nv != v) { es_write(0x06, nv); changed = true; }
+            uint8_t nv = v & ~(1 << 6);
+            if (nv != v) es_write(0x06, nv);
           }
-          // Reg 38 (DAC Control 16): LMIXSEL=001 (LIN2) for left mixer,
-          // RMIXSEL=001 (RIN2) for right mixer -> 0x09.
+          // Reg 38 (DAC Control 16): LMIXSEL=001 (LIN2), RMIXSEL=001 (RIN2) -> 0x09.
           {
             uint8_t v = es_read(0x26);
-            if (v != 0x09) { es_write(0x26, 0x09); changed = true; }
+            if (v != 0x09) es_write(0x26, 0x09);
           }
-          // Reg 42 (DAC Control 20): RIN -> right mixer enable (RI2RO bit6) at
-          // 0 dB (RI2ROVOL bits5:3 = 010). RD2RO (bit7, DAC) stays 0.
+          // Reg 52 (DAC Control 30): known-good LOUT2/mixer reference bits (0xAA).
+          {
+            uint8_t v = es_read(0x34);
+            if (v != 0xAA) es_write(0x34, 0xAA);
+          }
+          // Output volumes. LOUT2/ROUT2 (speakers) follow the "Speaker Volume"
+          // number; LOUT1/ROUT1 (headphone) set to 0 dB (0x1E).
+          {
+            uint8_t vol = (uint8_t) id(speaker_volume_number).state;
+            if (vol > 33) vol = 33;
+            { uint8_t cur = es_read(0x2E); if (cur != 0x1E) es_write(0x2E, 0x1E); }  // LOUT1VOL
+            { uint8_t cur = es_read(0x2F); if (cur != 0x1E) es_write(0x2F, 0x1E); }  // ROUT1VOL
+            { uint8_t cur = es_read(0x30); if (cur != vol)  es_write(0x30, vol);  }  // LOUT2VOL
+            { uint8_t cur = es_read(0x31); if (cur != vol)  es_write(0x31, vol);  }  // ROUT2VOL
+          }
+      # Small settle delay so the output stages bias up before opening routes.
+      - delay: 20ms
+      - lambda: |-
+          auto es_write = [](uint8_t reg, uint8_t val) {
+            uint8_t b[2] = { reg, val };
+            id(bus_a).write(0x10, b, 2);
+          };
+          auto es_read = [](uint8_t reg) -> uint8_t {
+            uint8_t cur = 0x00;
+            id(bus_a).write(0x10, &reg, 1, false);
+            id(bus_a).read(0x10, &cur, 1);
+            return cur;
+          };
+
+          // Reg 42 (0x2A): RIN -> right mixer (RI2RO bit6) at 0 dB (bits5:3=010).
           {
             uint8_t v = es_read(0x2A);
             uint8_t nv = v;
             nv &= ~(1 << 7);           // RD2RO off (no DAC)
-            nv |=  (1 << 6);           // RI2RO -> RIN to right mixer enable
-            nv &= ~(0b111 << 3);       // clear RI2ROVOL
-            nv |=  (0b010 << 3);       // RI2ROVOL = 0 dB
-            if (nv != v) { es_write(0x2A, nv); changed = true; }
+            nv |=  (1 << 6);           // RI2RO enable
+            nv &= ~(0b111 << 3);
+            nv |=  (0b010 << 3);       // 0 dB
+            if (nv != v) es_write(0x2A, nv);
           }
-          // Reg 52 (DAC Control 30): known-good LOUT2/mixer reference bits (default 0xAA).
-          {
-            uint8_t v = es_read(0x34);
-            if (v != 0xAA) { es_write(0x34, 0xAA); changed = true; }
-          }
-
-          // Output volumes. LOUT2/ROUT2 (speakers) follow the "Speaker Volume"
-          // number; LOUT1/ROUT1 (headphone) set to 0 dB (0x1E) for bring-up.
-          {
-            uint8_t vol = (uint8_t) id(speaker_volume_number).state;
-            if (vol > 33) vol = 33;
-            // Reg 46 (0x2E) LOUT1VOL, Reg 47 (0x2F) ROUT1VOL: headphone @ 0 dB.
-            { uint8_t cur = es_read(0x2E); if (cur != 0x1E) { es_write(0x2E, 0x1E); changed = true; } }
-            { uint8_t cur = es_read(0x2F); if (cur != 0x1E) { es_write(0x2F, 0x1E); changed = true; } }
-            // Reg 48 (0x30) LOUT2VOL, Reg 49 (0x31) ROUT2VOL: speaker volume.
-            { uint8_t cur = es_read(0x30); if (cur != vol) { es_write(0x30, vol); changed = true; } }
-            { uint8_t cur = es_read(0x31); if (cur != vol) { es_write(0x31, vol); changed = true; } }
-          }
-
-          // Left line-in into the left mixer. Enabled here whenever the passthrough
-          // switch is ON. LI2LO (bit6) + LI2LOVOL (bits5:3) = 0 dB (010).
-          // LD2LO (bit7, DAC) stays 0.
+          // Reg 39 (0x27): LEFT line-in route depends on mono mode.
+          //   Mono OFF (stereo): LI2LO on (LIN2 -> left mixer) at 0 dB.
+          //   Mono ON:           LI2LO off (RIN duplicated to left mixer via RI2LO).
           {
             uint8_t v = es_read(0x27);
-            bool want_on = id(linein_passthrough).state;
             uint8_t nv = v;
             nv &= ~(1 << 7);           // LD2LO off (no DAC)
-            nv &= ~(0b111 << 3);       // clear LI2LOVOL
+            nv &= ~(0b111 << 3);
             nv |=  (0b010 << 3);       // LI2LOVOL = 0 dB
-            if (want_on) nv |= (1 << 6); else nv &= ~(1 << 6);   // LI2LO
-            if (nv != v) { es_write(0x27, nv); changed = true; }
+            if (id(mono_passthrough).state)
+              nv &= ~(1 << 6);         // LI2LO off in mono mode
+            else
+              nv |=  (1 << 6);         // LI2LO on in stereo mode
+            if (nv != v) es_write(0x27, nv);
           }
-
-          // If Mono Passthrough is ON, re-assert the RIN->left cross route (RI2LO,
-          // Reg 0x29 bit6) at 0 dB so a re-apply doesn't drop back to stereo, and
-          // keep the LEFT line-in gate (LI2LO) off in mono mode.
-          //
+          // Reg 41 (0x29): RIN -> LEFT mixer cross route (RI2LO bit6) only in mono.
           // NOTE: Reg 0x28/0x29 cross-mix gates are NOT documented in the ES8388
-          // datasheet revision on hand; they are widely used in community drivers
-          // and mirror the 0x27/0x2A layout (bit6=enable, bits5:3=gain). Verify.
+          // datasheet on hand; widely used in community drivers, mirror 0x27/0x2A.
           {
+            uint8_t v = es_read(0x29);
+            uint8_t nv = v;
             if (id(mono_passthrough).state) {
-              uint8_t v = es_read(0x29);
-              uint8_t nv = v;
-              nv |= (1 << 6);            // RI2LO enable
+              nv |= (1 << 6);          // RI2LO enable
               nv &= ~(0b111 << 3);
-              nv |=  (0b010 << 3);       // 0 dB
-              if (nv != v) { es_write(0x29, nv); changed = true; }
-              // Keep LEFT gate off in mono mode.
-              uint8_t v27 = es_read(0x27);
-              uint8_t nv27 = v27 & ~(1 << 6);   // LI2LO off
-              if (nv27 != v27) { es_write(0x27, nv27); changed = true; }
+              nv |=  (0b010 << 3);     // 0 dB
+            } else {
+              nv &= ~(1 << 6);         // RI2LO off
             }
+            if (nv != v) es_write(0x29, nv);
           }
+          ESP_LOGI("es8388", "output_path_on: analog passthrough routes enabled.");
+      # Enable the class-D amps only AFTER the routes are open (pop-free).
+      - delay: 10ms
+      - output.turn_on: amp_enable
 
-          ESP_LOGI("es8388", "apply_speaker_path: stereo LIN2/RIN2 -> all outputs applied (changed=%d).", (int) changed);
+  # Tear DOWN the output path: amps off, disable routes, power down output drivers.
+  # Returns the codec to the quiet decode-friendly state.
+  - id: output_path_off
+    then:
+      # Shut the amps down FIRST so their switching noise stops immediately.
+      - output.turn_off: amp_enable
+      - lambda: |-
+          auto es_write = [](uint8_t reg, uint8_t val) {
+            uint8_t b[2] = { reg, val };
+            id(bus_a).write(0x10, b, 2);
+          };
+          auto es_read = [](uint8_t reg) -> uint8_t {
+            uint8_t cur = 0x00;
+            id(bus_a).write(0x10, &reg, 1, false);
+            id(bus_a).read(0x10, &cur, 1);
+            return cur;
+          };
+
+          // Disable the mixer routes first (avoid pops).
+          { uint8_t v = es_read(0x27); uint8_t nv = v & ~(1 << 6); if (nv != v) es_write(0x27, nv); }  // LI2LO off
+          { uint8_t v = es_read(0x2A); uint8_t nv = v & ~(1 << 6); if (nv != v) es_write(0x2A, nv); }  // RI2RO off
+          { uint8_t v = es_read(0x29); uint8_t nv = v & ~(1 << 6); if (nv != v) es_write(0x29, nv); }  // RI2LO off
+          // Power down the output drivers (Reg 4 bits 5:2).
+          {
+            uint8_t v = es_read(0x04);
+            uint8_t nv = v & ~((1 << 5) | (1 << 4) | (1 << 3) | (1 << 2));
+            if (nv != v) es_write(0x04, nv);
+          }
+          // Power down the LEFT input buffer again (decode uses right only).
+          {
+            uint8_t v = es_read(0x03);
+            uint8_t nv = v | (1 << 7);   // PdnAINL -> power down
+            if (nv != v) es_write(0x03, nv);
+          }
+          ESP_LOGI("es8388", "output_path_off: outputs powered down (decode-friendly).");
 
 output:
   # Decode indicator LED on GPIO22 (proven-good pin). On at ZCZC sync, off at EOM.
@@ -291,8 +394,9 @@ output:
       inverted: true
 
   # Onboard speaker amplifier (U4/U5) shutdown/enable control on GPIO21.
-  # Active-high enable assumed. If the speakers stay silent after this change,
-  # add 'inverted: true' under 'pin:' to flip the polarity.
+  # Active-high enable assumed. If the speakers stay silent, add 'inverted: true'
+  # under 'pin:' to flip the polarity. Forced OFF at boot so idle class-D
+  # switching noise doesn't degrade the ADC/decode.
   - platform: gpio
     id: amp_enable
     pin:
@@ -303,6 +407,17 @@ button:
     name: "Restart"
     id: same_restart
     icon: "mdi:restart"
+
+  # Manually re-run the ES8388 codec-path setup (useful for debugging; logs are
+  # visible over the network once connected, unlike boot-time logs).
+  - platform: template
+    name: "Re-apply Codec Init"
+    id: reapply_codec_init
+    icon: "mdi:cog-refresh"
+    entity_category: config
+    on_press:
+      then:
+        - script.execute: apply_speaker_path
 
 # KEY1 (IO36): toggle Line-In -> audio passthrough.
 binary_sensor:
@@ -422,13 +537,13 @@ number:
     id: same_gain_number
     icon: "mdi:volume-high"
     min_value: 1
-    max_value: 512
+    max_value: 64
     step: 1
     mode: slider
     entity_category: diagnostic
     optimistic: true
-    restore_value: true
-    initial_value: 256
+    restore_value: false
+    initial_value: 8
     set_action:
       - lambda: 'id(same_dec).set_gain(x);'
 
@@ -522,9 +637,10 @@ number:
 
 # --- Per-event-code allow/mute toggles ---
 switch:
-  # Line-In -> output-mixer passthrough (single source of truth; KEY1 toggles it).
-  # Toggles LI2LO (Reg 0x27 bit6) for the left mixer. The right mixer (RI2RO) is
-  # enabled by apply_speaker_path; re-run "Re-apply Codec Init" or reboot to sync.
+  # Line-In -> audio passthrough (single source of truth; KEY1 toggles it).
+  # ON  -> output_path_on  (power up drivers, open routes, amps on).
+  # OFF -> output_path_off (amps off, close routes, power down drivers).
+  # Kept OFF at boot so the output path is fully powered down during decode.
   - platform: template
     name: "Enable Speaker"
     id: linein_passthrough
@@ -532,47 +648,14 @@ switch:
     optimistic: true
     restore_mode: ALWAYS_OFF
     turn_on_action:
-      - lambda: |-
-          uint8_t reg = 0x27, cur = 0x00;
-          id(bus_a).write(0x10, &reg, 1, false);
-          id(bus_a).read(0x10, &cur, 1);
-          cur |= (1 << 6);   // LI2LO enable
-          uint8_t b[2] = { 0x27, cur };
-          id(bus_a).write(0x10, b, 2);
-          // Also enable RIN -> right mixer (RI2RO, Reg 0x2A bit6) so both channels pass.
-          uint8_t rreg = 0x2A, rcur = 0x00;
-          id(bus_a).write(0x10, &rreg, 1, false);
-          id(bus_a).read(0x10, &rcur, 1);
-          rcur |= (1 << 6);  // RI2RO enable
-          uint8_t rb[2] = { 0x2A, rcur };
-          id(bus_a).write(0x10, rb, 2);
-          ESP_LOGI("es8388", "Line-In -> outputs ENABLED (Reg39=0x%02X, Reg42=0x%02X).", cur, rcur);
-      # Enable the class-D amps only AFTER the mixer routes are open (pop-free,
-      # and keeps the amps in shutdown during decode to protect ADC SNR).
-      - output.turn_on: amp_enable
+      - script.execute: output_path_on
     turn_off_action:
-      # Shut the amps down FIRST so their switching noise stops before decode resumes.
-      - output.turn_off: amp_enable
-      - lambda: |-
-          uint8_t reg = 0x27, cur = 0x00;
-          id(bus_a).write(0x10, &reg, 1, false);
-          id(bus_a).read(0x10, &cur, 1);
-          cur &= ~(1 << 6);  // LI2LO disable
-          uint8_t b[2] = { 0x27, cur };
-          id(bus_a).write(0x10, b, 2);
-          uint8_t rreg = 0x2A, rcur = 0x00;
-          id(bus_a).write(0x10, &rreg, 1, false);
-          id(bus_a).read(0x10, &rcur, 1);
-          rcur &= ~(1 << 6);  // RI2RO disable
-          uint8_t rb[2] = { 0x2A, rcur };
-          id(bus_a).write(0x10, rb, 2);
-          ESP_LOGI("es8388", "Line-In -> outputs DISABLED (Reg39=0x%02X, Reg42=0x%02X).", cur, rcur);
+      - script.execute: output_path_off
 
   # Mono passthrough: duplicate the RIGHT line-in (RIN2) to BOTH output mixers so
-  # the same audio appears on left and right outputs. Uses the cross-mix gate
-  # RI2LO (Reg 0x29 bit6) to route RIN into the LEFT mixer, in addition to the
-  # RI2RO (Reg 0x2A bit6) right-mixer route. Also disables the LEFT line-in gate
-  # (LI2LO, Reg 0x27 bit6) so the (likely silent) left input doesn't interfere.
+  # the same audio appears on left and right outputs. Handled inside output_path_on
+  # (RI2LO cross route + LI2LO disabled). Toggling this while passthrough is ON
+  # re-applies the output path to take effect immediately.
   #
   # NOTE: Reg 0x28/0x29 cross-mix gates are NOT documented in the ES8388 datasheet
   # revision on hand; they are widely used in community drivers and mirror the
@@ -585,71 +668,17 @@ switch:
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF
     turn_on_action:
-      - lambda: |-
-          auto es_read = [](uint8_t reg) -> uint8_t {
-            uint8_t cur = 0x00;
-            id(bus_a).write(0x10, &reg, 1, false);
-            id(bus_a).read(0x10, &cur, 1);
-            return cur;
-          };
-          auto es_write = [](uint8_t reg, uint8_t val) {
-            uint8_t b[2] = { reg, val };
-            id(bus_a).write(0x10, b, 2);
-          };
-          // Reg 0x29 (RI2LO): route RIN -> LEFT mixer, enable bit6, gain 0 dB (010).
-          {
-            uint8_t v = es_read(0x29);
-            uint8_t nv = v;
-            nv |= (1 << 6);            // RI2LO enable
-            nv &= ~(0b111 << 3);       // clear cross-mix vol
-            nv |=  (0b010 << 3);       // 0 dB
-            es_write(0x29, nv);
-          }
-          // Reg 0x2A (RI2RO): ensure RIN -> RIGHT mixer enabled at 0 dB.
-          {
-            uint8_t v = es_read(0x2A);
-            uint8_t nv = v;
-            nv &= ~(1 << 7);           // RD2RO off
-            nv |=  (1 << 6);           // RI2RO enable
-            nv &= ~(0b111 << 3);
-            nv |=  (0b010 << 3);       // 0 dB
-            es_write(0x2A, nv);
-          }
-          // Reg 0x27 (LI2LO): disable LEFT line-in gate so left input doesn't mix in.
-          {
-            uint8_t v = es_read(0x27);
-            uint8_t nv = v;
-            nv &= ~(1 << 6);           // LI2LO disable
-            es_write(0x27, nv);
-          }
-          ESP_LOGI("es8388", "Mono passthrough ENABLED (RIN -> both mixers via RI2LO+RI2RO).");
+      - if:
+          condition:
+            switch.is_on: linein_passthrough
+          then:
+            - script.execute: output_path_on
     turn_off_action:
-      - lambda: |-
-          auto es_read = [](uint8_t reg) -> uint8_t {
-            uint8_t cur = 0x00;
-            id(bus_a).write(0x10, &reg, 1, false);
-            id(bus_a).read(0x10, &cur, 1);
-            return cur;
-          };
-          auto es_write = [](uint8_t reg, uint8_t val) {
-            uint8_t b[2] = { reg, val };
-            id(bus_a).write(0x10, b, 2);
-          };
-          // Reg 0x29 (RI2LO): disable the cross route -> back to stereo.
-          {
-            uint8_t v = es_read(0x29);
-            uint8_t nv = v;
-            nv &= ~(1 << 6);           // RI2LO disable
-            es_write(0x29, nv);
-          }
-          // Restore LEFT line-in gate to follow the main passthrough switch.
-          {
-            uint8_t v = es_read(0x27);
-            uint8_t nv = v;
-            if (id(linein_passthrough).state) nv |= (1 << 6); else nv &= ~(1 << 6);
-            es_write(0x27, nv);
-          }
-          ESP_LOGI("es8388", "Mono passthrough DISABLED (back to stereo).");
+      - if:
+          condition:
+            switch.is_on: linein_passthrough
+          then:
+            - script.execute: output_path_on
 
   - platform: template
     name: "SAME Allow: EAN (Emergency Action Notification)"
