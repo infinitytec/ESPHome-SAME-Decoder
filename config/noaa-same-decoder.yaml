@@ -1200,9 +1200,9 @@ same_decoder:
   preamble_balance_max: 0.40
   lock_confidence_min: 0.5
   residual_drift_ppm: 12000.0
-  fallback_conf_thresh: 0.10
-  fallback_kp: 0.12
-  fallback_ki: 0.004
+  fallback_conf_thresh: 0.20
+  fallback_kp: 0.06
+  fallback_ki: 0.0015
   eom_require_context: true
   eom_context_ms: 120000
   decode_watchdog_ms: 7500
