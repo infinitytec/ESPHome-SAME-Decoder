@@ -186,6 +186,15 @@ script:
             uint8_t v = es_read(0x26);
             if (v != 0x08) { es_write(0x26, 0x08); changed = true; }
           }
+          // Reg 39 (DAC Control 17): enable LD2LO (bit7) so the left DAC is mixed
+          // into the left output mixer -> LOUT2. Read-modify-write so LI2LO (bit6),
+          // which the passthrough switch toggles, is preserved.
+          {
+            uint8_t v = es_read(0x27);
+            uint8_t nv = v;
+            nv |= (1 << 7);   // LD2LO -> left DAC to left mixer enable
+            if (nv != v) { es_write(0x27, nv); changed = true; }
+          }
           // Reg 52 (DAC Control 30): known-good LOUT2/mixer reference bits (default 0xAA).
           {
             uint8_t v = es_read(0x34);
