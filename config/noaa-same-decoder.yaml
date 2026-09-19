@@ -27,46 +27,17 @@ esphome:
           id(bus_a).write(0x10, &reg, 1, false);
           id(bus_a).read(0x10, &readback, 1);
           ESP_LOGI("es8388", "ADCControl1 wrote 0x77, readback=0x%02X", readback);
-      # --- Line-in -> LEFT speaker (LOUT2) analog-bypass init (path enabled but LI2LO gated) ---
-      - lambda: |-
-          auto es_write = [](uint8_t reg, uint8_t val) {
-            uint8_t b[2] = { reg, val };
-            id(bus_a).write(0x10, b, 2);
-          };
-          auto es_read = [](uint8_t reg) -> uint8_t {
-            uint8_t cur = 0x00;
-            id(bus_a).write(0x10, &reg, 1, false);
-            id(bus_a).read(0x10, &cur, 1);
-            return cur;
-          };
-          // Reg 2 (Chip Power Mgmt): power up DAC digital + DAC analog reference.
-          {
-            uint8_t v = es_read(0x02);
-            v &= ~(1 << 6);   // dac_DigPDN -> normal
-            v &= ~(1 << 0);   // dacVref_PDN -> power up
-            es_write(0x02, v);
-          }
-          // Reg 4 (DAC Power Mgmt): power up left DAC, enable LOUT2 (bit3).
-          {
-            uint8_t v = es_read(0x04);
-            v &= ~(1 << 7);   // PdnDACL -> left DAC power up
-            v |=  (1 << 3);   // LOUT2 enable
-            es_write(0x04, v);
-          }
-          // Reg 25 (DAC Control 3): ensure DAC analog output NOT muted (clear DACMute bit2).
-          {
-            uint8_t v = es_read(0x19);
-            v &= ~(1 << 2);   // DACMute -> normal (un-muted)
-            es_write(0x19, v);
-          }
-          // Reg 38 (DAC Control 16): LMIXSEL=001 (LIN2) for the left mixer.
-          es_write(0x26, 0x08);
-          // Reg 39 (DAC Control 17): LI2LO disabled (bit6=0), LI2LOVOL=000 staged.
-          es_write(0x27, 0x00);
-          // Reg 52 (DAC Control 30): known-good LOUT2/mixer reference bits (default 0xAA).
-          es_write(0x34, 0xAA);
-          ESP_LOGI("es8388", "Speaker (LOUT2) path initialized; LI2LO gated off.");
       - microphone.capture: same_mic
+      # Give the es8388/microphone components time to finish their own init,
+      # then apply our output-path setup so it wins over their register writes.
+      - delay: 1500ms
+      - script.execute: apply_speaker_path
+      # Re-apply a few more times over the next few seconds (guarded read-before-write
+      # inside the script) to defeat any late writes from the audio stack.
+      - delay: 1000ms
+      - script.execute: apply_speaker_path
+      - delay: 1000ms
+      - script.execute: apply_speaker_path
 
 esp32:
   board: esp-wrover-kit
@@ -167,8 +138,82 @@ microphone:
         - lambda: |-
             id(same_dec).feed_bytes(x);
 
+# --- ES8388 output-path setup, as a re-runnable script ---
+# Enables LOUT2, un-mutes DAC, sets LMIXSEL=LIN2 (line-in), stages LI2LO off.
+# Uses read-before-write guards so re-applying is cheap and pop-free.
+script:
+  - id: apply_speaker_path
+    then:
+      - lambda: |-
+          auto es_write = [](uint8_t reg, uint8_t val) {
+            uint8_t b[2] = { reg, val };
+            id(bus_a).write(0x10, b, 2);
+          };
+          auto es_read = [](uint8_t reg) -> uint8_t {
+            uint8_t cur = 0x00;
+            id(bus_a).write(0x10, &reg, 1, false);
+            id(bus_a).read(0x10, &cur, 1);
+            return cur;
+          };
+
+          bool changed = false;
+
+          // Reg 2 (Chip Power Mgmt): power up DAC digital + DAC analog reference.
+          {
+            uint8_t v = es_read(0x02);
+            uint8_t nv = v;
+            nv &= ~(1 << 6);   // dac_DigPDN -> normal
+            nv &= ~(1 << 0);   // dacVref_PDN -> power up
+            if (nv != v) { es_write(0x02, nv); changed = true; }
+          }
+          // Reg 4 (DAC Power Mgmt): power up left DAC, enable LOUT2 (bit3).
+          {
+            uint8_t v = es_read(0x04);
+            uint8_t nv = v;
+            nv &= ~(1 << 7);   // PdnDACL -> left DAC power up
+            nv |=  (1 << 3);   // LOUT2 enable
+            if (nv != v) { es_write(0x04, nv); changed = true; }
+          }
+          // Reg 25 (DAC Control 3): ensure DAC analog output NOT muted (clear DACMute bit2).
+          {
+            uint8_t v = es_read(0x19);
+            uint8_t nv = v;
+            nv &= ~(1 << 2);   // DACMute -> normal (un-muted)
+            if (nv != v) { es_write(0x19, nv); changed = true; }
+          }
+          // Reg 38 (DAC Control 16): LMIXSEL=001 (LIN2) for the left mixer.
+          {
+            uint8_t v = es_read(0x26);
+            if (v != 0x08) { es_write(0x26, 0x08); changed = true; }
+          }
+          // Reg 52 (DAC Control 30): known-good LOUT2/mixer reference bits (default 0xAA).
+          {
+            uint8_t v = es_read(0x34);
+            if (v != 0xAA) { es_write(0x34, 0xAA); changed = true; }
+          }
+
+          // Re-apply the current speaker volume (Reg 48 = LOUT2VOL).
+          {
+            uint8_t vol = (uint8_t) id(speaker_volume_number).state;
+            if (vol > 33) vol = 33;
+            uint8_t cur = es_read(0x30);
+            if (cur != vol) { es_write(0x30, vol); changed = true; }
+          }
+
+          // If the passthrough switch is ON, make sure LI2LO stays enabled.
+          {
+            uint8_t v = es_read(0x27);
+            bool want_on = id(linein_passthrough).state;
+            uint8_t nv = v;
+            if (want_on) nv |= (1 << 6); else nv &= ~(1 << 6);
+            if (nv != v) { es_write(0x27, nv); changed = true; }
+          }
+
+          ESP_LOGI("es8388", "apply_speaker_path: LOUT2/LMIXSEL=LIN2/unmute applied (changed=%d).", (int) changed);
+
 output:
-  # D4 LED indicator (on at ZCZC sync, off at EOM). Active-low on this board.
+  # Decode indicator LED on GPIO22 (proven-good pin). On at ZCZC sync, off at EOM.
+  # Active-low on this board. (Physically the D4 LED; GPIO19/D5 conflicts with the audio path.)
   - platform: gpio
     id: d4_led
     pin:
@@ -180,6 +225,17 @@ button:
     name: "Restart"
     id: same_restart
     icon: "mdi:restart"
+
+  # Manually re-run the ES8388 output-path setup (useful for debugging; logs are
+  # visible over the network once connected, unlike boot-time logs).
+  - platform: template
+    name: "Re-apply Codec Init"
+    id: reapply_codec_init
+    icon: "mdi:cog-refresh"
+    entity_category: config
+    on_press:
+      then:
+        - script.execute: apply_speaker_path
 
 # KEY1 (IO36): toggle Line-In -> LEFT speaker passthrough.
 binary_sensor:
