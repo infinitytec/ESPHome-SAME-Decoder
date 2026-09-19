@@ -543,7 +543,7 @@ number:
     entity_category: diagnostic
     optimistic: true
     restore_value: false
-    initial_value: 8
+    initial_value: 12
     set_action:
       - lambda: 'id(same_dec).set_gain(x);'
 
@@ -1184,25 +1184,25 @@ text_sensor:
 
 same_decoder:
   id: same_dec
-  gain: 8.0
+  gain: 12.0
   freq_offset_hz: 0.0
   agc_enable: false
   agc_target: 8000
   agc_min_gain: 0.25
   agc_max_gain: 32.0
-  timeout_ms: 3000
+  timeout_ms: 4500
   single_burst_min_ms: 3000
   post_emit_dead_ms: 500
   sample_rate: 48000
   resend_suppress_ms: 3000
-  preamble_lock_bits: 32
-  preamble_energy_mult: 8.0
+  preamble_lock_bits: 40
+  preamble_energy_mult: 12.0
   preamble_balance_max: 0.40
-  lock_confidence_min: 0.5
+  lock_confidence_min: 0.65
   residual_drift_ppm: 12000.0
-  fallback_conf_thresh: 0.20
-  fallback_kp: 0.06
-  fallback_ki: 0.0015
+  fallback_conf_thresh: 0.10
+  fallback_kp: 0.12
+  fallback_ki: 0.004
   eom_require_context: true
   eom_context_ms: 120000
   decode_watchdog_ms: 7500
